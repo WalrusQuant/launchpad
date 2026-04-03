@@ -1,6 +1,7 @@
+use futures_util::StreamExt;
 use git2::{BranchType, Repository, StatusOptions};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -603,6 +604,282 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string()[..7].to_string())
 }
 
+// ===== AI Agent =====
+
+#[derive(Clone, Serialize)]
+struct AgentChunk {
+    #[serde(rename = "type")]
+    chunk_type: String, // "text", "tool_call", "error", "done"
+    content: String,
+    tool_name: Option<String>,
+    tool_args: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentToolResult {
+    tool_call_id: String,
+    content: String,
+}
+
+#[tauri::command]
+async fn agent_chat_stream(
+    provider_type: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    messages: serde_json::Value,
+    tools: serde_json::Value,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+
+    match provider_type.as_str() {
+        "openai" => stream_openai(&client, &base_url, &api_key, &model, &messages, &tools, &app).await,
+        "anthropic" => stream_anthropic(&client, &base_url, &api_key, &model, &messages, &tools, &app).await,
+        _ => Err(format!("Unknown provider type: {}", provider_type)),
+    }
+}
+
+async fn stream_openai(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+    });
+
+    if let Some(arr) = tools.as_array() {
+        if !arr.is_empty() {
+            body["tools"] = tools.clone();
+        }
+    }
+
+    let resp = client
+        .post(base_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, text));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut tool_call_id = String::new();
+    let mut tool_name = String::new();
+    let mut tool_args = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Process complete SSE lines
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if line.is_empty() || line == "data: [DONE]" {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(choices) = json["choices"].as_array() {
+                        if let Some(choice) = choices.first() {
+                            let delta = &choice["delta"];
+
+                            // Text content
+                            if let Some(content) = delta["content"].as_str() {
+                                let _ = app.emit("agent-chunk", AgentChunk {
+                                    chunk_type: "text".into(),
+                                    content: content.into(),
+                                    tool_name: None,
+                                    tool_args: None,
+                                    tool_call_id: None,
+                                });
+                            }
+
+                            // Tool calls
+                            if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                                for tc in tool_calls {
+                                    if let Some(id) = tc["id"].as_str() {
+                                        tool_call_id = id.to_string();
+                                    }
+                                    if let Some(func) = tc["function"].as_object() {
+                                        if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                            tool_name = name.to_string();
+                                        }
+                                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                            tool_args.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Finish reason
+                            if let Some(reason) = choice["finish_reason"].as_str() {
+                                if reason == "tool_calls" && !tool_name.is_empty() {
+                                    let _ = app.emit("agent-chunk", AgentChunk {
+                                        chunk_type: "tool_call".into(),
+                                        content: String::new(),
+                                        tool_name: Some(tool_name.clone()),
+                                        tool_args: Some(tool_args.clone()),
+                                        tool_call_id: Some(tool_call_id.clone()),
+                                    });
+                                    tool_call_id.clear();
+                                    tool_name.clear();
+                                    tool_args.clear();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = app.emit("agent-chunk", AgentChunk {
+        chunk_type: "done".into(),
+        content: String::new(),
+        tool_name: None,
+        tool_args: None,
+        tool_call_id: None,
+    });
+
+    Ok(())
+}
+
+async fn stream_anthropic(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "stream": true,
+    });
+
+    if let Some(arr) = tools.as_array() {
+        if !arr.is_empty() {
+            body["tools"] = tools.clone();
+        }
+    }
+
+    let resp = client
+        .post(base_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, text));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_input = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    let event_type = json["type"].as_str().unwrap_or("");
+
+                    match event_type {
+                        "content_block_start" => {
+                            let block = &json["content_block"];
+                            if block["type"].as_str() == Some("tool_use") {
+                                current_tool_id = block["id"].as_str().unwrap_or("").to_string();
+                                current_tool_name = block["name"].as_str().unwrap_or("").to_string();
+                                current_tool_input.clear();
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = &json["delta"];
+                            if let Some(text) = delta["text"].as_str() {
+                                let _ = app.emit("agent-chunk", AgentChunk {
+                                    chunk_type: "text".into(),
+                                    content: text.into(),
+                                    tool_name: None,
+                                    tool_args: None,
+                                    tool_call_id: None,
+                                });
+                            }
+                            if let Some(json_str) = delta["partial_json"].as_str() {
+                                current_tool_input.push_str(json_str);
+                            }
+                        }
+                        "content_block_stop" => {
+                            if !current_tool_name.is_empty() {
+                                let _ = app.emit("agent-chunk", AgentChunk {
+                                    chunk_type: "tool_call".into(),
+                                    content: String::new(),
+                                    tool_name: Some(current_tool_name.clone()),
+                                    tool_args: Some(current_tool_input.clone()),
+                                    tool_call_id: Some(current_tool_id.clone()),
+                                });
+                                current_tool_name.clear();
+                                current_tool_input.clear();
+                                current_tool_id.clear();
+                            }
+                        }
+                        "message_stop" => {
+                            let _ = app.emit("agent-chunk", AgentChunk {
+                                chunk_type: "done".into(),
+                                content: String::new(),
+                                tool_name: None,
+                                tool_args: None,
+                                tool_call_id: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn get_home_dir() -> Result<String, String> {
     dirs_home()
@@ -640,7 +917,8 @@ pub fn run() {
             get_file_diff,
             git_stage_all,
             git_stage_file,
-            git_commit
+            git_commit,
+            agent_chat_stream
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

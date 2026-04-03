@@ -6,6 +6,7 @@ import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
 import { initQuickOpen, show as showQuickOpen, updateRoot as updateQuickOpenRoot } from "./quickopen.js";
+import { initAgentPanel, setTabCallbacks, isAgentVisible } from "./agentpanel.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -15,6 +16,7 @@ const { listen } = window.__TAURI__.event;
 // Each pane: { ptyId, term, fitAddon, el }
 const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
+let agentTabActive = false; // is the agent chat tab currently shown?
 let activeTabUiId = -1;
 let nextUiTabId = 0;
 
@@ -187,10 +189,38 @@ function getActivePtyId() {
   return tab.panes[tab.activePane]?.ptyId ?? tab.panes[0]?.ptyId ?? null;
 }
 
-function switchTab(uiId) {
-  if (activeTabUiId === uiId && tabs.has(uiId)) return;
+function showAgentChatTab() {
+  // Hide current terminal tab
+  if (tabs.has(activeTabUiId)) {
+    tabs.get(activeTabUiId).containerEl.style.display = "none";
+  }
+  document.getElementById("agent-chat-tab").style.display = "flex";
+  agentTabActive = true;
+  renderTabBar();
+}
 
-  // Hide current tab
+function hideAgentChatTab() {
+  document.getElementById("agent-chat-tab").style.display = "none";
+  agentTabActive = false;
+  // Show the last active terminal tab
+  if (tabs.has(activeTabUiId)) {
+    tabs.get(activeTabUiId).containerEl.style.display = "flex";
+    const tab = tabs.get(activeTabUiId);
+    setTimeout(() => fitAllPanes(tab), 10);
+  }
+  renderTabBar();
+}
+
+function switchTab(uiId) {
+  if (activeTabUiId === uiId && tabs.has(uiId) && !agentTabActive) return;
+
+  // Hide agent chat if showing
+  if (agentTabActive) {
+    document.getElementById("agent-chat-tab").style.display = "none";
+    agentTabActive = false;
+  }
+
+  // Hide current terminal tab
   if (tabs.has(activeTabUiId)) {
     tabs.get(activeTabUiId).containerEl.style.display = "none";
   }
@@ -233,8 +263,9 @@ function renderTabBar() {
 
   let index = 1;
   for (const [uiId, tab] of tabs) {
+    const isActive = uiId === activeTabUiId && !agentTabActive;
     const tabEl = document.createElement("div");
-    tabEl.className = `tab ${uiId === activeTabUiId ? "tab-active" : ""}`;
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
 
     const label = document.createElement("span");
     label.className = "tab-label";
@@ -258,6 +289,15 @@ function renderTabBar() {
     tabEl.addEventListener("click", () => switchTab(uiId));
     tabBar.appendChild(tabEl);
     index++;
+  }
+
+  // Agent chat tab (only show if agent is open)
+  if (isAgentVisible()) {
+    const agentTab = document.createElement("div");
+    agentTab.className = `tab tab-agent ${agentTabActive ? "tab-active" : ""}`;
+    agentTab.innerHTML = `<span class="tab-label">⚡ Agent</span>`;
+    agentTab.addEventListener("click", () => showAgentChatTab());
+    tabBar.appendChild(agentTab);
   }
 
   const newTabBtn = document.createElement("div");
@@ -501,6 +541,8 @@ async function boot() {
   });
 
   initGitPanel(getCurrentPath);
+  initAgentPanel(getCurrentPath);
+  setTabCallbacks(showAgentChatTab, hideAgentChatTab);
 
   onNavigate((path) => {
     fetchGitStatus(path);

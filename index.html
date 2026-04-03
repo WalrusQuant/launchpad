@@ -8,34 +8,54 @@
   </head>
   <body>
     <div id="app">
-      <div id="titlebar">
-        <div id="titlebar-spacer"></div>
-        <span id="titlebar-title">Launchpad</span>
-        <div id="titlebar-actions">
-          <button id="toggle-git-panel" class="titlebar-btn" title="Git panel (⌘G)">⎇</button>
+      <div id="toolbar">
+        <div id="toolbar-actions">
+          <button id="toggle-agent-panel" class="toolbar-btn" title="Agent (⌘I)">⚡</button>
+          <button id="toggle-git-panel" class="toolbar-btn" title="Git panel (⌘G)">⎇</button>
         </div>
       </div>
-      <div id="workspace">
-        <div id="sidebar">
-          <div id="sidebar-header">
-            <button id="nav-up" class="sidebar-btn" title="Go up">↑</button>
-            <span id="current-path">~/Code</span>
-            <button id="toggle-hidden" class="sidebar-btn" title="Show hidden files">•</button>
+      <div id="main-layout">
+        <div id="workspace">
+          <div id="sidebar">
+            <div id="sidebar-header">
+              <button id="nav-up" class="sidebar-btn" title="Go up">↑</button>
+              <span id="current-path">~/Code</span>
+              <button id="toggle-hidden" class="sidebar-btn" title="Show hidden files">•</button>
+            </div>
+            <div id="file-search" class="file-search">
+              <input id="file-search-input" type="text" placeholder="Search files..." autocomplete="off" />
+            </div>
+            <div id="file-tree"></div>
           </div>
-          <div id="file-search" class="file-search">
-            <input id="file-search-input" type="text" placeholder="Search files..." autocomplete="off" />
+          <div id="resize-handle" class="resize-handle"></div>
+          <div id="terminal-container">
+            <div id="tab-bar"></div>
+            <div id="terminal-instances">
+              <!-- Agent chat tab lives here as a sibling to terminal tabs -->
+              <div id="agent-chat-tab" class="agent-chat-instance" style="display:none">
+                <div id="agent-messages"></div>
+              </div>
+            </div>
           </div>
-          <div id="file-tree"></div>
+          <div id="git-panel">
+            <div class="gp-empty">
+              <div class="gp-empty-icon">⎇</div>
+              <div class="gp-empty-text">Open a git repository</div>
+            </div>
+          </div>
         </div>
-        <div id="resize-handle" class="resize-handle"></div>
-        <div id="terminal-container">
-          <div id="tab-bar"></div>
-          <div id="terminal-instances"></div>
-        </div>
-        <div id="git-panel">
-          <div class="gp-empty">
-            <div class="gp-empty-icon">⎇</div>
-            <div class="gp-empty-text">Open a git repository</div>
+        <!-- Agent input bar (bottom) -->
+        <div id="agent-bar" style="display:none">
+          <div id="agent-bar-controls">
+            <select id="agent-provider-select" class="agent-select"></select>
+            <select id="agent-model-select" class="agent-select"></select>
+            <button id="agent-edit-provider" class="agent-header-btn" title="Edit provider">⚙</button>
+            <button id="agent-add-provider" class="agent-header-btn" title="Add provider">+</button>
+            <button id="agent-clear" class="agent-header-btn" title="Clear conversation">⌫</button>
+          </div>
+          <div id="agent-input-area">
+            <textarea id="agent-input" placeholder="Ask the agent anything..." rows="1"></textarea>
+            <button id="agent-send" class="agent-send-btn">Send</button>
           </div>
         </div>
       </div>
@@ -61,6 +81,33 @@
       </div>
       <div id="preview-editor" style="display:none"></div>
       <pre id="preview-content"></pre>
+    </div>
+    <!-- Provider dialog (add / edit) -->
+    <div id="provider-dialog">
+      <div id="provider-dialog-box">
+        <h3 id="provider-dialog-title">Add Provider</h3>
+        <div id="provider-preset-list"></div>
+        <div class="provider-form">
+          <input id="provider-name-input" type="text" placeholder="Provider name" />
+          <input id="provider-key-input" type="password" placeholder="API key" />
+          <input id="provider-url-input" type="text" placeholder="Base URL" />
+          <input id="provider-type-input" type="hidden" value="openai" />
+          <div id="provider-models-section" style="display:none">
+            <label class="provider-label">Models</label>
+            <div id="provider-models-list"></div>
+            <div class="provider-model-add">
+              <input id="provider-model-add-input" type="text" placeholder="Add model (e.g. anthropic/claude-sonnet-4.6)" />
+              <button id="provider-model-add-btn" class="provider-btn">Add</button>
+            </div>
+          </div>
+          <div class="provider-form-actions">
+            <button id="provider-delete-btn" class="provider-btn provider-btn-delete" style="display:none">Delete</button>
+            <div style="flex:1"></div>
+            <button id="provider-cancel-btn" class="provider-btn">Cancel</button>
+            <button id="provider-save-btn" class="provider-btn provider-btn-save">Add Provider</button>
+          </div>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>
