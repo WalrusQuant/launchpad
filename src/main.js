@@ -828,8 +828,11 @@ document.addEventListener("keydown", (e) => {
 
 // Focus terminal on click (only for terminal tabs)
 terminalContainer.addEventListener("click", (e) => {
-  const tab = tabs.get(activeTabUiId);
+  const clickedRight = isSplit && e.target.closest("#group-right");
+  const uiId = clickedRight ? rightActiveTabUiId : activeTabUiId;
+  const tab = tabs.get(uiId);
   if (tab?.type === "terminal") {
+    if (clickedRight) setFocusedGroup("right");
     const pane = tab.panes[tab.activePane] || tab.panes[0];
     if (pane) pane.term.focus();
   }
