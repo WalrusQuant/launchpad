@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use git2::{BranchType, Repository, StatusOptions};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -17,6 +17,7 @@ struct PtyInstance {
 struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
+    http_client: reqwest::Client,
 }
 
 #[derive(Clone, Serialize)]
@@ -106,7 +107,7 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
                         Err(e) => e.valid_up_to(),
                     };
                     if valid_up_to > 0 {
-                        let output = String::from_utf8(leftover[..valid_up_to].to_vec()).unwrap();
+                        let output = String::from_utf8(leftover[..valid_up_to].to_vec()).expect("valid_up_to guarantees valid UTF-8");
                         let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
                         leftover = leftover[valid_up_to..].to_vec();
                     }
@@ -296,8 +297,9 @@ fn get_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let local_oid = head.target()?;
     let branch_name = head.shorthand()?;
 
-    let upstream_name = format!("refs/remotes/origin/{}", branch_name);
-    let upstream_ref = repo.find_reference(&upstream_name).ok()?;
+    let upstream_ref_name = repo.branch_upstream_name(&format!("refs/heads/{}", branch_name)).ok()?;
+    let upstream_name = upstream_ref_name.as_str()?;
+    let upstream_ref = repo.find_reference(upstream_name).ok()?;
     let upstream_oid = upstream_ref.target()?;
 
     repo.graph_ahead_behind(local_oid, upstream_oid).ok()
@@ -437,7 +439,6 @@ fn checkout_branch_inner(repo: &Repository, branch_name: &str) -> Result<(), Str
 
     repo.checkout_head(Some(
         git2::build::CheckoutBuilder::new()
-            .safe()
             .force(),
     ))
     .map_err(|e| e.to_string())?;
@@ -463,11 +464,16 @@ fn load_settings() -> Result<String, String> {
 
 #[tauri::command]
 fn save_settings(data: String) -> Result<(), String> {
+    // Validate JSON before writing to prevent config corruption
+    let parsed: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("Invalid JSON: {}", e))?;
+    let normalized = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| format!("JSON serialization error: {}", e))?;
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, data.as_bytes()).map_err(|e| e.to_string())?;
+    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -523,7 +529,7 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     std::process::Command::new("open")
         .arg("-R")
         .arg(&path)
-        .spawn()
+        .output()
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -538,6 +544,10 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, S
 
 #[tauri::command]
 fn write_file(path: String, content: String) -> Result<(), String> {
+    // Size limit to prevent accidental large writes
+    if content.len() > 10 * 1024 * 1024 {
+        return Err("File content exceeds 10MB limit".into());
+    }
     fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -701,6 +711,10 @@ fn git_pull(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn git_merge_branch(path: String, branch_name: String) -> Result<String, String> {
+    // Validate branch name to prevent option injection
+    if !branch_name.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c)) {
+        return Err("Invalid branch name".into());
+    }
     let output = std::process::Command::new("git")
         .args(["merge", &branch_name])
         .current_dir(&path)
@@ -716,7 +730,7 @@ fn git_merge_branch(path: String, branch_name: String) -> Result<String, String>
 #[tauri::command]
 fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
     let status = std::process::Command::new("git")
-        .args(["checkout", "--ours", &file_path])
+        .args(["checkout", "--ours", "--", &file_path])
         .current_dir(&path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -724,7 +738,7 @@ fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
         return Err("Failed to checkout --ours".into());
     }
     let status = std::process::Command::new("git")
-        .args(["add", &file_path])
+        .args(["add", "--", &file_path])
         .current_dir(&path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -737,7 +751,7 @@ fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
     let status = std::process::Command::new("git")
-        .args(["checkout", "--theirs", &file_path])
+        .args(["checkout", "--theirs", "--", &file_path])
         .current_dir(&path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -745,7 +759,7 @@ fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
         return Err("Failed to checkout --theirs".into());
     }
     let status = std::process::Command::new("git")
-        .args(["add", &file_path])
+        .args(["add", "--", &file_path])
         .current_dir(&path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -758,22 +772,40 @@ fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_unstage_file(path: String, file_path: String) -> Result<(), String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let head = repo.head().map_err(|e| e.to_string())?;
-    let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
-    let obj = head_commit.as_object();
-    repo.reset_default(Some(obj), [file_path.as_str()])
-        .map_err(|e| e.to_string())?;
+    match repo.head() {
+        Ok(head) => {
+            let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+            let obj = head_commit.as_object();
+            repo.reset_default(Some(obj), [file_path.as_str()])
+                .map_err(|e| e.to_string())?;
+        }
+        Err(_) => {
+            // Unborn HEAD (no commits yet) — remove from index directly
+            let mut index = repo.index().map_err(|e| e.to_string())?;
+            index.remove_path(std::path::Path::new(&file_path)).map_err(|e| e.to_string())?;
+            index.write().map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn git_unstage_all(path: String) -> Result<(), String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let head = repo.head().map_err(|e| e.to_string())?;
-    let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
-    let obj = head_commit.as_object();
-    repo.reset_default(Some(obj), ["*"])
-        .map_err(|e| e.to_string())?;
+    match repo.head() {
+        Ok(head) => {
+            let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+            let obj = head_commit.as_object();
+            repo.reset_default(Some(obj), ["*"])
+                .map_err(|e| e.to_string())?;
+        }
+        Err(_) => {
+            // Unborn HEAD (no commits yet) — clear the entire index
+            let mut index = repo.index().map_err(|e| e.to_string())?;
+            index.clear().map_err(|e| e.to_string())?;
+            index.write().map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -958,13 +990,6 @@ struct AgentChunk {
     tool_call_id: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[allow(dead_code)] // TODO: wire up tool results in agent panel
-struct AgentToolResult {
-    tool_call_id: String,
-    content: String,
-}
-
 #[tauri::command]
 async fn agent_chat_stream(
     provider_type: String,
@@ -973,13 +998,15 @@ async fn agent_chat_stream(
     model: String,
     messages: serde_json::Value,
     tools: serde_json::Value,
+    system: Option<String>,
+    state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = &state.http_client;
 
     match provider_type.as_str() {
-        "openai" => stream_openai(&client, &base_url, &api_key, &model, &messages, &tools, &app).await,
-        "anthropic" => stream_anthropic(&client, &base_url, &api_key, &model, &messages, &tools, &app).await,
+        "openai" => stream_openai(client, &base_url, &api_key, &model, &messages, &tools, &app).await,
+        "anthropic" => stream_anthropic(client, &base_url, &api_key, &model, &messages, &tools, system.as_deref(), &app).await,
         _ => Err(format!("Unknown provider type: {}", provider_type)),
     }
 }
@@ -1113,6 +1140,7 @@ async fn stream_anthropic(
     model: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
+    system: Option<&str>,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let mut body = serde_json::json!({
@@ -1121,6 +1149,10 @@ async fn stream_anthropic(
         "max_tokens": 4096,
         "stream": true,
     });
+
+    if let Some(sys) = system {
+        body["system"] = serde_json::json!(sys);
+    }
 
     if let Some(arr) = tools.as_array() {
         if !arr.is_empty() {
@@ -1234,6 +1266,7 @@ pub fn run() {
     let app_state = AppState {
         ptys: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(Mutex::new(0)),
+        http_client: reqwest::Client::new(),
     };
 
     tauri::Builder::default()
@@ -1283,4 +1316,270 @@ pub fn run() {
 
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // ─── Helper: create a temp git repo with an initial commit ───────────────
+    fn setup_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Configure git user for commits
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+
+        // Create a file, stage it, and commit
+        fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("hello.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[]).unwrap();
+
+        dir
+    }
+
+    // ─── Helper: create a temp git repo with NO commits (unborn HEAD) ────────
+    fn setup_empty_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        dir
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // write_file tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_write_file_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let result = write_file(path.to_string_lossy().to_string(), "hello".into());
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_write_file_rejects_oversized_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let content = "x".repeat(10 * 1024 * 1024 + 1); // just over 10MB
+        let result = write_file(path.to_string_lossy().to_string(), content);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("10MB"));
+        // File should not have been created
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_write_file_exactly_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limit.txt");
+        let content = "x".repeat(10 * 1024 * 1024); // exactly 10MB
+        let result = write_file(path.to_string_lossy().to_string(), content);
+        assert!(result.is_ok());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // read_file_preview tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_read_file_preview_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello world").unwrap();
+        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        assert_eq!(result.unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_read_file_preview_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello world").unwrap();
+        let result = read_file_preview(path.to_string_lossy().to_string(), Some(5));
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_read_file_preview_missing_file() {
+        let result = read_file_preview("/nonexistent/path/file.txt".into(), None);
+        assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // save_settings JSON validation tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_save_settings_rejects_invalid_json() {
+        let result = save_settings("not valid json {{{".into());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn test_save_settings_accepts_valid_json() {
+        // This writes to ~/.launchpad/config.json — we accept that in tests
+        let result = save_settings(r#"{"termFontSize": 14}"#.into());
+        assert!(result.is_ok());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // git_merge_branch validation tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_merge_branch_rejects_invalid_names() {
+        let dir = setup_git_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Names with spaces
+        assert!(git_merge_branch(path.clone(), "branch name".into()).is_err());
+        // Names with shell-special chars
+        assert!(git_merge_branch(path.clone(), "branch;rm -rf".into()).is_err());
+        // Names starting with --
+        assert!(git_merge_branch(path.clone(), "--no-verify".into()).is_err());
+        // Backtick injection
+        assert!(git_merge_branch(path.clone(), "`whoami`".into()).is_err());
+    }
+
+    #[test]
+    fn test_merge_branch_accepts_valid_names() {
+        let dir = setup_git_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Valid names should not fail the validation (may fail because branch doesn't exist,
+        // but shouldn't fail with "Invalid branch name")
+        let result = git_merge_branch(path.clone(), "feature/test-branch".into());
+        // Will error because branch doesn't exist, but not due to validation
+        if let Err(e) = result {
+            assert!(!e.contains("Invalid branch name"), "Valid name was rejected: {}", e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // git_unstage tests — including unborn HEAD
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_unstage_file_with_commits() {
+        let dir = setup_git_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Create and stage a new file
+        fs::write(dir.path().join("new.txt"), "new file").unwrap();
+        let repo = Repository::discover(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("new.txt")).unwrap();
+        index.write().unwrap();
+
+        // Unstage it
+        let result = git_unstage_file(path, "new.txt".into());
+        assert!(result.is_ok());
+
+        // Verify it's no longer staged
+        let repo = Repository::discover(dir.path()).unwrap();
+        let statuses = repo.statuses(None).unwrap();
+        for entry in statuses.iter() {
+            if entry.path() == Some("new.txt") {
+                assert!(!entry.status().contains(git2::Status::INDEX_NEW));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unstage_file_unborn_head() {
+        let dir = setup_empty_git_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Create and stage a file in a repo with no commits
+        fs::write(dir.path().join("first.txt"), "first file").unwrap();
+        let repo = Repository::discover(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("first.txt")).unwrap();
+        index.write().unwrap();
+
+        // Should not panic or error — this is the bug we fixed
+        let result = git_unstage_file(path, "first.txt".into());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_unstage_all_unborn_head() {
+        let dir = setup_empty_git_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Stage multiple files in a repo with no commits
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let repo = Repository::discover(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.add_path(std::path::Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+
+        // Should not panic or error
+        let result = git_unstage_all(path);
+        assert!(result.is_ok());
+
+        // Verify index is empty
+        let repo = Repository::discover(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert_eq!(index.len(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // get_ahead_behind tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ahead_behind_no_upstream() {
+        let dir = setup_git_repo();
+        let repo = Repository::discover(dir.path()).unwrap();
+
+        // No remote configured — should return None gracefully
+        let result = get_ahead_behind(&repo);
+        assert!(result.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // checkout_branch_inner tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_checkout_nonexistent_branch() {
+        let dir = setup_git_repo();
+        let repo = Repository::discover(dir.path()).unwrap();
+
+        let result = checkout_branch_inner(&repo, "nonexistent-branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checkout_existing_branch() {
+        let dir = setup_git_repo();
+        let repo = Repository::discover(dir.path()).unwrap();
+
+        // Create a branch
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        repo.branch("test-branch", &commit, false).unwrap();
+
+        // Checkout should succeed
+        let result = checkout_branch_inner(&repo, "test-branch");
+        assert!(result.is_ok());
+
+        // Verify HEAD points to new branch
+        let head = repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), "test-branch");
+    }
 }

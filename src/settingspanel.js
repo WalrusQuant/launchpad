@@ -172,7 +172,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
 }
 
 function isSelected(current, match) {
-  return current.includes(match) ? "selected" : "";
+  return current.startsWith(match) ? "selected" : "";
 }
 
 function escapeAttr(str) {

@@ -1,4 +1,6 @@
 import { getProviders, getActiveProvider, addProvider, removeProvider, setActiveProvider, updateProviderModel, updateProvider, getPresets } from "./providers.js";
+import { refreshFileBrowser } from "./filebrowser.js";
+import { refreshPanel } from "./gitpanel.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -8,6 +10,8 @@ let messages = []; // { role: "user"|"assistant", content: string }
 let isStreaming = false;
 let currentStreamText = "";
 let getCurrentPath = null;
+let codeBlockCounter = 0;
+let pendingToolCall = null; // Track in-flight tool call to prevent done/tool race
 
 // Tool definitions sent to the model
 const TOOLS_OPENAI = [
@@ -59,18 +63,6 @@ const TOOLS_OPENAI = [
         type: "object",
         properties: { path: { type: "string", description: "Directory path" } },
         required: ["path"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "run_command",
-      description: "Run a shell command in the terminal",
-      parameters: {
-        type: "object",
-        properties: { command: { type: "string", description: "Shell command to run" } },
-        required: ["command"],
       },
     },
   },
@@ -272,6 +264,7 @@ async function callAgent(provider) {
       model: provider.model,
       messages: apiMessages,
       tools,
+      system: provider.type === "anthropic" ? buildSystemPrompt() : null,
     });
   } catch (err) {
     isStreaming = false;
@@ -290,15 +283,24 @@ function handleChunk(chunk) {
     currentStreamText += `\n${toolMsg}\n`;
     renderMessages();
 
-    // Execute the tool
-    executeToolCall(chunk.tool_name, chunk.tool_args, chunk.tool_call_id);
+    // Execute the tool — track the promise so done doesn't race ahead
+    pendingToolCall = executeToolCall(chunk.tool_name, chunk.tool_args, chunk.tool_call_id);
   } else if (chunk.type === "done") {
-    if (currentStreamText) {
-      messages.push({ role: "assistant", content: currentStreamText });
-      currentStreamText = "";
+    // Wait for any in-flight tool call to finish before finalizing
+    const finalize = () => {
+      if (currentStreamText) {
+        messages.push({ role: "assistant", content: currentStreamText });
+        currentStreamText = "";
+      }
+      isStreaming = false;
+      renderMessages();
+    };
+    if (pendingToolCall) {
+      pendingToolCall.then(finalize).catch(finalize);
+      pendingToolCall = null;
+    } else {
+      finalize();
     }
-    isStreaming = false;
-    renderMessages();
   } else if (chunk.type === "error") {
     messages.push({ role: "assistant", content: `Error: ${chunk.content}` });
     isStreaming = false;
@@ -335,14 +337,17 @@ async function executeToolCall(toolName, toolArgsJson, toolCallId) {
         const entries = await invoke("read_directory", { path: resolvePath(args.path) });
         result = entries.map((e) => `${e.is_dir ? "📁" : "📄"} ${e.name}`).join("\n");
         break;
-      case "run_command":
-        result = `Command sent to terminal: ${args.command}`;
-        break;
       default:
         result = `Unknown tool: ${toolName}`;
     }
   } catch (err) {
     result = `Tool error: ${err}`;
+  }
+
+  // Refresh file browser and git panel after mutating operations
+  if (toolName === "write_file") {
+    refreshFileBrowser();
+    refreshPanel(null, true);
   }
 
   // Show result in stream
@@ -371,6 +376,7 @@ async function executeToolCall(toolName, toolArgsJson, toolCallId) {
 
 function renderMessages() {
   const container = document.getElementById("agent-messages");
+  codeBlockCounter = 0; // Reset counter for stable IDs across re-renders
 
   let html = "";
 
@@ -384,11 +390,12 @@ function renderMessages() {
     </div>`;
   });
 
-  // Show streaming text
+  // Show streaming text — use escapeHtml only (no markdown formatting) to avoid
+  // partial code fence regex matches causing content jumps mid-stream
   if (isStreaming && currentStreamText) {
     html += `<div class="agent-msg agent-msg-assistant">
       <div class="agent-msg-label">Agent</div>
-      <div class="agent-msg-content">${formatMessage(currentStreamText)}<span class="agent-cursor">▊</span></div>
+      <div class="agent-msg-content">${escapeHtml(currentStreamText)}<span class="agent-cursor">▊</span></div>
     </div>`;
   } else if (isStreaming) {
     html += `<div class="agent-msg agent-msg-assistant">
@@ -560,7 +567,7 @@ function formatMessage(str) {
 
   // Replace fenced code blocks: ```lang\ncode\n```
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (match, lang, code) => {
-    const id = "code-" + Math.random().toString(36).slice(2, 8);
+    const id = "code-" + (codeBlockCounter++);
     return `<div class="agent-code-block">
       <div class="agent-code-header">
         <span class="agent-code-lang">${lang || "code"}</span>

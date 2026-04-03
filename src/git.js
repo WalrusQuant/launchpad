@@ -1,3 +1,5 @@
+import { refreshPanel } from "./gitpanel.js";
+
 const { invoke } = window.__TAURI__.core;
 
 let currentGitInfo = null;
@@ -55,7 +57,10 @@ export function startGitPolling(getPath, intervalSeconds) {
   const ms = (intervalSeconds || 3) * 1000;
   gitPollInterval = setInterval(() => {
     const path = getPath();
-    if (path) fetchGitStatus(path);
+    if (path) {
+      fetchGitStatus(path);
+      refreshPanel(path);
+    }
   }, ms);
 }
 

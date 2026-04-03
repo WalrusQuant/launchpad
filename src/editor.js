@@ -118,7 +118,7 @@ const launchpadTheme = EditorView.theme({
  * Create a CodeMirror editor instance.
  * Returns the EditorView — caller owns its lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap } = {}) {
   const extensions = [
     lineNumbers(),
     highlightActiveLine(),
@@ -130,6 +130,8 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     keymap.of([...defaultKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
+    EditorState.tabSize.of(tabSize || 2),
+    ...(wordWrap ? [EditorView.lineWrapping] : []),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());

@@ -1,4 +1,5 @@
 import { showDiffPreview } from "./filebrowser.js";
+import { setPanelTransitioning } from "./main.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -48,6 +49,8 @@ export function togglePanel() {
     btn.classList.add("active");
     refreshPanel();
   } else {
+    setPanelTransitioning(true);
+    panel.addEventListener("transitionend", () => setPanelTransitioning(false), { once: true });
     panel.classList.remove("visible");
     btn.classList.remove("active");
   }
@@ -154,7 +157,11 @@ function showConfirmPopup(anchorEl, message, onConfirm) {
   popup.style.left = `${Math.max(4, rect.left - 80)}px`;
   document.body.appendChild(popup);
 
-  const close = () => popup.remove();
+  let outsideClick = null;
+  const close = () => {
+    popup.remove();
+    if (outsideClick) document.removeEventListener("mousedown", outsideClick);
+  };
 
   popup.querySelector(".gp-confirm-yes").addEventListener("click", () => {
     close();
@@ -164,11 +171,8 @@ function showConfirmPopup(anchorEl, message, onConfirm) {
 
   // Close on outside click
   setTimeout(() => {
-    const outsideClick = (e) => {
-      if (!popup.contains(e.target)) {
-        close();
-        document.removeEventListener("mousedown", outsideClick);
-      }
+    outsideClick = (e) => {
+      if (!popup.contains(e.target)) close();
     };
     document.addEventListener("mousedown", outsideClick);
   }, 0);
@@ -640,12 +644,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
       }
       commitPrefix.value = "";
       commitTextarea.focus();
-      // Update char count
-      const firstLine = commitTextarea.value.split("\n")[0];
-      const len = firstLine.length;
-      if (commitCharCount) {
-        commitCharCount.textContent = `${len}/72`;
-      }
+      updateCharCount();
     });
   }
 
@@ -661,8 +660,11 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
       await refreshPanel(null, true);
     } catch (err) {
       showGitFeedback(`Commit failed: ${err}`, "error");
-      commitBtn.disabled = false;
-      commitBtn.textContent = "Commit";
+    } finally {
+      if (commitBtn) {
+        commitBtn.disabled = false;
+        commitBtn.textContent = "Commit";
+      }
     }
   }
 

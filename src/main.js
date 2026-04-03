@@ -24,6 +24,7 @@ let agentTabActive = false; // is the agent chat tab currently shown?
 let activeTabUiId = -1;
 let nextUiTabId = 0;
 let isCreatingTab = false;
+let panelTransitioning = false;
 
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
@@ -215,11 +216,10 @@ async function splitPane() {
   secondPane.term.focus();
 }
 
-let fitRAF = null;
 function fitAllPanes(tab) {
-  if (fitRAF) cancelAnimationFrame(fitRAF);
-  fitRAF = requestAnimationFrame(() => {
-    fitRAF = null;
+  if (tab.fitRAF) cancelAnimationFrame(tab.fitRAF);
+  tab.fitRAF = requestAnimationFrame(() => {
+    tab.fitRAF = null;
     tab.panes.forEach((pane) => {
       pane.fitAddon.fit();
       if (pane.ptyId !== null) {
@@ -253,7 +253,7 @@ function hideAgentChatTab() {
     const tab = tabs.get(activeTabUiId);
     tab.containerEl.style.display = "flex";
     if (tab.type === "terminal") {
-      setTimeout(() => fitAllPanes(tab), 10);
+      requestAnimationFrame(() => fitAllPanes(tab));
     }
   }
   renderTabBar();
@@ -274,6 +274,7 @@ function switchTab(uiId) {
   }
 
   const tab = tabs.get(uiId);
+  if (!tab) return;
   tab.containerEl.style.display = "flex";
   activeTabUiId = uiId;
 
@@ -383,6 +384,7 @@ async function createEditorTab(filePath) {
     modified: false,
   };
 
+  const editorSettings = getSettings();
   const editorView = createEditor(editorContent, content, fileName, {
     onChange: (newContent) => {
       tab.modified = newContent !== tab.originalContent;
@@ -391,6 +393,8 @@ async function createEditorTab(filePath) {
     onCursorChange: (line, col) => {
       statusBar.textContent = `Ln ${line}, Col ${col} · ${getLangName(fileName)}`;
     },
+    tabSize: editorSettings.editorTabSize,
+    wordWrap: editorSettings.editorWordWrap,
   });
 
   tab.editorView = editorView;
@@ -453,7 +457,9 @@ function applySettingLive(key, value) {
         if (key === "termCursorStyle") pane.term.options.cursorStyle = value;
         if (key === "termCursorBlink") pane.term.options.cursorBlink = value;
         pane.fitAddon.fit();
-        invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+        if (pane.ptyId !== null) {
+          invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+        }
       }
     }
   }
@@ -605,6 +611,7 @@ listen("pty-exit", (event) => {
 // Resize observer
 const terminalContainer = document.getElementById("terminal-container");
 const resizeObserver = new ResizeObserver(() => {
+  if (panelTransitioning) return;
   const tab = tabs.get(activeTabUiId);
   if (tab?.type === "terminal") fitAllPanes(tab);
 });
@@ -655,7 +662,7 @@ terminalContainer.addEventListener("drop", (e) => {
     if (tab?.type === "terminal") {
       const ptyId = getActivePtyId();
       if (ptyId !== null) {
-        const quoted = path.includes(" ") ? `"${path}"` : path;
+        const quoted = "'" + path.replace(/'/g, "'\\''") + "'";
         invoke("write_to_pty", { tabId: ptyId, data: quoted });
       }
     }
@@ -1269,7 +1276,12 @@ async function boot() {
     sidebar.style.width = settings.sidebarWidth + "px";
   }
 
-  await createTab();
+  try {
+    await createTab();
+  } catch (err) {
+    document.getElementById("terminal-container").innerHTML =
+      `<div style="padding:20px;color:#ff6b6b;">Failed to start terminal: ${err}</div>`;
+  }
 
   await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
 
@@ -1291,6 +1303,10 @@ async function boot() {
 
   fetchGitStatus(getCurrentPath());
   startGitPolling(getCurrentPath, settings.gitPollInterval);
+}
+
+export function setPanelTransitioning(value) {
+  panelTransitioning = value;
 }
 
 boot();

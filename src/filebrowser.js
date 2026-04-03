@@ -64,7 +64,7 @@ function formatSize(bytes) {
 }
 
 function shortenPath(path) {
-  const home = currentPath.split("/").slice(0, 3).join("/");
+  const home = path.split("/").slice(0, 3).join("/");
   if (path.startsWith(home)) {
     return "~" + path.slice(home.length);
   }
@@ -253,9 +253,6 @@ function closeContextMenu() {
 }
 
 // File editor/preview
-let currentEditPath = null;
-let originalContent = "";
-
 async function showFilePreview(entry) {
   // If we have an editor tab callback, use that instead of the overlay
   if (openFileCallback) {
@@ -267,7 +264,6 @@ async function showFilePreview(entry) {
 export function closeFilePreview() {
   const preview = document.getElementById("file-preview");
   if (preview) preview.classList.remove("visible");
-  currentEditPath = null;
 }
 
 // Show diff in read-only preview mode (used by git panel)
@@ -285,7 +281,6 @@ export function showDiffPreview(fileName, diffHtml) {
   previewContent.innerHTML = diffHtml;
   saveBtn.style.display = "none";
   status.textContent = "";
-  currentEditPath = null;
 
   preview.classList.add("visible");
 }
