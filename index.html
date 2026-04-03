@@ -9,6 +9,29 @@
   <body>
     <div id="app">
       <div id="toolbar">
+        <div id="toolbar-left">
+          <button id="open-settings" class="toolbar-btn" title="Settings (⌘,)">⚙</button>
+          <div id="shortcuts-wrapper">
+            <button id="show-shortcuts" class="toolbar-btn" title="Keyboard shortcuts">⌘</button>
+            <div id="shortcuts-modal">
+              <div class="shortcuts-title">Keyboard Shortcuts</div>
+              <div class="shortcuts-grid">
+                <span class="sc-key">⌘T</span><span class="sc-desc">New terminal tab</span>
+                <span class="sc-key">⌘W</span><span class="sc-desc">Close tab</span>
+                <span class="sc-key">⌘1-9</span><span class="sc-desc">Switch to tab</span>
+                <span class="sc-key">⌘D</span><span class="sc-desc">Split pane</span>
+                <span class="sc-key">⌘K</span><span class="sc-desc">Clear terminal</span>
+                <span class="sc-key">⌘P</span><span class="sc-desc">Quick open file</span>
+                <span class="sc-key">⌘G</span><span class="sc-desc">Git panel</span>
+                <span class="sc-key">⌘F</span><span class="sc-desc">Find / search</span>
+                <span class="sc-key">⌘H</span><span class="sc-desc">Find & replace</span>
+                <span class="sc-key">⌘S</span><span class="sc-desc">Save file</span>
+                <span class="sc-key">⌘,</span><span class="sc-desc">Settings</span>
+                <span class="sc-key">Esc</span><span class="sc-desc">Close preview</span>
+              </div>
+            </div>
+          </div>
+        </div>
         <div id="toolbar-actions">
           <button id="toggle-agent-panel" class="toolbar-btn" title="Agent (⌘I)">⚡</button>
           <button id="toggle-git-panel" class="toolbar-btn" title="Git panel (⌘G)">⎇</button>

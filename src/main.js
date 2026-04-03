@@ -734,6 +734,9 @@ window.addEventListener("beforeunload", (e) => {
   }
 });
 
+// Settings button
+document.getElementById("open-settings").addEventListener("click", () => openSettingsTab());
+
 // Boot
 async function boot() {
   const settings = await loadSettings();
