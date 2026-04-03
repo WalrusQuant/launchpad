@@ -15,7 +15,7 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 ```
 src/                    # Frontend (JS/CSS/HTML)
   main.js              # App entry, unified tab management (terminal + editor + settings), split workspace (left/right groups), split panes, drag-to-move tabs, keyboard shortcuts
-  filebrowser.js        # File tree, context menu, drag & drop, git status colors
+  filebrowser.js        # File tree, context menu, drag & drop, git status colors, decoupled browsing/working directory
   editor.js             # CodeMirror factory — creates independent editor instances with search, cursor tracking
   git.js                # Git status polling, file status colors in tree
   gitpanel.js           # Full git panel UI (toolbar, staged/unstaged, commit, branches, history, GitHub, conflicts, cheatsheet)
@@ -39,6 +39,10 @@ index.html              # Main HTML shell (includes toolbar with settings, short
 - **Split workspace (left/right groups)**: Cmd+\\ toggles a vertical workspace split. The right group tracks its own tab IDs in `rightGroupTabIds`. Each group has its own tab bar. Tabs can be dragged between groups or moved with Cmd+Shift+M. Focus switches with Cmd+Option+Left/Right. Closing the last tab in the right group auto-collapses the workspace.
 - **In-tab pane split**: Cmd+D splits a single terminal tab into two vertical panes (50/50, draggable divider). Each pane gets its own PTY. This is independent from the workspace split.
 - **Tab drag-to-move**: When workspace is split, tabs use a MutationObserver-based drag system to move between left and right groups. Group markers on tab objects track which group they belong to.
+
+### File Browser
+- **Decoupled browsing**: Navigating folders in the file browser does NOT change the terminal's working directory. A blue ⏎ button appears in the sidebar header when the browsed directory differs from the terminal's cwd. Clicking it sends `cd` to the active terminal.
+- **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the current directory recursively. Emits `fs-changed` Tauri events that trigger `refreshFileBrowser()` and git status updates. Frontend throttles to 500ms. The watcher follows directory navigation and is managed in `AppState.fs_watcher`.
 
 ### Terminal
 - **Multi-PTY**: Each terminal tab/pane spawns its own PTY via `portable-pty`. PTY output is routed by ID through `paneMap`.
@@ -113,6 +117,7 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 - `read_directory(path, show_hidden)` — list directory contents
 - `search_files(path, query)` — fuzzy file search
 - `read_file_preview(path)` — read file content (512KB limit)
+- `watch_directory(path)` — start recursive filesystem watcher, emits `fs-changed` events
 - `write_file(path, content)` — write file to disk
 
 ### Git

@@ -89,7 +89,9 @@ Open with Cmd+G. A visual git workflow designed so you never have to remember gi
 ### File Browser
 - Tree view with expandable directories
 - Color-coded by file type (JS=yellow, Python=green, Rust=pink, config=cyan) and git status (modified=yellow, new=green, deleted=red, staged=green, conflict=pink)
-- Click to open in editor, double-click folder to cd
+- **Decoupled browsing** — navigating folders does NOT cd your terminal. Browse freely without disrupting running processes (like Claude Code). Click the blue ⏎ button in the sidebar header to explicitly set the working directory.
+- **Live filesystem watcher** — files created, modified, or deleted from the terminal or externally appear instantly in the tree (no manual refresh needed)
+- Click to open in editor, double-click folder to navigate
 - Drag files to terminal to paste the path
 - Right-click: copy path, copy name, reveal in Finder
 - Search/filter with Cmd+F

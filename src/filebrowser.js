@@ -1,6 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 
 let currentPath = "";
+let workingDirectory = ""; // the terminal's actual cwd — only changes on explicit confirm
 let showHidden = false;
 let expandedDirs = new Set();
 let onNavigateCallback = null;
@@ -306,12 +307,23 @@ async function toggleDirectory(entry, row, depth) {
 }
 
 function navigateToDirectory(path) {
-  // Send cd command to active terminal tab
+  setRoot(path);
+}
+
+// Explicitly set the terminal working directory to match the browsed path
+function confirmWorkingDirectory() {
   const tabId = getActiveTabId ? getActiveTabId() : null;
   if (tabId !== null) {
-    invoke("write_to_pty", { tabId, data: `cd "${path}"\r` });
+    invoke("write_to_pty", { tabId, data: `cd "${currentPath}"\r` });
   }
-  setRoot(path);
+  workingDirectory = currentPath;
+  updateSetWdButton();
+}
+
+function updateSetWdButton() {
+  const btn = document.getElementById("set-wd-btn");
+  if (!btn) return;
+  btn.style.display = (currentPath !== workingDirectory) ? "inline-flex" : "none";
 }
 
 async function setRoot(path) {
@@ -326,6 +338,7 @@ async function setRoot(path) {
   await loadDirectory(path, tree);
 
   if (onNavigateCallback) onNavigateCallback(path);
+  updateSetWdButton();
 }
 
 function toggleHidden() {
@@ -356,12 +369,16 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
     } catch {
       await setRoot(home);
     }
+    workingDirectory = currentPath;
   } catch (err) {
     console.error("Failed to init file browser:", err);
   }
 
   const upBtn = document.getElementById("nav-up");
   if (upBtn) upBtn.addEventListener("click", navigateUp);
+
+  const setWdBtn = document.getElementById("set-wd-btn");
+  if (setWdBtn) setWdBtn.addEventListener("click", confirmWorkingDirectory);
 
   const hiddenBtn = document.getElementById("toggle-hidden");
   if (hiddenBtn) hiddenBtn.addEventListener("click", toggleHidden);
