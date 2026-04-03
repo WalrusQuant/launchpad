@@ -1,12 +1,16 @@
 use futures_util::StreamExt;
 use git2::{BranchType, Repository, StatusOptions};
+use notify_debouncer_mini::{new_debouncer, notify};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, State};
+
+type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 
 // Each tab has its own PTY writer and master
 struct PtyInstance {
@@ -18,6 +22,7 @@ struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
     http_client: reqwest::Client,
+    fs_watcher: Arc<Mutex<Option<FsWatcher>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -34,6 +39,11 @@ struct SpawnResult {
 #[derive(Clone, Serialize)]
 struct PtyExit {
     tab_id: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct FsChanged {
+    path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -1262,11 +1272,43 @@ fn get_home_dir() -> Result<String, String> {
         .ok_or_else(|| "Could not determine home directory".to_string())
 }
 
+#[tauri::command]
+fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    let watch_path = path.clone();
+    let handle = app.clone();
+
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(300),
+        move |events: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
+            if let Ok(events) = events {
+                if !events.is_empty() {
+                    let _ = handle.emit("fs-changed", FsChanged { path: watch_path.clone() });
+                }
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    debouncer
+        .watcher()
+        .watch(
+            std::path::Path::new(&path),
+            notify::RecursiveMode::Recursive,
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Replace old watcher — dropping it stops the previous watch
+    let mut guard = state.fs_watcher.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
+    *guard = Some(debouncer);
+    Ok(())
+}
+
 pub fn run() {
     let app_state = AppState {
         ptys: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(Mutex::new(0)),
         http_client: reqwest::Client::new(),
+        fs_watcher: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -1308,7 +1350,8 @@ pub fn run() {
             git_delete_branch,
             list_remote_branches,
             get_commit_details,
-            get_remote_url
+            get_remote_url,
+            watch_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

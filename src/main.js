@@ -3,7 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
-import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview } from "./filebrowser.js";
+import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
@@ -606,6 +606,21 @@ listen("pty-exit", (event) => {
       break;
     }
   }
+});
+
+// Listen for filesystem changes — refresh file browser and git panel
+let fsRefreshScheduled = false;
+listen("fs-changed", (event) => {
+  const { path } = event.payload;
+  if (path !== getCurrentPath()) return;
+  if (fsRefreshScheduled) return;
+  fsRefreshScheduled = true;
+  setTimeout(() => {
+    fsRefreshScheduled = false;
+    refreshFileBrowser();
+    fetchGitStatus(getCurrentPath());
+    refreshPanel(null, true);
+  }, 500);
 });
 
 // Resize observer
@@ -1284,6 +1299,7 @@ async function boot() {
   }
 
   await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
+  invoke("watch_directory", { path: getCurrentPath() });
 
   // Quick open: Cmd+P to search, select opens in editor tab
   initQuickOpen(getCurrentPath, (fullPath) => {
@@ -1299,6 +1315,7 @@ async function boot() {
     refreshPanel(path);
     updateQuickOpenRoot(path);
     saveSetting("lastDirectory", path);
+    invoke("watch_directory", { path });
   });
 
   fetchGitStatus(getCurrentPath());
