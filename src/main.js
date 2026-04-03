@@ -1,5 +1,6 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
 import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview } from "./filebrowser.js";
@@ -72,6 +73,11 @@ function createPane(parentEl) {
     parentEl.appendChild(el);
 
     term.open(el);
+    try {
+      term.loadAddon(new WebglAddon());
+    } catch (e) {
+      console.warn("WebGL renderer not available, using default");
+    }
     fitAddon.fit();
 
     term.onData((data) => {
@@ -156,7 +162,6 @@ async function splitPane() {
     const clamped = Math.min(Math.max(pct, 20), 80);
     tab.panes[0].el.style.width = clamped + "%";
     tab.panes[1].el.style.width = (100 - clamped) + "%";
-    fitAllPanes(tab);
   };
 
   const onMouseUp = () => {
@@ -180,10 +185,15 @@ async function splitPane() {
   secondPane.term.focus();
 }
 
+let fitRAF = null;
 function fitAllPanes(tab) {
-  tab.panes.forEach((pane) => {
-    pane.fitAddon.fit();
-    invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+  if (fitRAF) cancelAnimationFrame(fitRAF);
+  fitRAF = requestAnimationFrame(() => {
+    fitRAF = null;
+    tab.panes.forEach((pane) => {
+      pane.fitAddon.fit();
+      invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+    });
   });
 }
 
@@ -236,11 +246,11 @@ function switchTab(uiId) {
   activeTabUiId = uiId;
 
   if (tab.type === "terminal") {
-    setTimeout(() => {
+    requestAnimationFrame(() => {
       fitAllPanes(tab);
       const activePane = tab.panes[tab.activePane] || tab.panes[0];
       if (activePane) activePane.term.focus();
-    }, 10);
+    });
   } else if (tab.type === "editor") {
     setTimeout(() => tab.editorView.focus(), 10);
   }
@@ -553,8 +563,6 @@ document.addEventListener("mousemove", (e) => {
   if (!isResizing) return;
   const newWidth = Math.min(Math.max(e.clientX, 150), 500);
   sidebar.style.width = newWidth + "px";
-  const tab = tabs.get(activeTabUiId);
-  if (tab?.type === "terminal") fitAllPanes(tab);
 });
 
 document.addEventListener("mouseup", () => {

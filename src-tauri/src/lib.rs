@@ -84,12 +84,21 @@ fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResul
     let handle = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut leftover = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let output = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
+                    leftover.extend_from_slice(&buf[..n]);
+                    let valid_up_to = match std::str::from_utf8(&leftover) {
+                        Ok(_) => leftover.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid_up_to > 0 {
+                        let output = String::from_utf8(leftover[..valid_up_to].to_vec()).unwrap();
+                        let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
+                        leftover = leftover[valid_up_to..].to_vec();
+                    }
                 }
                 Err(_) => break,
             }
