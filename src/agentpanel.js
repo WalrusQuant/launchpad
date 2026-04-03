@@ -497,6 +497,12 @@ function showProviderDialog(existingProvider) {
   }
 
   saveBtn.onclick = async () => {
+    // Auto-add any model typed in the input field
+    const pendingModel = modelAddInput.value.trim();
+    if (pendingModel && !dialogModels.includes(pendingModel)) {
+      dialogModels.push(pendingModel);
+    }
+
     const name = nameInput.value.trim();
     const apiKey = keyInput.value.trim();
     const baseUrl = urlInput.value.trim();
