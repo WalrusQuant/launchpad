@@ -308,6 +308,62 @@ html, body, #app {
   flex-direction: column;
 }
 
+/* Split wrapper */
+#split-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+#group-left, #group-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* Focus indicator — only visible when workspace is split */
+body.workspace-split #group-left.group-focused #tab-bar,
+body.workspace-split #group-right.group-focused .right-tab-bar {
+  border-bottom-color: #57c7ff;
+}
+
+/* Right group tab bar — mirrors #tab-bar */
+.right-tab-bar {
+  display: flex;
+  align-items: center;
+  background: #222;
+  border-bottom: 1px solid #333;
+  height: 34px;
+  flex-shrink: 0;
+  padding: 0 4px;
+  gap: 2px;
+  overflow-x: auto;
+}
+
+/* Right group instances — mirrors #terminal-instances */
+.right-instances {
+  flex: 1;
+  overflow: hidden;
+  padding: 8px;
+}
+
+/* Split handle between groups */
+.split-group-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+
+.split-group-handle:hover,
+.split-group-handle.dragging {
+  background: #57c7ff;
+}
+
 /* Tab bar */
 #tab-bar {
   display: flex;
@@ -352,6 +408,36 @@ html, body, #app {
 .tab-label {
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 11px;
+}
+
+/* Prevent inner tab elements from starting their own drag */
+.tab-label, .tab-icon, .tab-modified-dot {
+  -webkit-user-drag: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Drag ghost that follows cursor */
+.tab-drag-ghost {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.8;
+  background: #333;
+  border: 1px solid #57c7ff;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: #e0e0e0;
+  white-space: nowrap;
+}
+
+/* Highlight tab bar as drop target when dragging over it */
+#tab-bar.drag-over,
+.right-tab-bar.drag-over {
+  background: #2a2a2a;
+  outline: 2px dashed #57c7ff;
+  outline-offset: -2px;
 }
 
 .tab-close {

@@ -52,12 +52,17 @@
           </div>
           <div id="resize-handle" class="resize-handle"></div>
           <div id="terminal-container">
-            <div id="tab-bar"></div>
-            <div id="terminal-instances">
-              <!-- Agent chat tab lives here as a sibling to terminal tabs -->
-              <div id="agent-chat-tab" class="agent-chat-instance" style="display:none">
-                <div id="agent-messages"></div>
+            <div id="split-wrapper">
+              <div id="group-left">
+                <div id="tab-bar"></div>
+                <div id="terminal-instances">
+                  <!-- Agent chat tab lives here as a sibling to terminal tabs -->
+                  <div id="agent-chat-tab" class="agent-chat-instance" style="display:none">
+                    <div id="agent-messages"></div>
+                  </div>
+                </div>
               </div>
+              <!-- #group-right created dynamically when split -->
             </div>
           </div>
           <div id="git-panel">
