@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Launchpad</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="titlebar">
+        <div id="titlebar-spacer"></div>
+        <span id="titlebar-title">Launchpad</span>
+        <div id="titlebar-actions">
+          <button id="toggle-git-panel" class="titlebar-btn" title="Git panel (⌘G)">⎇</button>
+        </div>
+      </div>
+      <div id="workspace">
+        <div id="sidebar">
+          <div id="sidebar-header">
+            <button id="nav-up" class="sidebar-btn" title="Go up">↑</button>
+            <span id="current-path">~/Code</span>
+            <button id="toggle-hidden" class="sidebar-btn" title="Show hidden files">•</button>
+          </div>
+          <div id="file-search" class="file-search">
+            <input id="file-search-input" type="text" placeholder="Search files..." autocomplete="off" />
+          </div>
+          <div id="file-tree"></div>
+        </div>
+        <div id="resize-handle" class="resize-handle"></div>
+        <div id="terminal-container">
+          <div id="tab-bar"></div>
+          <div id="terminal-instances"></div>
+        </div>
+        <div id="git-panel">
+          <div class="gp-empty">
+            <div class="gp-empty-icon">⎇</div>
+            <div class="gp-empty-text">Open a git repository</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Quick open overlay -->
+    <div id="quick-open">
+      <div id="quick-open-dialog">
+        <input id="quick-open-input" type="text" placeholder="Search files by name..." autocomplete="off" />
+        <div id="quick-open-results">
+          <div class="qo-hint">Type to search files...</div>
+        </div>
+      </div>
+    </div>
+    <!-- File editor/preview overlay -->
+    <div id="file-preview">
+      <div id="preview-header">
+        <span id="preview-file-name"></span>
+        <div id="preview-actions">
+          <span id="preview-status"></span>
+          <button id="preview-save" class="preview-btn" style="display:none">Save ⌘S</button>
+          <button id="preview-close" class="preview-btn preview-btn-close">×</button>
+        </div>
+      </div>
+      <div id="preview-editor" style="display:none"></div>
+      <pre id="preview-content"></pre>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

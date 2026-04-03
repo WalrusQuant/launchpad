@@ -1,0 +1,986 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+}
+
+#titlebar {
+  height: 52px;
+  background: #2a2a2a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-app-region: drag;
+  border-bottom: 1px solid #333;
+  position: relative;
+}
+
+#titlebar-spacer {
+  width: 78px;
+  position: absolute;
+  left: 0;
+}
+
+#titlebar-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: #999;
+  letter-spacing: 0.02em;
+}
+
+#titlebar-actions {
+  position: absolute;
+  right: 16px;
+  display: flex;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #777;
+  width: 32px;
+  height: 28px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  transition: all 0.15s ease;
+}
+
+.titlebar-btn:hover {
+  background: #333;
+  color: #ccc;
+  border-color: #555;
+}
+
+.titlebar-btn.active {
+  background: #3a3a3a;
+  color: #e0e0e0;
+  border-color: #57c7ff;
+}
+
+#workspace {
+  display: flex;
+  height: calc(100% - 52px);
+}
+
+/* Sidebar */
+#sidebar {
+  width: 260px;
+  min-width: 200px;
+  background: #222;
+  border-right: 1px solid #333;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#sidebar-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+}
+
+.sidebar-btn:hover {
+  background: #333;
+  color: #ccc;
+}
+
+.sidebar-btn.active {
+  background: #444;
+  color: #e0e0e0;
+}
+
+#current-path {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+/* Resize handle */
+.resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+}
+
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: #57c7ff;
+}
+
+/* File search */
+.file-search {
+  padding: 6px 12px;
+  border-bottom: 1px solid #333;
+}
+
+#file-search-input {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  outline: none;
+}
+
+#file-search-input:focus {
+  border-color: #57c7ff;
+}
+
+/* File tree */
+#file-tree {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.file-entry {
+  display: flex;
+  align-items: center;
+  padding: 3px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  gap: 6px;
+  user-select: none;
+  min-height: 26px;
+}
+
+.file-entry:hover {
+  background: #2a2a2a;
+}
+
+.file-entry.dir {
+  color: #e0e0e0;
+}
+
+.file-icon {
+  font-size: 12px;
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.file-size {
+  font-size: 10px;
+  color: #555;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* File type colors */
+.type-js .file-name { color: #f3f99d; }
+.type-py .file-name { color: #5af78e; }
+.type-rs .file-name { color: #ff6ac1; }
+.type-config .file-name { color: #9aedfe; }
+.type-doc .file-name { color: #888; }
+.type-web .file-name { color: #ff5f56; }
+.dir .file-name { color: #57c7ff; }
+
+.dir-children {
+  /* nested directory contents */
+}
+
+.file-error {
+  padding: 12px 16px;
+  color: #666;
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Git status colors — override file type colors for changed files */
+.git-modified .file-name { color: #e5c07b !important; }
+.git-new .file-name { color: #5af78e !important; }
+.git-deleted .file-name { color: #ff5f56 !important; text-decoration: line-through; }
+.git-staged .file-name { color: #5af78e !important; }
+.git-conflict .file-name { color: #ff6ac1 !important; }
+.git-renamed .file-name { color: #9aedfe !important; }
+
+/* Terminal */
+#terminal-container {
+  flex: 1;
+  background: #1a1a1a;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Tab bar */
+#tab-bar {
+  display: flex;
+  align-items: center;
+  background: #222;
+  border-bottom: 1px solid #333;
+  height: 34px;
+  flex-shrink: 0;
+  padding: 0 4px;
+  gap: 2px;
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: #777;
+  cursor: pointer;
+  border-radius: 4px;
+  gap: 6px;
+  white-space: nowrap;
+  user-select: none;
+  transition: background 0.1s ease;
+}
+
+.tab:hover {
+  background: #2a2a2a;
+  color: #bbb;
+}
+
+.tab-active {
+  background: #1a1a1a;
+  color: #e0e0e0;
+}
+
+.tab-active:hover {
+  background: #1a1a1a;
+}
+
+.tab-label {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+}
+
+.tab-close {
+  font-size: 14px;
+  color: #555;
+  cursor: pointer;
+  line-height: 1;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+}
+
+.tab-close:hover {
+  background: #444;
+  color: #ff5f56;
+}
+
+.tab-new {
+  color: #555;
+  font-size: 16px;
+  padding: 4px 8px;
+}
+
+.tab-new:hover {
+  color: #5af78e;
+  background: #2a2a2a;
+}
+
+.tab-rename-input {
+  background: #1a1a1a;
+  border: 1px solid #57c7ff;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  outline: none;
+  width: 100px;
+}
+
+/* Terminal instances */
+#terminal-instances {
+  flex: 1;
+  overflow: hidden;
+  padding: 8px;
+}
+
+.terminal-instance {
+  height: 100%;
+  width: 100%;
+  display: none;
+  flex-direction: row;
+}
+
+.terminal-instance.split {
+  /* When split, panes are side by side */
+}
+
+.pane {
+  flex: 1;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.split .pane {
+  width: 50%;
+  flex: none;
+}
+
+.split-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+
+.split-handle:hover,
+.split-handle.dragging {
+  background: #57c7ff;
+}
+
+/* ===== Git Panel ===== */
+#git-panel {
+  width: 0;
+  overflow: hidden;
+  background: #222;
+  border-left: 1px solid #333;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.2s ease;
+}
+
+#git-panel.visible {
+  width: 280px;
+}
+
+.gp-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gp-branch-name {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 13px;
+  color: #57c7ff;
+  font-weight: 600;
+}
+
+.gp-sync {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: #888;
+}
+
+/* Sections */
+.gp-section {
+  border-bottom: 1px solid #333;
+}
+
+.gp-section-title {
+  padding: 10px 16px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #666;
+  letter-spacing: 0.08em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gp-action-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.gp-action-btn:hover {
+  background: #333;
+  color: #ccc;
+}
+
+/* Changed files */
+.gp-file-list {
+  padding: 4px 0 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.gp-file {
+  display: flex;
+  align-items: center;
+  padding: 3px 16px;
+  font-size: 12px;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.gp-file:hover {
+  background: #2a2a2a;
+}
+
+.gp-stage-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #5af78e;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+  padding: 0;
+}
+
+.gp-stage-btn:hover {
+  background: rgba(90, 247, 142, 0.15);
+  border-color: #5af78e;
+}
+
+.gp-file-status {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.gp-status-modified { color: #e5c07b; }
+.gp-status-new { color: #5af78e; }
+.gp-status-deleted { color: #ff5f56; }
+.gp-status-staged { color: #5af78e; }
+.gp-status-conflict { color: #ff6ac1; }
+.gp-status-renamed { color: #9aedfe; }
+
+.gp-file-path {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: #bbb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Branches */
+.gp-branch-list {
+  padding: 4px 0 8px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.gp-branch {
+  display: flex;
+  align-items: center;
+  padding: 4px 16px;
+  font-size: 12px;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.gp-branch:hover {
+  background: #2a2a2a;
+}
+
+.gp-branch-current {
+  cursor: default;
+}
+
+.gp-branch-current:hover {
+  background: transparent;
+}
+
+.gp-branch-indicator {
+  font-size: 10px;
+  color: #555;
+  width: 12px;
+  text-align: center;
+}
+
+.gp-branch-current .gp-branch-indicator {
+  color: #5af78e;
+}
+
+.gp-branch-label {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  color: #bbb;
+}
+
+.gp-branch-current .gp-branch-label {
+  color: #e0e0e0;
+  font-weight: 500;
+}
+
+/* New branch input */
+.gp-new-branch-input {
+  padding: 4px 16px;
+}
+
+.gp-new-branch-input input {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #57c7ff;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  outline: none;
+}
+
+/* Commit form */
+.gp-commit-form {
+  padding: 8px 16px;
+  border-bottom: 1px solid #333;
+  display: flex;
+  gap: 6px;
+}
+
+#commit-message {
+  flex: 1;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  outline: none;
+}
+
+#commit-message:focus {
+  border-color: #57c7ff;
+}
+
+.gp-commit-btn {
+  background: #5af78e;
+  color: #111;
+  border: none;
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.gp-commit-btn:hover {
+  background: #4de67d;
+}
+
+/* Diff line colors */
+.diff-line {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 0 4px;
+  white-space: pre;
+}
+
+.diff-add {
+  background: rgba(90, 247, 142, 0.1);
+  color: #5af78e;
+}
+
+.diff-del {
+  background: rgba(255, 95, 86, 0.1);
+  color: #ff5f56;
+}
+
+/* Commits */
+.gp-commits-section {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-bottom: none;
+}
+
+.gp-commit-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0 8px;
+}
+
+.gp-commit {
+  display: flex;
+  align-items: baseline;
+  padding: 4px 16px;
+  font-size: 11px;
+  gap: 8px;
+}
+
+.gp-commit-oid {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  color: #e5c07b;
+  flex-shrink: 0;
+}
+
+.gp-commit-msg {
+  color: #bbb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.gp-commit-date {
+  font-size: 10px;
+  color: #555;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Empty states */
+.gp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+}
+
+.gp-empty-icon {
+  font-size: 32px;
+  color: #444;
+}
+
+.gp-empty-text {
+  font-size: 12px;
+  color: #555;
+}
+
+.gp-empty-section {
+  padding: 8px 16px;
+  font-size: 11px;
+  color: #555;
+  font-style: italic;
+}
+
+.gp-error {
+  padding: 16px;
+  color: #ff5f56;
+  font-size: 12px;
+}
+
+/* ===== Quick Open ===== */
+#quick-open {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 200;
+  display: none;
+  justify-content: center;
+  padding-top: 80px;
+}
+
+#quick-open.visible {
+  display: flex;
+}
+
+#quick-open-dialog {
+  width: 500px;
+  max-width: 90%;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  max-height: 400px;
+  display: flex;
+  flex-direction: column;
+}
+
+#quick-open-input {
+  width: 100%;
+  background: #2a2a2a;
+  border: none;
+  border-bottom: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 14px;
+  padding: 14px 16px;
+  outline: none;
+}
+
+#quick-open-results {
+  overflow-y: auto;
+  max-height: 340px;
+}
+
+.qo-result {
+  display: flex;
+  align-items: center;
+  padding: 8px 16px;
+  cursor: pointer;
+  gap: 12px;
+}
+
+.qo-result:hover,
+.qo-result-active {
+  background: #333;
+}
+
+.qo-result-name {
+  font-size: 13px;
+  color: #e0e0e0;
+  font-weight: 500;
+}
+
+.qo-result-dir {
+  font-size: 11px;
+  color: #666;
+  font-family: "SF Mono", "Menlo", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qo-hint {
+  padding: 16px;
+  color: #555;
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ===== Context Menu ===== */
+.context-menu {
+  position: fixed;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  z-index: 1000;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.context-menu-item {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: #ddd;
+  cursor: pointer;
+  user-select: none;
+}
+
+.context-menu-item:hover {
+  background: #57c7ff;
+  color: #111;
+}
+
+.context-menu-separator {
+  height: 1px;
+  background: #444;
+  margin: 4px 0;
+}
+
+/* ===== File Preview ===== */
+#file-preview {
+  position: fixed;
+  top: 52px;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  background: #1e1e1e;
+  border-left: 1px solid #333;
+  overflow: hidden;
+  transition: width 0.2s ease;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+#file-preview.visible {
+  width: 45%;
+  min-width: 320px;
+  max-width: 600px;
+}
+
+#preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid #333;
+  background: #252525;
+  flex-shrink: 0;
+}
+
+#preview-file-name {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#preview-status {
+  font-size: 11px;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+
+.preview-status-modified {
+  color: #e5c07b;
+}
+
+.preview-status-saved {
+  color: #5af78e;
+}
+
+.preview-status-error {
+  color: #ff5f56;
+}
+
+.preview-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #aaa;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preview-btn:hover {
+  background: #333;
+  color: #e0e0e0;
+}
+
+#preview-save {
+  border-color: #5af78e;
+  color: #5af78e;
+}
+
+#preview-save:hover {
+  background: rgba(90, 247, 142, 0.15);
+}
+
+.preview-btn-close {
+  border: none;
+  font-size: 18px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+.preview-btn-close:hover {
+  color: #ff5f56;
+}
+
+/* CodeMirror editor container */
+#preview-editor {
+  flex: 1;
+  overflow: hidden;
+}
+
+#preview-editor .cm-editor {
+  height: 100%;
+}
+
+#preview-content {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #ccc;
+  white-space: pre;
+  tab-size: 2;
+  margin: 0;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4a4a4a;
+}
