@@ -287,18 +287,21 @@ async function closeTab(uiId) {
   const tab = tabs.get(uiId);
   if (!tab) return;
 
-  if (tab.type === "editor") {
-    if (tab.modified && !confirm(`"${tab.fileName}" has unsaved changes. Close anyway?`)) {
-      return;
-    }
-    tab.editorView.destroy();
-  } else if (tab.type === "terminal") {
-    tab.panes.forEach(destroyPane);
+  if (tab.type === "editor" && tab.modified) {
+    if (!confirm(`"${tab.fileName}" has unsaved changes. Close anyway?`)) return;
   }
 
-  tab.containerEl.remove();
+  // Remove tab from state and UI FIRST — before any cleanup that could fail
+  tab.containerEl.style.display = "none";
   tabs.delete(uiId);
   renderTabBar();
+
+  // Now clean up resources
+  try {
+    if (tab.type === "editor") tab.editorView.destroy();
+    else if (tab.type === "terminal") tab.panes.forEach(destroyPane);
+  } catch (_) {}
+  try { tab.containerEl.remove(); } catch (_) {}
 
   if (tabs.size === 0) {
     await createTab();
@@ -501,8 +504,9 @@ function renderTabBar() {
     const closeBtn = document.createElement("span");
     closeBtn.className = "tab-close";
     closeBtn.textContent = "×";
-    closeBtn.addEventListener("click", (e) => {
+    closeBtn.addEventListener("mousedown", (e) => {
       e.stopPropagation();
+      e.preventDefault();
       closeTab(uiId);
     });
     tabEl.appendChild(closeBtn);
