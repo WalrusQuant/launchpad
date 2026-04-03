@@ -60,6 +60,7 @@ fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResul
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
     cmd.arg("-l");
+    cmd.env("TERM", "xterm-256color");
     cmd.cwd(dirs_home().unwrap_or_else(|| "/Users".into()));
 
     pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
@@ -214,34 +215,41 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
 
     let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
 
-    let files: Vec<GitFileStatus> = statuses
-        .iter()
-        .filter_map(|entry| {
-            let path = entry.path()?.to_string();
-            let s = entry.status();
+    let mut files: Vec<GitFileStatus> = Vec::new();
+    for entry in statuses.iter() {
+        let path = match entry.path() {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        let s = entry.status();
 
-            let status = if s.is_conflicted() {
-                "conflict"
-            } else if s.is_index_new() || s.is_index_modified() || s.is_index_deleted() {
-                "staged"
-            } else if s.is_wt_new() {
-                "new"
-            } else if s.is_wt_modified() {
-                "modified"
-            } else if s.is_wt_deleted() {
-                "deleted"
-            } else if s.is_wt_renamed() {
-                "renamed"
-            } else {
-                return None;
-            };
+        if s.is_conflicted() {
+            files.push(GitFileStatus { path, status: "conflict".into() });
+            continue;
+        }
 
-            Some(GitFileStatus {
-                path,
-                status: status.to_string(),
-            })
-        })
-        .collect();
+        // Index (staged) changes
+        if s.is_index_new() {
+            files.push(GitFileStatus { path: path.clone(), status: "index_new".into() });
+        } else if s.is_index_modified() {
+            files.push(GitFileStatus { path: path.clone(), status: "index_modified".into() });
+        } else if s.is_index_deleted() {
+            files.push(GitFileStatus { path: path.clone(), status: "index_deleted".into() });
+        } else if s.is_index_renamed() {
+            files.push(GitFileStatus { path: path.clone(), status: "index_renamed".into() });
+        }
+
+        // Worktree changes
+        if s.is_wt_new() {
+            files.push(GitFileStatus { path: path.clone(), status: "new".into() });
+        } else if s.is_wt_modified() {
+            files.push(GitFileStatus { path: path.clone(), status: "modified".into() });
+        } else if s.is_wt_deleted() {
+            files.push(GitFileStatus { path: path.clone(), status: "deleted".into() });
+        } else if s.is_wt_renamed() {
+            files.push(GitFileStatus { path: path.clone(), status: "renamed".into() });
+        }
+    }
 
     let (ahead, behind) = get_ahead_behind(&repo).unwrap_or((0, 0));
 
@@ -280,6 +288,7 @@ struct CommitInfo {
     message: String,
     author: String,
     timestamp: i64,
+    parent_count: usize,
 }
 
 #[tauri::command]
@@ -353,6 +362,7 @@ fn get_commits(path: String, count: Option<usize>) -> Result<Vec<CommitInfo>, St
                 message,
                 author,
                 timestamp,
+                parent_count: commit.parent_count(),
             })
         })
         .collect();
@@ -604,6 +614,282 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string()[..7].to_string())
 }
 
+#[tauri::command]
+fn git_push(path: String) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["push"])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).to_string(); // git push outputs to stderr
+        Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg })
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn git_pull(path: String) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["pull"])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn git_merge_branch(path: String, branch_name: String) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["merge", &branch_name])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
+    let status = std::process::Command::new("git")
+        .args(["checkout", "--ours", &file_path])
+        .current_dir(&path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Failed to checkout --ours".into());
+    }
+    let status = std::process::Command::new("git")
+        .args(["add", &file_path])
+        .current_dir(&path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Failed to stage resolved file".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
+    let status = std::process::Command::new("git")
+        .args(["checkout", "--theirs", &file_path])
+        .current_dir(&path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Failed to checkout --theirs".into());
+    }
+    let status = std::process::Command::new("git")
+        .args(["add", &file_path])
+        .current_dir(&path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Failed to stage resolved file".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn git_unstage_file(path: String, file_path: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let head = repo.head().map_err(|e| e.to_string())?;
+    let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+    let obj = head_commit.as_object();
+    repo.reset_default(Some(obj), [file_path.as_str()])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_unstage_all(path: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let head = repo.head().map_err(|e| e.to_string())?;
+    let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+    let obj = head_commit.as_object();
+    repo.reset_default(Some(obj), ["*"])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.path(&file_path).force();
+    repo.checkout_head(Some(&mut checkout))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_stash_save(path: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let sig = repo.signature().map_err(|e| e.to_string())?;
+    // stash_save requires &mut Repository
+    let mut repo = repo;
+    repo.stash_save(&sig, "Launchpad stash", None)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_stash_pop(path: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let mut repo = repo;
+    repo.stash_pop(0, None)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_delete_branch(path: String, branch_name: String) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let mut branch = repo
+        .find_branch(&branch_name, BranchType::Local)
+        .map_err(|e| e.to_string())?;
+    branch.delete().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_remote_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let branches = repo
+        .branches(Some(BranchType::Remote))
+        .map_err(|e| e.to_string())?;
+
+    let result: Vec<BranchInfo> = branches
+        .filter_map(|b| {
+            let (branch, _) = b.ok()?;
+            let full_name = branch.name().ok()??.to_string();
+            // Skip HEAD pointer
+            if full_name.ends_with("/HEAD") {
+                return None;
+            }
+            // Strip "origin/" prefix for display
+            let name = full_name
+                .strip_prefix("origin/")
+                .unwrap_or(&full_name)
+                .to_string();
+
+            let commit = branch.get().peel_to_commit().ok();
+            let last_commit_msg = commit
+                .as_ref()
+                .and_then(|c| c.summary().map(String::from));
+            let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
+
+            Some(BranchInfo {
+                name,
+                is_current: false,
+                last_commit_msg,
+                last_commit_time,
+            })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+#[tauri::command]
+fn get_commit_details(path: String, oid: String) -> Result<CommitDetail, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let obj = repo.revparse_single(&oid).map_err(|e| e.to_string())?;
+    let commit = obj.peel_to_commit().map_err(|e| e.to_string())?;
+
+    let tree = commit.tree().map_err(|e| e.to_string())?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(|e| e.to_string())?;
+
+    // First pass: build file list from deltas
+    let mut files: Vec<CommitFileStat> = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let delta = diff.get_delta(idx).unwrap();
+        let file_path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let status = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Modified => "modified",
+            git2::Delta::Renamed => "renamed",
+            git2::Delta::Copied => "copied",
+            _ => "modified",
+        };
+        files.push(CommitFileStat {
+            path: file_path,
+            additions: 0,
+            deletions: 0,
+            status: status.to_string(),
+        });
+    }
+
+    // Second pass: count additions/deletions per file via Patch
+    let num_deltas = diff.deltas().len();
+    for i in 0..num_deltas {
+        if let Ok(patch) = git2::Patch::from_diff(&diff, i) {
+            if let Some(patch) = patch {
+                let (_, additions, deletions) = patch.line_stats().unwrap_or((0, 0, 0));
+                files[i].additions = additions;
+                files[i].deletions = deletions;
+            }
+        }
+    }
+
+    let message = commit.summary().unwrap_or("(no message)").to_string();
+    let author = commit.author().name().unwrap_or("Unknown").to_string();
+    let timestamp = commit.time().seconds();
+    let short_oid = commit.id().to_string()[..7].to_string();
+
+    Ok(CommitDetail {
+        oid: short_oid,
+        message,
+        author,
+        timestamp,
+        files,
+    })
+}
+
+#[tauri::command]
+fn get_remote_url(path: String) -> Result<String, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let remote = repo.find_remote("origin").map_err(|e| e.to_string())?;
+    let url = remote.url().ok_or("No URL for origin")?.to_string();
+    Ok(url)
+}
+
+#[derive(Clone, Serialize)]
+struct CommitFileStat {
+    path: String,
+    additions: usize,
+    deletions: usize,
+    status: String,
+}
+
+#[derive(Clone, Serialize)]
+struct CommitDetail {
+    oid: String,
+    message: String,
+    author: String,
+    timestamp: i64,
+    files: Vec<CommitFileStat>,
+}
+
 // ===== AI Agent =====
 
 #[derive(Clone, Serialize)]
@@ -617,6 +903,7 @@ struct AgentChunk {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // TODO: wire up tool results in agent panel
 struct AgentToolResult {
     tool_call_id: String,
     content: String,
@@ -918,7 +1205,21 @@ pub fn run() {
             git_stage_all,
             git_stage_file,
             git_commit,
-            agent_chat_stream
+            agent_chat_stream,
+            git_push,
+            git_pull,
+            git_merge_branch,
+            git_resolve_ours,
+            git_resolve_theirs,
+            git_unstage_file,
+            git_unstage_all,
+            git_discard_file,
+            git_stash_save,
+            git_stash_pop,
+            git_delete_branch,
+            list_remote_branches,
+            get_commit_details,
+            get_remote_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -29,26 +29,34 @@ function applyGitColors() {
     if (!filePath) return;
 
     // Remove old git classes
-    el.classList.remove("git-modified", "git-new", "git-deleted", "git-staged", "git-conflict");
+    el.classList.remove(
+      "git-modified", "git-new", "git-deleted", "git-staged", "git-conflict", "git-renamed",
+      "git-index_new", "git-index_modified", "git-index_deleted", "git-index_renamed"
+    );
 
     // Check if this file or any child matches
     for (const [gitPath, status] of statusMap) {
       // Match by filename at end of path
       if (filePath.endsWith("/" + gitPath) || filePath.endsWith("/" + gitPath.split("/")[0])) {
-        el.classList.add(`git-${status}`);
+        // All index_ (staged) statuses map to git-staged in the file tree
+        if (status.startsWith("index_")) {
+          el.classList.add("git-staged");
+        } else {
+          el.classList.add(`git-${status}`);
+        }
         break;
       }
     }
   });
 }
 
-export function startGitPolling(getPath) {
-  // Poll every 3 seconds
+export function startGitPolling(getPath, intervalSeconds) {
   if (gitPollInterval) clearInterval(gitPollInterval);
+  const ms = (intervalSeconds || 3) * 1000;
   gitPollInterval = setInterval(() => {
     const path = getPath();
     if (path) fetchGitStatus(path);
-  }, 3000);
+  }, ms);
 }
 
 export function stopGitPolling() {

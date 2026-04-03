@@ -1,5 +1,3 @@
-import { createEditor, getContent, destroyEditor } from "./editor.js";
-
 const { invoke } = window.__TAURI__.core;
 
 let currentPath = "";
@@ -7,6 +5,7 @@ let showHidden = false;
 let expandedDirs = new Set();
 let onNavigateCallback = null;
 let getActiveTabId = null; // set by main.js
+let openFileCallback = null; // set by main.js — opens file as editor tab
 let searchQuery = "";
 let searchDebounce = null;
 
@@ -258,72 +257,16 @@ let currentEditPath = null;
 let originalContent = "";
 
 async function showFilePreview(entry) {
-  try {
-    const content = await invoke("read_file_preview", { path: entry.path, maxBytes: 65536 });
-    const preview = document.getElementById("file-preview");
-    const previewName = document.getElementById("preview-file-name");
-    const previewContent = document.getElementById("preview-content");
-    const editorContainer = document.getElementById("preview-editor");
-    const saveBtn = document.getElementById("preview-save");
-    const status = document.getElementById("preview-status");
-    const closeBtn = document.getElementById("preview-close");
-
-    previewName.textContent = entry.name;
-    currentEditPath = entry.path;
-    originalContent = content;
-
-    // Show CodeMirror editor
-    editorContainer.style.display = "block";
-    editorContainer.innerHTML = ""; // clear old editor
-    previewContent.style.display = "none";
-    saveBtn.style.display = "none";
-    status.textContent = "";
-
-    createEditor(editorContainer, content, entry.name, (newContent) => {
-      const changed = newContent !== originalContent;
-      saveBtn.style.display = changed ? "inline-flex" : "none";
-      status.textContent = changed ? "Modified" : "";
-      status.className = changed ? "preview-status-modified" : "";
-    });
-
-    saveBtn.onclick = () => saveCurrentFile();
-    closeBtn.onclick = () => closeFilePreview();
-
-    preview.classList.add("visible");
-  } catch (err) {
-    console.error("Preview error:", err);
-  }
-}
-
-export async function saveCurrentFile() {
-  if (!currentEditPath) return;
-  const content = getContent();
-  const saveBtn = document.getElementById("preview-save");
-  const status = document.getElementById("preview-status");
-
-  try {
-    await invoke("write_file", { path: currentEditPath, content });
-    originalContent = content;
-    saveBtn.style.display = "none";
-    status.textContent = "Saved";
-    status.className = "preview-status-saved";
-    setTimeout(() => {
-      if (status.textContent === "Saved") {
-        status.textContent = "";
-        status.className = "";
-      }
-    }, 2000);
-  } catch (err) {
-    status.textContent = "Save failed";
-    status.className = "preview-status-error";
-    console.error("Save error:", err);
+  // If we have an editor tab callback, use that instead of the overlay
+  if (openFileCallback) {
+    openFileCallback(entry.path);
+    return;
   }
 }
 
 export function closeFilePreview() {
   const preview = document.getElementById("file-preview");
   if (preview) preview.classList.remove("visible");
-  destroyEditor();
   currentEditPath = null;
 }
 
@@ -337,7 +280,6 @@ export function showDiffPreview(fileName, diffHtml) {
   const status = document.getElementById("preview-status");
 
   previewName.textContent = `Diff: ${fileName}`;
-  destroyEditor();
   editorContainer.style.display = "none";
   previewContent.style.display = "block";
   previewContent.innerHTML = diffHtml;
@@ -404,16 +346,18 @@ async function navigateUp() {
   navigateToDirectory(parent);
 }
 
-export async function initFileBrowser(activeTabIdGetter) {
+export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDirectory) {
   getActiveTabId = activeTabIdGetter;
+  openFileCallback = openFileCb || null;
 
   try {
     const home = await invoke("get_home_dir");
-    const codePath = home + "/Code";
 
+    // Use configured default directory, or fall back to ~/Code, then ~
+    const startDir = defaultDirectory || (home + "/Code");
     try {
-      await invoke("read_directory", { path: codePath });
-      await setRoot(codePath);
+      await invoke("read_directory", { path: startDir });
+      await setRoot(startDir);
     } catch {
       await setRoot(home);
     }
@@ -452,9 +396,11 @@ export async function initFileBrowser(activeTabIdGetter) {
     e.stopPropagation();
   });
 
-  // Cmd+F to open search
+  // Cmd+F to open sidebar file search (only when not in an editor tab)
   document.addEventListener("keydown", (e) => {
     if (e.metaKey && e.key === "f") {
+      // Don't hijack Cmd+F when a CodeMirror editor is active
+      if (document.activeElement?.closest(".cm-editor")) return;
       e.preventDefault();
       searchBox.style.display = "block";
       searchInput.focus();
@@ -472,8 +418,12 @@ export function onNavigate(callback) {
 }
 
 export function openFileByPath(fullPath) {
-  const name = fullPath.split("/").pop();
-  showFilePreview({ path: fullPath, name });
+  if (openFileCallback) {
+    openFileCallback(fullPath);
+  } else {
+    const name = fullPath.split("/").pop();
+    showFilePreview({ path: fullPath, name });
+  }
 }
 
 export function refreshFileBrowser() {

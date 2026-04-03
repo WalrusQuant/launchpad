@@ -392,10 +392,11 @@ html, body, #app {
   display: flex;
   flex-direction: column;
   transition: width 0.2s ease;
+  position: relative;
 }
 
 #git-panel.visible {
-  width: 280px;
+  width: 320px;
 }
 
 .gp-header {
@@ -590,29 +591,6 @@ html, body, #app {
 }
 
 /* Commit form */
-.gp-commit-form {
-  padding: 8px 16px;
-  border-bottom: 1px solid #333;
-  display: flex;
-  gap: 6px;
-}
-
-#commit-message {
-  flex: 1;
-  background: #1a1a1a;
-  border: 1px solid #444;
-  color: #e0e0e0;
-  font-family: "SF Mono", "Menlo", monospace;
-  font-size: 11px;
-  padding: 5px 8px;
-  border-radius: 4px;
-  outline: none;
-}
-
-#commit-message:focus {
-  border-color: #57c7ff;
-}
-
 .gp-commit-btn {
   background: #5af78e;
   color: #111;
@@ -724,6 +702,929 @@ html, body, #app {
   padding: 16px;
   color: #ff5f56;
   font-size: 12px;
+}
+
+/* Quick Actions Toolbar */
+.gp-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 6px 16px;
+  border-bottom: 1px solid #333;
+}
+
+.gp-pill-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  color: #aaa;
+  padding: 3px 0;
+  border-radius: 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  cursor: pointer;
+  flex: 1;
+  text-align: center;
+  transition: border-color 0.15s;
+}
+
+.gp-pill-btn:hover {
+  background: #333;
+  color: #e0e0e0;
+  border-color: #57c7ff;
+}
+
+.gp-pill-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Feedback toast */
+.gp-feedback {
+  padding: 6px 16px;
+  font-size: 11px;
+  font-family: "SF Mono", "Menlo", monospace;
+  border-bottom: 1px solid #333;
+}
+
+.gp-feedback-error {
+  color: #ff5f56;
+  background: rgba(255, 95, 86, 0.08);
+}
+
+.gp-feedback-success {
+  color: #5af78e;
+  background: rgba(90, 247, 142, 0.08);
+}
+
+/* Unstage button */
+.gp-unstage-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #e5c07b;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+  padding: 0;
+}
+
+.gp-unstage-btn:hover {
+  background: rgba(229, 192, 123, 0.15);
+  border-color: #e5c07b;
+}
+
+/* Discard button */
+.gp-discard-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #ff5f56;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+  padding: 0;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.gp-file:hover .gp-discard-btn {
+  opacity: 1;
+}
+
+.gp-discard-btn:hover {
+  background: rgba(255, 95, 86, 0.15);
+  border-color: #ff5f56;
+}
+
+/* Confirm popup */
+.gp-confirm-popup {
+  position: absolute;
+  background: #2a2a2a;
+  border: 1px solid #ff5f56;
+  border-radius: 6px;
+  padding: 10px 12px;
+  z-index: 100;
+  width: 220px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.gp-confirm-msg {
+  font-size: 11px;
+  color: #ddd;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.gp-confirm-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.gp-confirm-yes {
+  background: #ff5f56;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.gp-confirm-yes:hover {
+  background: #e54c43;
+}
+
+.gp-confirm-no {
+  background: none;
+  border: 1px solid #555;
+  color: #aaa;
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.gp-confirm-no:hover {
+  background: #333;
+  color: #ddd;
+}
+
+/* Commit form improvements */
+.gp-commit-prefix-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.gp-commit-prefix {
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #aaa;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  outline: none;
+}
+
+.gp-commit-prefix:focus {
+  border-color: #57c7ff;
+}
+
+.gp-char-count {
+  font-size: 10px;
+  color: #555;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+
+.gp-char-count-warn {
+  color: #e5c07b;
+}
+
+.gp-char-count-over {
+  color: #ff5f56;
+}
+
+.gp-commit-form {
+  padding: 8px 16px;
+  border-bottom: 1px solid #333;
+}
+
+#commit-message {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  outline: none;
+  resize: vertical;
+  min-height: 28px;
+  max-height: 120px;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+}
+
+#commit-message:focus {
+  border-color: #57c7ff;
+}
+
+/* Branch section improvements */
+.gp-branch-subsection {
+  padding: 4px 16px 0;
+  font-size: 9px;
+  color: #555;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+
+.gp-branch-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.gp-branch:hover .gp-branch-actions {
+  opacity: 1;
+}
+
+.gp-branch-delete,
+.gp-branch-merge {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+}
+
+.gp-branch-delete:hover {
+  color: #ff5f56;
+  border-color: #ff5f56;
+}
+
+.gp-branch-merge:hover {
+  color: #5af78e;
+  border-color: #5af78e;
+}
+
+/* GitHub buttons */
+.gp-github-actions {
+  display: flex;
+  gap: 3px;
+}
+
+.gp-gh-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gp-gh-btn:hover {
+  background: #333;
+  color: #ccc;
+  border-color: #57c7ff;
+}
+
+/* Commit graph */
+.gp-graph-cell {
+  width: 20px;
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gp-graph-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #333;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.gp-graph-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #57c7ff;
+  position: relative;
+  z-index: 1;
+}
+
+.gp-graph-merge {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #ff6ac1;
+  background: #222;
+}
+
+/* Commit detail expansion */
+.gp-commit-detail {
+  padding: 4px 16px 8px 36px;
+  border-bottom: 1px solid #2a2a2a;
+  background: #1e1e1e;
+}
+
+.gp-commit-file {
+  display: flex;
+  gap: 6px;
+  font-size: 10px;
+  padding: 2px 0;
+  font-family: "SF Mono", "Menlo", monospace;
+  color: #888;
+}
+
+.gp-cf-status {
+  width: 10px;
+  text-align: center;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.gp-cf-path {
+  color: #aaa;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gp-cf-adds {
+  color: #5af78e;
+  flex-shrink: 0;
+}
+
+.gp-cf-dels {
+  color: #ff5f56;
+  flex-shrink: 0;
+}
+
+/* Conflict resolution */
+.gp-conflicts-section {
+  border-bottom: 1px solid #333;
+}
+
+.gp-conflicts-warning {
+  padding: 6px 16px;
+  background: rgba(255, 106, 193, 0.08);
+  color: #ff6ac1;
+  font-size: 11px;
+  font-family: "SF Mono", "Menlo", monospace;
+  border-bottom: 1px solid #333;
+}
+
+.gp-conflict-actions {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+  padding: 4px 0 2px 30px;
+}
+
+.gp-resolve-btn {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid #444;
+  background: none;
+  cursor: pointer;
+  color: #aaa;
+}
+
+.gp-resolve-btn:hover {
+  background: #333;
+}
+
+.gp-resolve-btn[data-action="ours"]:hover {
+  border-color: #57c7ff;
+  color: #57c7ff;
+}
+
+.gp-resolve-btn[data-action="theirs"]:hover {
+  border-color: #e5c07b;
+  color: #e5c07b;
+}
+
+.gp-resolve-btn[data-action="edit"]:hover {
+  border-color: #5af78e;
+  color: #5af78e;
+}
+
+/* Help button */
+.gp-help-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #666;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.gp-help-btn:hover {
+  color: #ccc;
+  border-color: #57c7ff;
+}
+
+/* Cheatsheet overlay */
+.gp-cheatsheet {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #222;
+  z-index: 50;
+  overflow-y: auto;
+}
+
+.gp-cheatsheet-content {
+  padding: 16px;
+}
+
+.gp-cs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: #e0e0e0;
+}
+
+.gp-cs-close {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 24px;
+  height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gp-cs-close:hover {
+  color: #ff5f56;
+  border-color: #ff5f56;
+}
+
+.gp-cs-section {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #333;
+}
+
+.gp-cs-section:last-child {
+  border-bottom: none;
+}
+
+.gp-cs-section h4 {
+  color: #57c7ff;
+  font-size: 12px;
+  font-weight: 600;
+  margin: 0 0 6px 0;
+}
+
+.gp-cs-section p {
+  color: #aaa;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.gp-cs-section strong {
+  color: #e0e0e0;
+}
+
+/* Status colors for new index_ prefixed values */
+.gp-status-index_new { color: #5af78e; }
+.gp-status-index_modified { color: #5af78e; }
+.gp-status-index_deleted { color: #5af78e; }
+.gp-status-index_renamed { color: #5af78e; }
+
+/* Header layout update */
+.gp-header {
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.gp-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.gp-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ─── Git panel additions ─────────────────────────────────────────────────── */
+
+/* Toolbar pill buttons (used in quick-action toolbar) */
+.gp-tool-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  color: #aaa;
+  padding: 3px 0;
+  border-radius: 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  cursor: pointer;
+  flex: 1;
+  text-align: center;
+  transition: border-color 0.15s;
+}
+
+.gp-tool-btn:hover {
+  background: #333;
+  color: #e0e0e0;
+  border-color: #57c7ff;
+}
+
+.gp-tool-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Commit form top row */
+.gp-commit-form-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 5px;
+}
+
+.gp-prefix-select {
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #aaa;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+.gp-prefix-select:focus {
+  border-color: #57c7ff;
+}
+
+.gp-commit-textarea {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  outline: none;
+  resize: vertical;
+  min-height: 52px;
+  max-height: 120px;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+  display: block;
+}
+
+.gp-commit-textarea:focus {
+  border-color: #57c7ff;
+}
+
+.gp-char-count-danger {
+  color: #ff5f56;
+}
+
+/* Branch sub-section labels */
+.gp-branch-sub-title {
+  padding: 6px 16px 2px;
+  font-size: 9px;
+  color: #555;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+
+.gp-branch-indicator-remote {
+  color: #888;
+}
+
+.gp-branch-remote {
+  opacity: 0.75;
+}
+
+.gp-branch-remote:hover {
+  opacity: 1;
+}
+
+/* Branch action buttons (delete / merge) */
+.gp-branch-delete-btn,
+.gp-branch-merge-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+}
+
+.gp-branch-delete-btn:hover {
+  color: #ff5f56;
+  border-color: #ff5f56;
+}
+
+.gp-branch-merge-btn:hover {
+  color: #5af78e;
+  border-color: #5af78e;
+}
+
+/* Commit graph column */
+.gp-graph-col {
+  width: 18px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gp-graph-dot-merge {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid #ff6ac1;
+  background: #222;
+  position: relative;
+  z-index: 1;
+}
+
+/* Expanded commit row */
+.gp-commit-expanded {
+  background: #1e1e1e;
+}
+
+.gp-commit-expanded .gp-commit-msg {
+  color: #e0e0e0;
+}
+
+/* Commit detail block */
+.gp-commit-detail {
+  padding: 6px 16px 8px 36px;
+  background: #1e1e1e;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.gp-detail-loading {
+  font-size: 10px;
+  color: #555;
+  font-style: italic;
+}
+
+.gp-detail-error {
+  font-size: 10px;
+  color: #ff5f56;
+}
+
+.gp-detail-meta {
+  font-size: 10px;
+  color: #666;
+  font-family: "SF Mono", "Menlo", monospace;
+  margin-bottom: 6px;
+}
+
+.gp-detail-files {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gp-detail-file {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 10px;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+
+.gp-detail-path {
+  color: #aaa;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gp-detail-stats {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.gp-detail-add {
+  color: #5af78e;
+}
+
+.gp-detail-del {
+  color: #ff5f56;
+}
+
+/* Conflicts */
+.gp-conflict-banner {
+  padding: 6px 16px;
+  background: rgba(255, 106, 193, 0.08);
+  color: #ff6ac1;
+  font-size: 11px;
+  font-family: "SF Mono", "Menlo", monospace;
+  border-bottom: 1px solid rgba(255, 106, 193, 0.2);
+}
+
+.gp-conflict-btn {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  border: 1px solid #444;
+  background: none;
+  cursor: pointer;
+  color: #aaa;
+}
+
+.gp-conflict-btn:hover {
+  background: #333;
+}
+
+.gp-conflict-btn[data-action="ours"]:hover {
+  border-color: #57c7ff;
+  color: #57c7ff;
+}
+
+.gp-conflict-btn[data-action="theirs"]:hover {
+  border-color: #e5c07b;
+  color: #e5c07b;
+}
+
+.gp-conflict-btn[data-action="edit"]:hover {
+  border-color: #5af78e;
+  color: #5af78e;
+}
+
+/* Confirm popup cancel button */
+.gp-confirm-cancel {
+  background: none;
+  border: 1px solid #555;
+  color: #aaa;
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.gp-confirm-cancel:hover {
+  background: #333;
+  color: #ddd;
+}
+
+/* Cheatsheet overlay */
+.gp-cheatsheet-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #1c1c1c;
+  z-index: 50;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.gp-cheatsheet-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.gp-cheatsheet-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #333;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e0e0e0;
+  flex-shrink: 0;
+}
+
+.gp-cheatsheet-close {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  width: 22px;
+  height: 22px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gp-cheatsheet-close:hover {
+  color: #ff5f56;
+  border-color: #ff5f56;
+}
+
+.gp-cheatsheet-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.gp-cheatsheet-section {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.gp-cheatsheet-section:last-child {
+  border-bottom: none;
+}
+
+.gp-cheatsheet-title {
+  color: #57c7ff;
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  letter-spacing: 0.05em;
+}
+
+.gp-cheatsheet-item {
+  font-size: 11px;
+  color: #888;
+  line-height: 1.6;
+}
+
+.gp-cheatsheet-item kbd {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  color: #ccc;
+}
+
+/* GitHub PR button accent */
+.gp-gh-btn-pr {
+  border-color: #5af78e;
+  color: #5af78e;
+}
+
+.gp-gh-btn-pr:hover {
+  background: rgba(90, 247, 142, 0.1);
+  border-color: #5af78e;
+  color: #5af78e;
 }
 
 /* ===== Quick Open ===== */
@@ -969,6 +1870,242 @@ html, body, #app {
   white-space: pre;
   tab-size: 2;
   margin: 0;
+}
+
+/* ===== Settings Panel ===== */
+.settings-instance {
+  height: 100%;
+  width: 100%;
+  display: none;
+  flex-direction: column;
+  background: #1e1e1e;
+  overflow-y: auto;
+}
+
+.settings-content {
+  max-width: 560px;
+  padding: 32px 40px;
+  margin: 0 auto;
+}
+
+.settings-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #e0e0e0;
+  margin: 0 0 24px 0;
+}
+
+.settings-section {
+  margin-bottom: 24px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.settings-section:last-of-type {
+  border-bottom: none;
+}
+
+.settings-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #57c7ff;
+  letter-spacing: 0.04em;
+  margin: 0 0 12px 0;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  min-height: 32px;
+}
+
+.settings-label {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  color: #bbb;
+  flex-shrink: 0;
+}
+
+.settings-input {
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  outline: none;
+  width: 200px;
+}
+
+.settings-input:focus {
+  border-color: #57c7ff;
+}
+
+.settings-input-sm {
+  width: 72px;
+  text-align: center;
+}
+
+.settings-input-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-unit {
+  font-size: 11px;
+  color: #666;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+
+.settings-select {
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  outline: none;
+  cursor: pointer;
+}
+
+.settings-select:focus {
+  border-color: #57c7ff;
+}
+
+.settings-toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.settings-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.settings-toggle-slider {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #444;
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.settings-toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  bottom: 2px;
+  background: #ccc;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.settings-toggle input:checked + .settings-toggle-slider {
+  background: #57c7ff;
+}
+
+.settings-toggle input:checked + .settings-toggle-slider::before {
+  transform: translateX(16px);
+}
+
+.settings-footer {
+  margin-top: 16px;
+  padding-top: 12px;
+  font-size: 10px;
+  color: #555;
+}
+
+.settings-footer code {
+  color: #888;
+  background: #252525;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* ===== Editor Tab Instances ===== */
+.editor-instance {
+  height: 100%;
+  width: 100%;
+  display: none;
+  flex-direction: column;
+  background: #1e1e1e;
+}
+
+.editor-breadcrumb {
+  padding: 5px 16px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: #666;
+  background: #1e1e1e;
+  border-bottom: 1px solid #2a2a2a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+.breadcrumb-separator {
+  color: #444;
+  margin: 0 3px;
+}
+
+.breadcrumb-file {
+  color: #aaa;
+}
+
+.editor-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+.editor-content .cm-editor {
+  height: 100%;
+}
+
+.editor-statusbar {
+  height: 22px;
+  padding: 0 16px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  color: #666;
+  background: #222;
+  border-top: 1px solid #333;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+}
+
+.tab-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+
+.tab-active .tab-icon {
+  opacity: 0.8;
+}
+
+.tab-modified-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e5c07b;
+  flex-shrink: 0;
 }
 
 /* ===== Agent Chat Tab ===== */

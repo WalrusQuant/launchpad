@@ -3,8 +3,20 @@ const { invoke } = window.__TAURI__.core;
 let settings = {
   sidebarWidth: 260,
   defaultDirectory: null, // null = auto-detect ~/Code
-  fontSize: 13,
   lastDirectory: null,
+  // Terminal
+  termFontSize: 13,
+  termFontFamily: '"SF Mono", "Menlo", "Monaco", "Courier New", monospace',
+  termScrollback: 10000,
+  termCursorStyle: "bar",
+  termCursorBlink: true,
+  // Editor
+  editorFontSize: 12,
+  editorTabSize: 2,
+  editorWordWrap: false,
+  // Git
+  gitPollInterval: 3,
+  gitDefaultPrefix: "",
 };
 
 export async function loadSettings() {

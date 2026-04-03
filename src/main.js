@@ -1,18 +1,21 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview, saveCurrentFile, openFileByPath } from "./filebrowser.js";
+import { createEditor, getLangName } from "./editor.js";
+import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
 import { initQuickOpen, show as showQuickOpen, updateRoot as updateQuickOpenRoot } from "./quickopen.js";
 import { initAgentPanel, setTabCallbacks, isAgentVisible } from "./agentpanel.js";
+import { createSettingsPanel } from "./settingspanel.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 // Tab management
-// Each tab: { panes: [pane, pane?], containerEl, name, activePane: 0|1 }
+// Terminal tab: { type: "terminal", panes: [pane, pane?], containerEl, name, activePane: 0|1 }
+// Editor tab:   { type: "editor", containerEl, filePath, fileName, editorView, originalContent, modified }
 // Each pane: { ptyId, term, fitAddon, el }
 const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
@@ -49,14 +52,15 @@ function createPane(parentEl) {
     const result = await invoke("spawn_pty");
     const ptyId = result.tab_id;
 
+    const s = getSettings();
     const term = new Terminal({
-      fontFamily: '"SF Mono", "Menlo", "Monaco", "Courier New", monospace',
-      fontSize: 13,
+      fontFamily: s.termFontFamily,
+      fontSize: s.termFontSize,
       lineHeight: 1.4,
       theme: terminalTheme,
-      cursorBlink: true,
-      cursorStyle: "bar",
-      scrollback: 10000,
+      cursorBlink: s.termCursorBlink,
+      cursorStyle: s.termCursorStyle,
+      scrollback: s.termScrollback,
       allowProposedApi: true,
     });
 
@@ -97,7 +101,7 @@ async function createTab() {
 
   const pane = await createPane(containerEl);
 
-  const tab = { panes: [pane], containerEl, name: null, activePane: 0 };
+  const tab = { type: "terminal", panes: [pane], containerEl, name: null, activePane: 0 };
   tabs.set(uiId, tab);
 
   renderTabBar();
@@ -108,7 +112,7 @@ async function createTab() {
 
 async function splitPane() {
   const tab = tabs.get(activeTabUiId);
-  if (!tab) return;
+  if (!tab || tab.type !== "terminal") return;
 
   if (tab.panes.length >= 2) {
     // Already split — unsplit (close second pane)
@@ -185,7 +189,7 @@ function fitAllPanes(tab) {
 
 function getActivePtyId() {
   const tab = tabs.get(activeTabUiId);
-  if (!tab) return null;
+  if (!tab || tab.type !== "terminal") return null;
   return tab.panes[tab.activePane]?.ptyId ?? tab.panes[0]?.ptyId ?? null;
 }
 
@@ -202,11 +206,13 @@ function showAgentChatTab() {
 function hideAgentChatTab() {
   document.getElementById("agent-chat-tab").style.display = "none";
   agentTabActive = false;
-  // Show the last active terminal tab
+  // Show the last active tab
   if (tabs.has(activeTabUiId)) {
-    tabs.get(activeTabUiId).containerEl.style.display = "flex";
     const tab = tabs.get(activeTabUiId);
-    setTimeout(() => fitAllPanes(tab), 10);
+    tab.containerEl.style.display = "flex";
+    if (tab.type === "terminal") {
+      setTimeout(() => fitAllPanes(tab), 10);
+    }
   }
   renderTabBar();
 }
@@ -220,7 +226,7 @@ function switchTab(uiId) {
     agentTabActive = false;
   }
 
-  // Hide current terminal tab
+  // Hide current tab
   if (tabs.has(activeTabUiId)) {
     tabs.get(activeTabUiId).containerEl.style.display = "none";
   }
@@ -229,11 +235,15 @@ function switchTab(uiId) {
   tab.containerEl.style.display = "flex";
   activeTabUiId = uiId;
 
-  setTimeout(() => {
-    fitAllPanes(tab);
-    const activePane = tab.panes[tab.activePane] || tab.panes[0];
-    if (activePane) activePane.term.focus();
-  }, 10);
+  if (tab.type === "terminal") {
+    setTimeout(() => {
+      fitAllPanes(tab);
+      const activePane = tab.panes[tab.activePane] || tab.panes[0];
+      if (activePane) activePane.term.focus();
+    }, 10);
+  } else if (tab.type === "editor") {
+    setTimeout(() => tab.editorView.focus(), 10);
+  }
 
   renderTabBar();
 }
@@ -242,12 +252,20 @@ async function closeTab(uiId) {
   const tab = tabs.get(uiId);
   if (!tab) return;
 
-  tab.panes.forEach(destroyPane);
+  if (tab.type === "editor") {
+    if (tab.modified && !confirm(`"${tab.fileName}" has unsaved changes. Close anyway?`)) {
+      return;
+    }
+    tab.editorView.destroy();
+  } else if (tab.type === "terminal") {
+    tab.panes.forEach(destroyPane);
+  }
+  // settings tabs need no special cleanup
+
   tab.containerEl.remove();
   tabs.delete(uiId);
 
   if (tabs.size === 0) {
-    // Last tab closed — spawn a fresh one
     await createTab();
   } else if (activeTabUiId === uiId) {
     const remaining = [...tabs.keys()];
@@ -257,25 +275,195 @@ async function closeTab(uiId) {
   renderTabBar();
 }
 
+// Editor tab management
+async function createEditorTab(filePath) {
+  // Deduplicate: if already open, switch to it
+  for (const [uiId, tab] of tabs) {
+    if (tab.type === "editor" && tab.filePath === filePath) {
+      switchTab(uiId);
+      return uiId;
+    }
+  }
+
+  const fileName = filePath.split("/").pop();
+  let content;
+  try {
+    content = await invoke("read_file_preview", { path: filePath, maxBytes: 512000 });
+  } catch (err) {
+    console.error("Failed to read file:", err);
+    return null;
+  }
+
+  const uiId = nextUiTabId++;
+
+  const containerEl = document.createElement("div");
+  containerEl.className = "editor-instance";
+  document.getElementById("terminal-instances").appendChild(containerEl);
+
+  // Breadcrumb
+  const breadcrumb = document.createElement("div");
+  breadcrumb.className = "editor-breadcrumb";
+  const homePath = filePath.replace(/^\/Users\/[^/]+/, "~");
+  const parts = homePath.split("/");
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "breadcrumb-separator";
+      sep.textContent = "›";
+      breadcrumb.appendChild(sep);
+    }
+    const span = document.createElement("span");
+    span.className = i === parts.length - 1 ? "breadcrumb-file" : "";
+    span.textContent = part;
+    breadcrumb.appendChild(span);
+  });
+  containerEl.appendChild(breadcrumb);
+
+  // Editor content area
+  const editorContent = document.createElement("div");
+  editorContent.className = "editor-content";
+  containerEl.appendChild(editorContent);
+
+  // Status bar
+  const statusBar = document.createElement("div");
+  statusBar.className = "editor-statusbar";
+  statusBar.textContent = `Ln 1, Col 1 · ${getLangName(fileName)}`;
+  containerEl.appendChild(statusBar);
+
+  const tab = {
+    type: "editor",
+    containerEl,
+    filePath,
+    fileName,
+    editorView: null,
+    originalContent: content,
+    modified: false,
+  };
+
+  const editorView = createEditor(editorContent, content, fileName, {
+    onChange: (newContent) => {
+      tab.modified = newContent !== tab.originalContent;
+      renderTabBar();
+    },
+    onCursorChange: (line, col) => {
+      statusBar.textContent = `Ln ${line}, Col ${col} · ${getLangName(fileName)}`;
+    },
+  });
+
+  tab.editorView = editorView;
+  tabs.set(uiId, tab);
+
+  renderTabBar();
+  switchTab(uiId);
+  return uiId;
+}
+
+async function saveEditorTab(uiId) {
+  const tab = tabs.get(uiId);
+  if (!tab || tab.type !== "editor") return;
+
+  try {
+    const content = tab.editorView.state.doc.toString();
+    await invoke("write_file", { path: tab.filePath, content });
+    tab.originalContent = content;
+    tab.modified = false;
+    renderTabBar();
+  } catch (err) {
+    console.error("Save error:", err);
+  }
+}
+
+// Settings tab
+function openSettingsTab() {
+  // Deduplicate
+  for (const [uiId, tab] of tabs) {
+    if (tab.type === "settings") {
+      switchTab(uiId);
+      return;
+    }
+  }
+
+  const uiId = nextUiTabId++;
+  const containerEl = document.createElement("div");
+  containerEl.className = "settings-instance";
+  document.getElementById("terminal-instances").appendChild(containerEl);
+
+  createSettingsPanel(containerEl, getSettings(), (key, value) => {
+    saveSetting(key, value);
+    applySettingLive(key, value);
+  });
+
+  const tab = { type: "settings", containerEl };
+  tabs.set(uiId, tab);
+  renderTabBar();
+  switchTab(uiId);
+}
+
+function applySettingLive(key, value) {
+  // Apply terminal settings to all existing terminal panes
+  if (key.startsWith("term")) {
+    for (const tab of tabs.values()) {
+      if (tab.type !== "terminal") continue;
+      for (const pane of tab.panes) {
+        if (key === "termFontSize") pane.term.options.fontSize = value;
+        if (key === "termFontFamily") pane.term.options.fontFamily = value;
+        if (key === "termCursorStyle") pane.term.options.cursorStyle = value;
+        if (key === "termCursorBlink") pane.term.options.cursorBlink = value;
+        pane.fitAddon.fit();
+        invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+      }
+    }
+  }
+
+  if (key === "sidebarWidth") {
+    document.getElementById("sidebar").style.width = value + "px";
+  }
+
+  if (key === "gitPollInterval") {
+    startGitPolling(getCurrentPath, value);
+  }
+}
+
 function renderTabBar() {
   const tabBar = document.getElementById("tab-bar");
   tabBar.innerHTML = "";
 
-  let index = 1;
+  let termIndex = 1;
   for (const [uiId, tab] of tabs) {
     const isActive = uiId === activeTabUiId && !agentTabActive;
     const tabEl = document.createElement("div");
     tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
 
+    // Icon
+    const icon = document.createElement("span");
+    icon.className = "tab-icon";
+    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : "◆";
+    tabEl.appendChild(icon);
+
     const label = document.createElement("span");
     label.className = "tab-label";
-    label.textContent = tab.name || `Terminal ${index}`;
+
+    if (tab.type === "terminal") {
+      label.textContent = tab.name || `Terminal ${termIndex}`;
+      label.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        startTabRename(uiId, label, termIndex);
+      });
+      termIndex++;
+    } else if (tab.type === "settings") {
+      label.textContent = "Settings";
+    } else {
+      label.textContent = tab.fileName;
+    }
     tabEl.appendChild(label);
 
-    label.addEventListener("dblclick", (e) => {
-      e.stopPropagation();
-      startTabRename(uiId, label, index);
-    });
+    // Modified dot or close button
+    if (tab.type === "editor" && tab.modified) {
+      const dot = document.createElement("span");
+      dot.className = "tab-modified-dot";
+      dot.title = "Unsaved changes";
+      tabEl.appendChild(dot);
+    }
 
     const closeBtn = document.createElement("span");
     closeBtn.className = "tab-close";
@@ -288,7 +476,6 @@ function renderTabBar() {
 
     tabEl.addEventListener("click", () => switchTab(uiId));
     tabBar.appendChild(tabEl);
-    index++;
   }
 
   // Agent chat tab (only show if agent is open)
@@ -345,7 +532,7 @@ listen("pty-output", (event) => {
 const terminalContainer = document.getElementById("terminal-container");
 const resizeObserver = new ResizeObserver(() => {
   const tab = tabs.get(activeTabUiId);
-  if (tab) fitAllPanes(tab);
+  if (tab?.type === "terminal") fitAllPanes(tab);
 });
 resizeObserver.observe(terminalContainer);
 
@@ -367,7 +554,7 @@ document.addEventListener("mousemove", (e) => {
   const newWidth = Math.min(Math.max(e.clientX, 150), 500);
   sidebar.style.width = newWidth + "px";
   const tab = tabs.get(activeTabUiId);
-  if (tab) fitAllPanes(tab);
+  if (tab?.type === "terminal") fitAllPanes(tab);
 });
 
 document.addEventListener("mouseup", () => {
@@ -377,8 +564,7 @@ document.addEventListener("mouseup", () => {
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     const tab = tabs.get(activeTabUiId);
-    if (tab) fitAllPanes(tab);
-    // Save sidebar width
+    if (tab?.type === "terminal") fitAllPanes(tab);
     saveSetting("sidebarWidth", parseInt(sidebar.style.width));
   }
 });
@@ -393,11 +579,13 @@ terminalContainer.addEventListener("drop", (e) => {
   e.preventDefault();
   const path = e.dataTransfer.getData("text/plain");
   if (path) {
-    const ptyId = getActivePtyId();
-    if (ptyId !== null) {
-      // Quote path if it has spaces
-      const quoted = path.includes(" ") ? `"${path}"` : path;
-      invoke("write_to_pty", { tabId: ptyId, data: quoted });
+    const tab = tabs.get(activeTabUiId);
+    if (tab?.type === "terminal") {
+      const ptyId = getActivePtyId();
+      if (ptyId !== null) {
+        const quoted = path.includes(" ") ? `"${path}"` : path;
+        invoke("write_to_pty", { tabId: ptyId, data: quoted });
+      }
     }
   }
 });
@@ -406,7 +594,7 @@ terminalContainer.addEventListener("drop", (e) => {
 terminalContainer.addEventListener("contextmenu", (e) => {
   e.preventDefault();
   const tab = tabs.get(activeTabUiId);
-  if (!tab) return;
+  if (!tab || tab.type !== "terminal") return;
   const pane = tab.panes[tab.activePane] || tab.panes[0];
   if (!pane) return;
 
@@ -460,9 +648,19 @@ terminalContainer.addEventListener("contextmenu", (e) => {
 
 // Keyboard shortcuts
 document.addEventListener("keydown", (e) => {
+  const activeTab = tabs.get(activeTabUiId);
+  const isEditorTab = activeTab?.type === "editor";
+
+  if (e.metaKey && e.key === ",") {
+    e.preventDefault();
+    openSettingsTab();
+    return;
+  }
   if (e.metaKey && e.key === "s") {
     e.preventDefault();
-    saveCurrentFile();
+    if (isEditorTab) {
+      saveEditorTab(activeTabUiId);
+    }
     return;
   }
   if (e.metaKey && e.key === "p") {
@@ -470,11 +668,23 @@ document.addEventListener("keydown", (e) => {
     showQuickOpen(getCurrentPath());
     return;
   }
+  // Cmd+F: let CodeMirror handle it for editor tabs, sidebar search for terminal tabs
+  if (e.metaKey && e.key === "f") {
+    if (isEditorTab) {
+      e.preventDefault();
+      return;
+    }
+  }
+  if (e.metaKey && e.key === "h") {
+    if (isEditorTab) {
+      e.preventDefault();
+      return;
+    }
+  }
   if (e.metaKey && e.key === "k") {
     e.preventDefault();
-    const tab = tabs.get(activeTabUiId);
-    if (tab) {
-      const pane = tab.panes[tab.activePane] || tab.panes[0];
+    if (activeTab?.type === "terminal") {
+      const pane = activeTab.panes[activeTab.activePane] || activeTab.panes[0];
       pane.term.clear();
       pane.term.focus();
     }
@@ -489,7 +699,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.metaKey && e.key === "d") {
     e.preventDefault();
-    splitPane();
+    if (!isEditorTab) splitPane();
   }
   if (e.key === "Escape") {
     closeFilePreview();
@@ -504,10 +714,10 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Focus terminal on click
-terminalContainer.addEventListener("click", () => {
+// Focus terminal on click (only for terminal tabs)
+terminalContainer.addEventListener("click", (e) => {
   const tab = tabs.get(activeTabUiId);
-  if (tab) {
+  if (tab?.type === "terminal") {
     const pane = tab.panes[tab.activePane] || tab.panes[0];
     if (pane) pane.term.focus();
   }
@@ -515,10 +725,12 @@ terminalContainer.addEventListener("click", () => {
 
 // Unsaved changes warning
 window.addEventListener("beforeunload", (e) => {
-  const saveBtn = document.getElementById("preview-save");
-  if (saveBtn && saveBtn.style.display !== "none") {
-    e.preventDefault();
-    e.returnValue = "";
+  for (const tab of tabs.values()) {
+    if (tab.type === "editor" && tab.modified) {
+      e.preventDefault();
+      e.returnValue = "";
+      return;
+    }
   }
 });
 
@@ -533,14 +745,14 @@ async function boot() {
 
   await createTab();
 
-  await initFileBrowser(() => getActivePtyId());
+  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
 
-  // Quick open: Cmd+P to search, select opens in editor
+  // Quick open: Cmd+P to search, select opens in editor tab
   initQuickOpen(getCurrentPath, (fullPath) => {
-    openFileByPath(fullPath);
+    createEditorTab(fullPath);
   });
 
-  initGitPanel(getCurrentPath);
+  initGitPanel(getCurrentPath, (filePath) => createEditorTab(filePath));
   initAgentPanel(getCurrentPath);
   setTabCallbacks(showAgentChatTab, hideAgentChatTab);
 
@@ -552,7 +764,7 @@ async function boot() {
   });
 
   fetchGitStatus(getCurrentPath());
-  startGitPolling(getCurrentPath);
+  startGitPolling(getCurrentPath, settings.gitPollInterval);
 }
 
 boot();
