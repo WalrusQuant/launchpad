@@ -31,6 +31,11 @@ struct SpawnResult {
 }
 
 #[derive(Clone, Serialize)]
+struct PtyExit {
+    tab_id: u32,
+}
+
+#[derive(Clone, Serialize)]
 struct FileEntry {
     name: String,
     path: String,
@@ -41,17 +46,20 @@ struct FileEntry {
 }
 
 #[tauri::command]
-fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResult, String> {
+fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResult, String> {
     let mut next_id = state.next_id.lock().map_err(|e| e.to_string())?;
     let tab_id = *next_id;
     *next_id += 1;
     drop(next_id);
 
+    let pty_rows = rows.unwrap_or(24);
+    let pty_cols = cols.unwrap_or(80);
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: pty_rows,
+            cols: pty_cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -61,9 +69,12 @@ fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResul
     let mut cmd = CommandBuilder::new(&shell);
     cmd.arg("-l");
     cmd.env("TERM", "xterm-256color");
-    cmd.cwd(dirs_home().unwrap_or_else(|| "/Users".into()));
+    let start_dir = cwd
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs_home().unwrap_or_else(|| "/Users".into()));
+    cmd.cwd(start_dir);
 
-    pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -80,7 +91,7 @@ fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResul
         .map_err(|e| e.to_string())?
         .insert(tab_id, instance);
 
-    // Spawn reader thread for this tab
+    // Reader thread: routes PTY output to the frontend
     let handle = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -103,6 +114,15 @@ fn spawn_pty(state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResul
                 Err(_) => break,
             }
         }
+    });
+
+    // Child-wait thread: detects when shell process exits and notifies frontend
+    let handle2 = app.clone();
+    let ptys_clone = state.ptys.clone();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let _ = ptys_clone.lock().map(|mut ptys| { ptys.remove(&tab_id); });
+        let _ = handle2.emit("pty-exit", PtyExit { tab_id });
     });
 
     Ok(SpawnResult { tab_id })

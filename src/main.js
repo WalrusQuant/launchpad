@@ -24,6 +24,11 @@ let agentTabActive = false; // is the agent chat tab currently shown?
 let activeTabUiId = -1;
 let nextUiTabId = 0;
 
+/** Wait for the browser to complete layout reflow (double-rAF). */
+function waitForLayout() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
 const terminalTheme = {
   background: "#1a1a1a",
   foreground: "#e0e0e0",
@@ -48,30 +53,38 @@ const terminalTheme = {
   brightWhite: "#ffffff",
 };
 
-function createPane(parentEl) {
-  return new Promise(async (resolve) => {
-    const result = await invoke("spawn_pty");
-    const ptyId = result.tab_id;
+async function createPane(parentEl, cwd) {
+  const s = getSettings();
+  const term = new Terminal({
+    fontFamily: s.termFontFamily,
+    fontSize: s.termFontSize,
+    lineHeight: 1.4,
+    theme: terminalTheme,
+    cursorBlink: s.termCursorBlink,
+    cursorStyle: s.termCursorStyle,
+    scrollback: s.termScrollback,
+    allowProposedApi: true,
+  });
 
-    const s = getSettings();
-    const term = new Terminal({
-      fontFamily: s.termFontFamily,
-      fontSize: s.termFontSize,
-      lineHeight: 1.4,
-      theme: terminalTheme,
-      cursorBlink: s.termCursorBlink,
-      cursorStyle: s.termCursorStyle,
-      scrollback: s.termScrollback,
-      allowProposedApi: true,
-    });
+  const fitAddon = new FitAddon();
+  term.loadAddon(fitAddon);
 
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
+  const el = document.createElement("div");
+  el.className = "pane";
+  parentEl.appendChild(el);
 
-    const el = document.createElement("div");
-    el.className = "pane";
-    parentEl.appendChild(el);
+  // NOTE: term.open() is deferred to _spawnPty so the canvas initializes with real dimensions
+  const pane = { ptyId: null, term, fitAddon, el };
 
+  term.onData((data) => {
+    if (pane.ptyId !== null) {
+      invoke("write_to_pty", { tabId: pane.ptyId, data });
+    }
+  });
+
+  // Called after the container is visible — opens terminal, fits, then spawns PTY at correct size
+  pane._spawnPty = async () => {
+    await waitForLayout();
     term.open(el);
     try {
       term.loadAddon(new WebglAddon());
@@ -79,23 +92,27 @@ function createPane(parentEl) {
       console.warn("WebGL renderer not available, using default");
     }
     fitAddon.fit();
-
-    term.onData((data) => {
-      invoke("write_to_pty", { tabId: ptyId, data });
+    // Pass actual dimensions so the PTY starts at the right size — no resize race
+    const result = await invoke("spawn_pty", {
+      cwd: cwd || getCurrentPath() || undefined,
+      rows: term.rows,
+      cols: term.cols,
     });
+    pane.ptyId = result.tab_id;
+    paneMap.set(pane.ptyId, pane);
+    delete pane._spawnPty;
+  };
 
-    const pane = { ptyId, term, fitAddon, el };
-    paneMap.set(ptyId, pane);
-
-    resolve(pane);
-  });
+  return pane;
 }
 
 function destroyPane(pane) {
   pane.term.dispose();
   pane.el.remove();
-  paneMap.delete(pane.ptyId);
-  invoke("close_pty", { tabId: pane.ptyId });
+  if (pane.ptyId !== null) {
+    paneMap.delete(pane.ptyId);
+    invoke("close_pty", { tabId: pane.ptyId });
+  }
 }
 
 async function createTab() {
@@ -112,6 +129,10 @@ async function createTab() {
 
   renderTabBar();
   switchTab(uiId);
+
+  // Spawn PTY after container is visible so fit() gets correct dimensions
+  await pane._spawnPty();
+  pane.term.focus();
 
   return uiId;
 }
@@ -181,6 +202,8 @@ async function splitPane() {
   tab.panes[0].el.addEventListener("click", () => { tab.activePane = 0; });
   tab.panes[1].el.addEventListener("click", () => { tab.activePane = 1; });
 
+  // Spawn PTY after layout is set so fit() gets correct dimensions
+  await secondPane._spawnPty();
   fitAllPanes(tab);
   secondPane.term.focus();
 }
@@ -192,7 +215,9 @@ function fitAllPanes(tab) {
     fitRAF = null;
     tab.panes.forEach((pane) => {
       pane.fitAddon.fit();
-      invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+      if (pane.ptyId !== null) {
+        invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
+      }
     });
   });
 }
@@ -270,10 +295,10 @@ async function closeTab(uiId) {
   } else if (tab.type === "terminal") {
     tab.panes.forEach(destroyPane);
   }
-  // settings tabs need no special cleanup
 
   tab.containerEl.remove();
   tabs.delete(uiId);
+  renderTabBar();
 
   if (tabs.size === 0) {
     await createTab();
@@ -281,8 +306,6 @@ async function closeTab(uiId) {
     const remaining = [...tabs.keys()];
     switchTab(remaining[remaining.length - 1]);
   }
-
-  renderTabBar();
 }
 
 // Editor tab management
@@ -535,6 +558,21 @@ listen("pty-output", (event) => {
   const pane = paneMap.get(tab_id);
   if (pane) {
     pane.term.write(data);
+  }
+});
+
+// Listen for PTY exit — auto-close the tab when the shell process exits
+listen("pty-exit", (event) => {
+  const { tab_id } = event.payload;
+  paneMap.delete(tab_id);
+  for (const [uiId, tab] of tabs) {
+    if (tab.type !== "terminal") continue;
+    if (tab.panes.some((p) => p.ptyId === tab_id)) {
+      const exitedPane = tab.panes.find((p) => p.ptyId === tab_id);
+      if (exitedPane) exitedPane.ptyId = null;
+      closeTab(uiId);
+      break;
+    }
   }
 });
 
