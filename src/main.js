@@ -632,6 +632,16 @@ const resizeObserver = new ResizeObserver(() => {
 });
 resizeObserver.observe(terminalContainer);
 
+// Refit terminal after git/agent panel close transition (ResizeObserver is blocked during transition)
+window.addEventListener("panel-transition-done", () => {
+  const tab = tabs.get(activeTabUiId);
+  if (tab?.type === "terminal") fitAllPanes(tab);
+  if (isSplit && rightActiveTabUiId !== -1) {
+    const rightTab = tabs.get(rightActiveTabUiId);
+    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+  }
+});
+
 // Sidebar resize
 const resizeHandle = document.getElementById("resize-handle");
 const sidebar = document.getElementById("sidebar");

@@ -50,7 +50,11 @@ export function togglePanel() {
     refreshPanel();
   } else {
     setPanelTransitioning(true);
-    panel.addEventListener("transitionend", () => setPanelTransitioning(false), { once: true });
+    panel.addEventListener("transitionend", () => {
+      setPanelTransitioning(false);
+      // ResizeObserver was blocked during transition — emit event so main.js can refit
+      window.dispatchEvent(new CustomEvent("panel-transition-done"));
+    }, { once: true });
     panel.classList.remove("visible");
     btn.classList.remove("active");
   }
