@@ -616,17 +616,44 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
 
 #[tauri::command]
 fn git_push(path: String) -> Result<String, String> {
+    // First try a normal push
     let output = std::process::Command::new("git")
         .args(["push"])
         .current_dir(&path)
         .output()
         .map_err(|e| e.to_string())?;
+
     if output.status.success() {
-        let msg = String::from_utf8_lossy(&output.stderr).to_string(); // git push outputs to stderr
-        Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg })
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        let msg = String::from_utf8_lossy(&output.stderr).to_string();
+        return Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg });
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // If no upstream, automatically set it up
+    if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
+        let branch_output = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+        let retry = std::process::Command::new("git")
+            .args(["push", "--set-upstream", "origin", &branch])
+            .current_dir(&path)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if retry.status.success() {
+            let msg = String::from_utf8_lossy(&retry.stderr).to_string();
+            return Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg });
+        } else {
+            return Err(String::from_utf8_lossy(&retry.stderr).to_string());
+        }
+    }
+
+    Err(stderr)
 }
 
 #[tauri::command]
