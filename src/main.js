@@ -25,6 +25,8 @@ let activeTabUiId = -1;
 let nextUiTabId = 0;
 let isCreatingTab = false;
 let panelTransitioning = false;
+let resizing = false;
+const resizeBuffer = new Map(); // ptyId → [data chunks] — buffers PTY output during resize
 
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
@@ -217,6 +219,7 @@ async function splitPane() {
 }
 
 function fitAllPanes(tab) {
+  resizing = true;
   if (tab.fitRAF) cancelAnimationFrame(tab.fitRAF);
   tab.fitRAF = requestAnimationFrame(() => {
     tab.fitRAF = null;
@@ -226,6 +229,13 @@ function fitAllPanes(tab) {
         invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
       }
     });
+    // Flush any PTY data that arrived during the resize
+    resizing = false;
+    for (const [ptyId, chunks] of resizeBuffer) {
+      const pane = paneMap.get(ptyId);
+      if (pane) pane.term.write(chunks.join(""));
+    }
+    resizeBuffer.clear();
   });
 }
 
@@ -279,8 +289,9 @@ function switchTab(uiId) {
   activeTabUiId = uiId;
 
   if (tab.type === "terminal") {
+    resizing = true; // Gate PTY writes until fit completes
+    fitAllPanes(tab);
     requestAnimationFrame(() => {
-      fitAllPanes(tab);
       const activePane = tab.panes[tab.activePane] || tab.panes[0];
       if (activePane) activePane.term.focus();
     });
@@ -583,8 +594,14 @@ function startTabRename(uiId, labelEl, index) {
 }
 
 // Listen for PTY output — route by ptyId to correct pane
+// During resize, buffer writes so xterm.js renders at correct dimensions
 listen("pty-output", (event) => {
   const { tab_id, data } = event.payload;
+  if (resizing) {
+    if (!resizeBuffer.has(tab_id)) resizeBuffer.set(tab_id, []);
+    resizeBuffer.get(tab_id).push(data);
+    return;
+  }
   const pane = paneMap.get(tab_id);
   if (pane) {
     pane.term.write(data);
