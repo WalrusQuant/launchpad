@@ -25,8 +25,10 @@ let activeTabUiId = -1;
 let nextUiTabId = 0;
 let isCreatingTab = false;
 let panelTransitioning = false;
-let resizing = false;
-const resizeBuffer = new Map(); // ptyId → [data chunks] — buffers PTY output during resize
+// Per-pane resize coordination lives on each pane object (see createPane).
+// fitAllPanes uses a trailing-edge debounce stored on tab.fitDebounceTimer.
+const FIT_DEBOUNCE_MS = 60; // Coalesces ResizeObserver firehose during drags
+const RESIZE_SETTLE_MS = 50; // Time to let SIGWINCH propagate + shell repaint before flushing buffer
 
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
@@ -78,7 +80,18 @@ async function createPane(parentEl, cwd) {
   parentEl.appendChild(el);
 
   // NOTE: term.open() is deferred to _spawnPty so the canvas initializes with real dimensions
-  const pane = { ptyId: null, term, fitAddon, el };
+  const pane = {
+    ptyId: null,
+    term,
+    fitAddon,
+    el,
+    // Resize coordination — gates pty-output writes while xterm/pty dimensions sync
+    resizing: false,
+    resizeBuffer: [],
+    lastSentRows: 0,
+    lastSentCols: 0,
+    settleTimer: null,
+  };
 
   term.onData((data) => {
     if (pane.ptyId !== null) {
@@ -160,7 +173,7 @@ async function splitPane() {
     if (handle) handle.remove();
     tab.containerEl.classList.remove("split");
     tab.activePane = 0;
-    fitAllPanes(tab);
+    fitAllPanes(tab, { immediate: true });
     tab.panes[0].term.focus();
     return;
   }
@@ -214,29 +227,96 @@ async function splitPane() {
 
   // Spawn PTY after layout is set so fit() gets correct dimensions
   await secondPane._spawnPty();
-  fitAllPanes(tab);
+  fitAllPanes(tab, { immediate: true });
   secondPane.term.focus();
 }
 
-function fitAllPanes(tab) {
-  resizing = true;
-  if (tab.fitRAF) cancelAnimationFrame(tab.fitRAF);
-  tab.fitRAF = requestAnimationFrame(() => {
-    tab.fitRAF = null;
-    tab.panes.forEach((pane) => {
-      pane.fitAddon.fit();
-      if (pane.ptyId !== null) {
-        invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
-      }
-    });
-    // Flush any PTY data that arrived during the resize
-    resizing = false;
-    for (const [ptyId, chunks] of resizeBuffer) {
-      const pane = paneMap.get(ptyId);
-      if (pane) pane.term.write(chunks.join(""));
+// Flushes a pane's resize buffer and reopens the gate.
+function flushPane(pane) {
+  if (pane.settleTimer) {
+    clearTimeout(pane.settleTimer);
+    pane.settleTimer = null;
+  }
+  pane.resizing = false;
+  if (pane.resizeBuffer.length > 0) {
+    pane.term.write(pane.resizeBuffer.join(""));
+    pane.resizeBuffer.length = 0;
+  }
+}
+
+// The actual fit/resize coordinator. Per-pane gating; awaits the IPC; settles before flush.
+async function _runFit(tab) {
+  // For each pane: gate, fit, and decide whether the IPC is needed.
+  const needIpc = [];
+  for (const pane of tab.panes) {
+    pane.resizing = true;
+    // Cancel any pending settle so we don't flush against a stale grid mid-cycle.
+    if (pane.settleTimer) {
+      clearTimeout(pane.settleTimer);
+      pane.settleTimer = null;
     }
-    resizeBuffer.clear();
-  });
+    try {
+      pane.fitAddon.fit();
+    } catch (e) {
+      // term.open() may not have run yet (initial pane creation); fit is a no-op then.
+    }
+    if (pane.ptyId === null) {
+      // PTY not spawned yet — nothing to gate against, drop the gate immediately.
+      pane.resizing = false;
+      continue;
+    }
+    const rows = pane.term.rows;
+    const cols = pane.term.cols;
+    if (rows === pane.lastSentRows && cols === pane.lastSentCols) {
+      // No-op short-circuit: dimensions unchanged, skip IPC and ungate immediately.
+      pane.resizing = false;
+      // Drain anything that may have buffered between gate-on and short-circuit.
+      if (pane.resizeBuffer.length > 0) {
+        pane.term.write(pane.resizeBuffer.join(""));
+        pane.resizeBuffer.length = 0;
+      }
+      continue;
+    }
+    needIpc.push({ pane, rows, cols });
+  }
+
+  if (needIpc.length === 0) return;
+
+  // Issue all resize_pty calls in parallel and wait for them to land in Rust.
+  await Promise.all(
+    needIpc.map(({ pane, rows, cols }) =>
+      invoke("resize_pty", { tabId: pane.ptyId, rows, cols }).then(() => {
+        pane.lastSentRows = rows;
+        pane.lastSentCols = cols;
+      }).catch((e) => {
+        console.warn("resize_pty failed", e);
+      })
+    )
+  );
+
+  // Schedule per-pane settle. SIGWINCH + shell repaint needs a frame to land
+  // before we replay buffered output against the new grid.
+  for (const { pane } of needIpc) {
+    pane.settleTimer = setTimeout(() => flushPane(pane), RESIZE_SETTLE_MS);
+  }
+}
+
+// Public entry point. Trailing-edge debounce coalesces ResizeObserver firehose.
+// Pass { immediate: true } for programmatic single-shot fits (tab switch, panel transitions).
+function fitAllPanes(tab, { immediate = false } = {}) {
+  if (!tab || tab.type !== "terminal") return;
+  if (tab.fitDebounceTimer) {
+    clearTimeout(tab.fitDebounceTimer);
+    tab.fitDebounceTimer = null;
+  }
+  if (immediate) {
+    _runFit(tab);
+    return;
+  }
+  tab.fitDebounceTimer = setTimeout(() => {
+    tab.fitDebounceTimer = null;
+    _runFit(tab);
+  }, FIT_DEBOUNCE_MS);
 }
 
 function getActivePtyId() {
@@ -289,8 +369,7 @@ function switchTab(uiId) {
   activeTabUiId = uiId;
 
   if (tab.type === "terminal") {
-    resizing = true; // Gate PTY writes until fit completes
-    fitAllPanes(tab);
+    fitAllPanes(tab, { immediate: true });
     requestAnimationFrame(() => {
       const activePane = tab.panes[tab.activePane] || tab.panes[0];
       if (activePane) activePane.term.focus();
@@ -467,11 +546,10 @@ function applySettingLive(key, value) {
         if (key === "termFontFamily") pane.term.options.fontFamily = value;
         if (key === "termCursorStyle") pane.term.options.cursorStyle = value;
         if (key === "termCursorBlink") pane.term.options.cursorBlink = value;
-        pane.fitAddon.fit();
-        if (pane.ptyId !== null) {
-          invoke("resize_pty", { tabId: pane.ptyId, rows: pane.term.rows, cols: pane.term.cols });
-        }
       }
+      // Route through the gated/awaited resize path so font-metric changes
+      // can't race with PTY output (Race #2 fix).
+      fitAllPanes(tab, { immediate: true });
     }
   }
 
@@ -593,19 +671,18 @@ function startTabRename(uiId, labelEl, index) {
   input.addEventListener("blur", finishRename);
 }
 
-// Listen for PTY output — route by ptyId to correct pane
-// During resize, buffer writes so xterm.js renders at correct dimensions
+// Listen for PTY output — route by ptyId to correct pane.
+// Per-pane gating: if this pane is currently resizing, buffer until the settle
+// timer flushes (avoids writing OLD-col-count bytes into a NEW-col-count grid).
 listen("pty-output", (event) => {
   const { tab_id, data } = event.payload;
-  if (resizing) {
-    if (!resizeBuffer.has(tab_id)) resizeBuffer.set(tab_id, []);
-    resizeBuffer.get(tab_id).push(data);
+  const pane = paneMap.get(tab_id);
+  if (!pane) return;
+  if (pane.resizing) {
+    pane.resizeBuffer.push(data);
     return;
   }
-  const pane = paneMap.get(tab_id);
-  if (pane) {
-    pane.term.write(data);
-  }
+  pane.term.write(data);
 });
 
 // Listen for PTY exit — auto-close the tab when the shell process exits

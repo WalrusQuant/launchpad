@@ -16,6 +16,7 @@ type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 struct PtyInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
+    last_size: (u16, u16), // (rows, cols) — used to skip redundant resizes
 }
 
 struct AppState {
@@ -94,6 +95,7 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
     let instance = PtyInstance {
         writer,
         master: pair.master,
+        last_size: (pty_rows, pty_cols),
     };
 
     state
@@ -153,8 +155,12 @@ fn write_to_pty(tab_id: u32, data: String, state: State<AppState>) -> Result<(),
 
 #[tauri::command]
 fn resize_pty(tab_id: u32, rows: u16, cols: u16, state: State<AppState>) -> Result<(), String> {
-    let ptys = state.ptys.lock().map_err(|e| e.to_string())?;
-    let instance = ptys.get(&tab_id).ok_or("Tab not found")?;
+    let mut ptys = state.ptys.lock().map_err(|e| e.to_string())?;
+    let instance = ptys.get_mut(&tab_id).ok_or("Tab not found")?;
+    // Skip redundant resizes — avoids spurious SIGWINCH and shell repaints
+    if instance.last_size == (rows, cols) {
+        return Ok(());
+    }
     instance
         .master
         .resize(PtySize {
@@ -164,6 +170,7 @@ fn resize_pty(tab_id: u32, rows: u16, cols: u16, state: State<AppState>) -> Resu
             pixel_height: 0,
         })
         .map_err(|e| e.to_string())?;
+    instance.last_size = (rows, cols);
     Ok(())
 }
 
