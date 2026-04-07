@@ -80,7 +80,24 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
     cmd.arg("-l");
+
+    // Inherit the parent process environment. portable-pty's CommandBuilder does
+    // NOT inherit env by default — without this the shell starts with almost
+    // nothing, and programs that read env directly (Claude Code, Ink-based TUIs)
+    // fall back to limited terminfo and emit clear-region escape codes that don't
+    // match what xterm.js actually erases. That's the cause of the "floating
+    // character" ghosts (Shingle bubble fragments, status bar remnants).
+    for (key, value) in std::env::vars() {
+        cmd.env(&key, &value);
+    }
+    // Override / set the terminal-identifying vars that iTerm and Terminal.app set.
     cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "Launchpad");
+    // Ensure UTF-8 locale so multi-byte glyph widths get measured correctly.
+    if std::env::var("LANG").is_err() {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
     let start_dir = cwd
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| dirs_home().unwrap_or_else(|| "/Users".into()));

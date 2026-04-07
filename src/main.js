@@ -64,7 +64,6 @@ async function createPane(parentEl, cwd) {
   const term = new Terminal({
     fontFamily: s.termFontFamily,
     fontSize: s.termFontSize,
-    lineHeight: 1.4,
     theme: terminalTheme,
     cursorBlink: s.termCursorBlink,
     cursorStyle: s.termCursorStyle,
@@ -102,6 +101,12 @@ async function createPane(parentEl, cwd) {
   // Called after the container is visible — opens terminal, fits, then spawns PTY at correct size
   pane._spawnPty = async () => {
     await waitForLayout();
+    // Wait for web fonts before measuring cell metrics — otherwise xterm measures
+    // the fallback font, the WebGL atlas bakes in wrong cell dims, and glyph
+    // fragments persist as "floating characters" once the real font loads.
+    if (document.fonts && document.fonts.ready) {
+      await document.fonts.ready;
+    }
     term.open(el);
     try {
       term.loadAddon(new WebglAddon());
