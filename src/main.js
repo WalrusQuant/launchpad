@@ -35,6 +35,96 @@ function waitForLayout() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
+// =============================================================================
+// Debug capture — toggle via toolbar button (⦿). Captures PTY output bytes,
+// keystrokes, fit/resize events, and user-placed marks to an NDJSON log at
+// ~/.launchpad/debug.log. Zero overhead when off.
+// =============================================================================
+let debugCaptureActive = false;
+let debugLog = [];
+let debugStartTime = 0;
+const DEBUG_MAX_ENTRIES = 500_000;
+
+function hexOf(s) {
+  if (typeof s !== "string") s = String(s);
+  const bytes = new TextEncoder().encode(s);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function dbg(event, data) {
+  if (!debugCaptureActive) return;
+  if (debugLog.length >= DEBUG_MAX_ENTRIES) return;
+  debugLog.push({
+    t: Math.round(performance.now() - debugStartTime),
+    event,
+    ...data,
+  });
+}
+
+function startDebugCapture() {
+  debugLog = [];
+  debugStartTime = performance.now();
+  debugCaptureActive = true;
+  const tab = tabs.get(activeTabUiId);
+  const pane = tab?.type === "terminal" ? tab.panes[tab.activePane] : null;
+  dbg("capture_started", {
+    activePty: pane?.ptyId ?? null,
+    rows: pane?.term?.rows ?? null,
+    cols: pane?.term?.cols ?? null,
+    containerW: document.getElementById("terminal-container")?.clientWidth ?? null,
+    containerH: document.getElementById("terminal-container")?.clientHeight ?? null,
+  });
+  updateDebugButton();
+}
+
+async function stopDebugCapture() {
+  debugCaptureActive = false;
+  dbg("capture_stopped", { totalEntries: debugLog.length });
+  const totalEntries = debugLog.length;
+  const content = debugLog.map((e) => JSON.stringify(e)).join("\n");
+  const btn = document.getElementById("debug-capture");
+  try {
+    const path = await invoke("write_debug_log", { content });
+    console.log(`[debug-capture] Wrote ${totalEntries} events → ${path}`);
+    if (btn) {
+      btn.title = `Saved ${totalEntries} events → ${path}`;
+      btn.classList.add("debug-saved");
+      setTimeout(() => btn.classList.remove("debug-saved"), 2000);
+    }
+  } catch (e) {
+    console.error(`[debug-capture] Write failed:`, e);
+    if (btn) btn.title = `Debug capture write failed: ${e}`;
+  }
+  updateDebugButton();
+}
+
+function markDebug(label = "MARK") {
+  if (!debugCaptureActive) return;
+  dbg("mark", { label });
+  // Visible feedback so the user knows the mark landed.
+  const btn = document.getElementById("debug-capture");
+  if (btn) {
+    btn.classList.add("debug-marked");
+    setTimeout(() => btn.classList.remove("debug-marked"), 200);
+  }
+}
+
+function updateDebugButton() {
+  const btn = document.getElementById("debug-capture");
+  if (!btn) return;
+  if (debugCaptureActive) {
+    btn.classList.add("debug-recording");
+    btn.title = "Recording — click to stop. Cmd+Shift+X to mark.";
+  } else {
+    btn.classList.remove("debug-recording");
+    btn.title = "Debug capture";
+  }
+}
+
 const terminalTheme = {
   background: "#1a1a1a",
   foreground: "#e0e0e0",
@@ -94,6 +184,7 @@ async function createPane(parentEl, cwd) {
 
   term.onData((data) => {
     if (pane.ptyId !== null) {
+      dbg("keystroke", { pty: pane.ptyId, len: data.length, hex: hexOf(data) });
       invoke("write_to_pty", { tabId: pane.ptyId, data });
     }
   });
@@ -257,6 +348,7 @@ function flushPane(pane) {
 
 // The actual fit/resize coordinator. Per-pane gating; awaits the IPC; settles before flush.
 async function _runFit(tab) {
+  dbg("runfit_start", { paneCount: tab.panes.length });
   // Phase 1: gate every pane and cancel any pending settles. After this, new
   // pty-output events will buffer in pane.resizeBuffer instead of writing
   // directly.
@@ -291,11 +383,24 @@ async function _runFit(tab) {
   // Phase 3: fit each pane and decide whether the IPC resize is needed.
   const needIpc = [];
   for (const pane of tab.panes) {
+    const beforeRows = pane.term.rows;
+    const beforeCols = pane.term.cols;
+    const elW = pane.el?.clientWidth;
+    const elH = pane.el?.clientHeight;
     try {
       pane.fitAddon.fit();
     } catch (e) {
       // term.open() may not have run yet (initial pane creation); fit is a no-op then.
     }
+    dbg("fit", {
+      pty: pane.ptyId,
+      beforeRows,
+      beforeCols,
+      afterRows: pane.term.rows,
+      afterCols: pane.term.cols,
+      elW,
+      elH,
+    });
     if (pane.ptyId === null) {
       // PTY not spawned yet — nothing to gate against, drop the gate immediately.
       pane.resizing = false;
@@ -320,14 +425,17 @@ async function _runFit(tab) {
 
   // Issue all resize_pty calls in parallel and wait for them to land in Rust.
   await Promise.all(
-    needIpc.map(({ pane, rows, cols }) =>
-      invoke("resize_pty", { tabId: pane.ptyId, rows, cols }).then(() => {
+    needIpc.map(({ pane, rows, cols }) => {
+      dbg("resize_pty_send", { pty: pane.ptyId, rows, cols });
+      return invoke("resize_pty", { tabId: pane.ptyId, rows, cols }).then(() => {
+        dbg("resize_pty_ack", { pty: pane.ptyId, rows, cols });
         pane.lastSentRows = rows;
         pane.lastSentCols = cols;
       }).catch((e) => {
+        dbg("resize_pty_error", { pty: pane.ptyId, error: String(e) });
         console.warn("resize_pty failed", e);
-      })
-    )
+      });
+    })
   );
 
   // Schedule per-pane settle. SIGWINCH + shell repaint needs a frame to land
@@ -713,11 +821,24 @@ function startTabRename(uiId, labelEl, index) {
 listen("pty-output", (event) => {
   const { tab_id, data } = event.payload;
   const pane = paneMap.get(tab_id);
-  if (!pane) return;
+  if (!pane) {
+    dbg("pty_output_dropped", { pty: tab_id, len: data.length, hex: hexOf(data) });
+    return;
+  }
   if (pane.resizing) {
+    dbg("pty_output_buffered", { pty: tab_id, len: data.length, hex: hexOf(data) });
     pane.resizeBuffer.push(data);
     return;
   }
+  dbg("pty_output", {
+    pty: tab_id,
+    len: data.length,
+    hex: hexOf(data),
+    cursorX: pane.term.buffer?.active?.cursorX,
+    cursorY: pane.term.buffer?.active?.cursorY,
+    rows: pane.term.rows,
+    cols: pane.term.cols,
+  });
   pane.term.write(data);
 });
 
@@ -755,8 +876,13 @@ listen("fs-changed", (event) => {
 
 // Resize observer
 const terminalContainer = document.getElementById("terminal-container");
-const resizeObserver = new ResizeObserver(() => {
+const resizeObserver = new ResizeObserver((entries) => {
   if (panelTransitioning) return;
+  const entry = entries[0];
+  dbg("resize_observer", {
+    w: Math.round(entry?.contentRect?.width ?? 0),
+    h: Math.round(entry?.contentRect?.height ?? 0),
+  });
   const tab = tabs.get(activeTabUiId);
   if (tab?.type === "terminal") fitAllPanes(tab);
   // When workspace is split, the right group's terminal needs refitting too
@@ -960,6 +1086,12 @@ document.addEventListener("keydown", (e) => {
     if (focusedGroup === "left") moveTabToRight(activeTabUiId);
     else moveTabToLeft(rightActiveTabUiId);
   }
+  // Cmd+Shift+X — drop a mark in the debug log (when capturing).
+  // Use this the moment you see a ghost character so I can find the event.
+  if (e.metaKey && e.shiftKey && (e.key === "X" || e.key === "x") && debugCaptureActive) {
+    e.preventDefault();
+    markDebug("USER_MARK");
+  }
   if (e.key === "Escape") {
     closeFilePreview();
   }
@@ -1062,6 +1194,12 @@ function isOverEl(mouseEvent, el) {
 
 // Settings button
 document.getElementById("open-settings").addEventListener("click", () => openSettingsTab());
+
+// Debug capture toolbar button — toggles NDJSON capture of PTY/xterm events.
+document.getElementById("debug-capture").addEventListener("click", () => {
+  if (debugCaptureActive) stopDebugCapture();
+  else startDebugCapture();
+});
 
 // ===== Split Workspace =====
 // Parallel tab system for the right group. Left group uses existing code untouched.

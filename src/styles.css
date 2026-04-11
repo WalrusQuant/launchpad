@@ -115,6 +115,26 @@ html, body, #app {
   border-color: #57c7ff;
 }
 
+.toolbar-btn.debug-recording {
+  background: #5a1a1a;
+  color: #ff6e6e;
+  border-color: #ff5252;
+  animation: debug-pulse 1.5s ease-in-out infinite;
+}
+.toolbar-btn.debug-marked {
+  background: #ffeb3b;
+  color: #1a1a1a;
+}
+.toolbar-btn.debug-saved {
+  background: #1a5a1a;
+  color: #6eff6e;
+  border-color: #52ff52;
+}
+@keyframes debug-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.5); }
+  50% { box-shadow: 0 0 0 4px rgba(255, 82, 82, 0); }
+}
+
 #main-layout {
   display: flex;
   flex-direction: column;

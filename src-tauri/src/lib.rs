@@ -217,6 +217,18 @@ fn resize_pty(tab_id: u32, rows: u16, cols: u16, state: State<AppState>) -> Resu
     Ok(())
 }
 
+// Writes a debug capture session to ~/.launchpad/debug.log. Overwrites any
+// previous capture. Returns the absolute path so the frontend can display it.
+#[tauri::command]
+fn write_debug_log(content: String) -> Result<String, String> {
+    let home = dirs_home().ok_or_else(|| "no HOME".to_string())?;
+    let dir = home.join(".launchpad");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("debug.log");
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn close_pty(tab_id: u32, state: State<AppState>) -> Result<(), String> {
     state
@@ -1370,6 +1382,7 @@ pub fn run() {
             write_to_pty,
             resize_pty,
             close_pty,
+            write_debug_log,
             read_directory,
             get_home_dir,
             get_git_status,
