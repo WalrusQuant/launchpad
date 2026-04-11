@@ -17,6 +17,10 @@ struct PtyInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     last_size: (u16, u16), // (rows, cols) — used to skip redundant resizes
+    // Reader held until the frontend has registered this PTY in paneMap, then
+    // claimed by start_pty_reader. Prevents the race where pty-output events
+    // fire before paneMap.set() and get silently dropped by the JS listener.
+    pending_reader: Option<Box<dyn Read + Send>>,
 }
 
 struct AppState {
@@ -106,13 +110,17 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
+    // Store the reader in the instance instead of spawning the output thread
+    // here. The frontend will call start_pty_reader AFTER registering the pane
+    // in paneMap, closing the race where early output gets dropped.
     let instance = PtyInstance {
         writer,
         master: pair.master,
         last_size: (pty_rows, pty_cols),
+        pending_reader: Some(reader),
     };
 
     state
@@ -121,7 +129,33 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
         .map_err(|e| e.to_string())?
         .insert(tab_id, instance);
 
-    // Reader thread: routes PTY output to the frontend
+    // Child-wait thread: detects when shell process exits and notifies frontend
+    let handle2 = app.clone();
+    let ptys_clone = state.ptys.clone();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let _ = ptys_clone.lock().map(|mut ptys| { ptys.remove(&tab_id); });
+        let _ = handle2.emit("pty-exit", PtyExit { tab_id });
+    });
+
+    Ok(SpawnResult { tab_id })
+}
+
+// Called by the frontend AFTER it has registered the pane in paneMap.
+// Claims the reader stored during spawn_pty and spawns the output thread.
+// Splitting this off from spawn_pty closes the race where pty-output events
+// fire before the frontend's listener has a pane to route them to.
+#[tauri::command]
+fn start_pty_reader(tab_id: u32, state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    let mut reader = {
+        let mut ptys = state.ptys.lock().map_err(|e| e.to_string())?;
+        let instance = ptys.get_mut(&tab_id).ok_or("Tab not found")?;
+        instance
+            .pending_reader
+            .take()
+            .ok_or("Reader already started")?
+    };
+
     let handle = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -136,7 +170,8 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
                         Err(e) => e.valid_up_to(),
                     };
                     if valid_up_to > 0 {
-                        let output = String::from_utf8(leftover[..valid_up_to].to_vec()).expect("valid_up_to guarantees valid UTF-8");
+                        let output = String::from_utf8(leftover[..valid_up_to].to_vec())
+                            .expect("valid_up_to guarantees valid UTF-8");
                         let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
                         leftover = leftover[valid_up_to..].to_vec();
                     }
@@ -146,16 +181,7 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
         }
     });
 
-    // Child-wait thread: detects when shell process exits and notifies frontend
-    let handle2 = app.clone();
-    let ptys_clone = state.ptys.clone();
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        let _ = ptys_clone.lock().map(|mut ptys| { ptys.remove(&tab_id); });
-        let _ = handle2.emit("pty-exit", PtyExit { tab_id });
-    });
-
-    Ok(SpawnResult { tab_id })
+    Ok(())
 }
 
 #[tauri::command]
@@ -1340,6 +1366,7 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             spawn_pty,
+            start_pty_reader,
             write_to_pty,
             resize_pty,
             close_pty,

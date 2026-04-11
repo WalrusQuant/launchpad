@@ -122,6 +122,12 @@ async function createPane(parentEl, cwd) {
     });
     pane.ptyId = result.tab_id;
     paneMap.set(pane.ptyId, pane);
+    // Only now that the listener can route output to this pane, ask Rust to
+    // start reading. Splitting this from spawn_pty closes the race where the
+    // shell's first bytes (prompt, initial escape sequences) fired before
+    // paneMap had an entry and were silently dropped — which left xterm's
+    // internal state permanently desynced from the shell.
+    await invoke("start_pty_reader", { tabId: pane.ptyId });
     delete pane._spawnPty;
   };
 
@@ -251,15 +257,40 @@ function flushPane(pane) {
 
 // The actual fit/resize coordinator. Per-pane gating; awaits the IPC; settles before flush.
 async function _runFit(tab) {
-  // For each pane: gate, fit, and decide whether the IPC is needed.
-  const needIpc = [];
+  // Phase 1: gate every pane and cancel any pending settles. After this, new
+  // pty-output events will buffer in pane.resizeBuffer instead of writing
+  // directly.
   for (const pane of tab.panes) {
     pane.resizing = true;
-    // Cancel any pending settle so we don't flush against a stale grid mid-cycle.
     if (pane.settleTimer) {
       clearTimeout(pane.settleTimer);
       pane.settleTimer = null;
     }
+  }
+
+  // Phase 2: drain each pane's xterm write queue BEFORE changing dimensions.
+  // term.write() is async — xterm has an internal queue. If we call fit()
+  // (which synchronously resizes the xterm buffer) while bytes from the old
+  // column count are still queued, those bytes get processed against the new
+  // grid and land at wrong columns. term.write("", cb) fires cb after the
+  // queue drains, so awaiting it guarantees all pre-gate bytes have hit the
+  // old grid before we resize.
+  await Promise.all(
+    tab.panes.map(
+      (pane) =>
+        new Promise((resolve) => {
+          try {
+            pane.term.write("", resolve);
+          } catch (e) {
+            resolve();
+          }
+        })
+    )
+  );
+
+  // Phase 3: fit each pane and decide whether the IPC resize is needed.
+  const needIpc = [];
+  for (const pane of tab.panes) {
     try {
       pane.fitAddon.fit();
     } catch (e) {
@@ -728,6 +759,13 @@ const resizeObserver = new ResizeObserver(() => {
   if (panelTransitioning) return;
   const tab = tabs.get(activeTabUiId);
   if (tab?.type === "terminal") fitAllPanes(tab);
+  // When workspace is split, the right group's terminal needs refitting too
+  // — ResizeObserver only watches the left container, so without this the
+  // right group's xterm grid stays CSS-stretched after window resizes.
+  if (isSplit && rightActiveTabUiId !== -1) {
+    const rightTab = tabs.get(rightActiveTabUiId);
+    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+  }
 });
 resizeObserver.observe(terminalContainer);
 
@@ -1339,6 +1377,16 @@ async function splitWorkspace() {
       splitHandleEl.classList.remove("dragging");
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      // Refit both groups' active terminals — their container widths just
+      // changed via flex, but xterm's internal col/row count is still the
+      // pre-drag value. Without this, xterm's grid is CSS-stretched and
+      // characters render at wrong positions.
+      const leftTab = tabs.get(activeTabUiId);
+      if (leftTab?.type === "terminal") fitAllPanes(leftTab);
+      if (rightActiveTabUiId !== -1) {
+        const rightTab = tabs.get(rightActiveTabUiId);
+        if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+      }
     }
   });
 
