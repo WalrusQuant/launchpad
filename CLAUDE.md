@@ -5,7 +5,7 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 
 ## Tech Stack
 - **Tauri v2** — native macOS desktop shell
-- **Rust** — PTY management, filesystem ops, git operations via `git2` crate + system `git` for network ops (push/pull/merge), AI agent streaming via `reqwest`
+- **Rust** — PTY management, filesystem ops, git operations via `git2` crate + system `git` for network ops (push/pull/merge)
 - **Vanilla JS** — all frontend logic, no React/Vue/Svelte
 - **xterm.js** — terminal emulator with WebGL renderer
 - **CodeMirror 6** — code editor with syntax highlighting and search
@@ -22,14 +22,12 @@ src/                    # Frontend (JS/CSS/HTML)
   quickopen.js          # Cmd+P fuzzy file finder
   settings.js           # Persistent settings store (~/.launchpad/config.json)
   settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections)
-  agentpanel.js         # AI agent chat panel with tool use, streaming, provider/model selection
-  providers.js          # AI provider presets and management (Anthropic, OpenAI, Gemini, Grok, OpenRouter, custom)
   styles.css            # All styles (organized by section with comment headers)
 src-tauri/              # Rust backend
-  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings, agent streaming)
+  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings)
   Cargo.toml            # Rust dependencies
   tauri.conf.json       # App configuration
-index.html              # Main HTML shell (includes toolbar with settings, shortcuts, agent, git buttons)
+index.html              # Main HTML shell (includes toolbar with settings, shortcuts, git buttons)
 ```
 
 ## Key Architecture Decisions
@@ -55,11 +53,6 @@ index.html              # Main HTML shell (includes toolbar with settings, short
 ### Git
 - **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers.
 - **Git status dual entries**: `get_git_status` emits separate entries for staged (`index_new`, `index_modified`, `index_deleted`) and unstaged (`new`, `modified`, `deleted`) changes. A file can appear in both lists.
-
-### AI Agent
-- **Multi-provider streaming**: `agent_chat_stream` in Rust handles SSE streaming for both OpenAI and Anthropic wire formats. Emits `agent-chunk` events with types: `text`, `tool_call`, `done`, `error`.
-- **Tool system**: Agent has 5 tools — `read_file`, `write_file`, `search_files`, `list_directory`, `run_command`. Tool calls are executed frontend-side and results sent back in the conversation.
-- **Provider presets**: `providers.js` defines defaults for Anthropic, OpenAI, Gemini, Grok, OpenRouter, and custom OpenAI-compatible endpoints. Each provider has a model list, active model, base URL, and API key.
 
 ### Settings & State
 - **Live settings**: Settings changes apply immediately to all open terminals/editors. Stored as JSON at `~/.launchpad/config.json`.
@@ -95,7 +88,6 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 | Cmd+\\ | Split/unsplit workspace (left/right groups) |
 | Cmd+Option+Left/Right | Switch focused group |
 | Cmd+Shift+M | Move tab to other group |
-| Cmd+I | Toggle AI agent panel |
 | Cmd+G | Toggle git panel |
 | Cmd+P | Quick open file |
 | Cmd+F | Find in editor / search file tree |
@@ -138,9 +130,6 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 ### Settings
 - `load_settings()` / `save_settings(settings)`
 
-### Agent
-- `agent_chat_stream(messages, provider, model, base_url, api_key, provider_type, tools)` — stream AI response with tool support
-
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`
 2. Register it in the `invoke_handler` in `run()`
@@ -152,8 +141,6 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 - File browser features → `filebrowser.js`
 - Git features → `gitpanel.js`
 - Editor features → `editor.js`
-- AI agent features → `agentpanel.js`
-- AI providers → `providers.js`
 - Settings → `settingspanel.js` (UI) + `settings.js` (storage)
 - Styles → `styles.css` (organized by section with comment headers)
 
@@ -166,15 +153,3 @@ Key patterns:
 - `showConfirmPopup()` — positioned popup for destructive actions (discard, delete branch)
 - `showGitFeedback()` — temporary toast for success/error messages
 - GitHub URL parsing handles both SSH and HTTPS remote formats
-
-## Agent Panel Architecture
-The agent panel (`agentpanel.js`) manages a conversation with tool-calling loop:
-
-1. User sends message → `agent_chat_stream` Tauri command starts SSE stream
-2. Rust backend emits `agent-chunk` events (text deltas, tool calls, done, errors)
-3. Frontend accumulates text and tool calls from the stream
-4. When a tool call arrives, it's executed locally (read/write files, search, list dir, queue command)
-5. Tool results are appended to conversation and a follow-up request is sent automatically
-6. Loop continues until the agent responds with text only (no more tool calls)
-
-Provider/model selection UI lives in the panel header. Provider config (API keys, models) is stored in settings.

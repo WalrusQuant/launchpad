@@ -17,9 +17,6 @@ portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 git2 = "0.19"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-futures-util = "0.3"
-tokio = { version = "1", features = ["rt", "sync"] }
 notify-debouncer-mini = "0.5"
 
 [dev-dependencies]

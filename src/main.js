@@ -8,7 +8,6 @@ import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
 import { initQuickOpen, show as showQuickOpen, updateRoot as updateQuickOpenRoot } from "./quickopen.js";
-import { initAgentPanel, setTabCallbacks, isAgentVisible } from "./agentpanel.js";
 import { createSettingsPanel } from "./settingspanel.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -20,7 +19,6 @@ const { listen } = window.__TAURI__.event;
 // Each pane: { ptyId, term, fitAddon, el }
 const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
-let agentTabActive = false; // is the agent chat tab currently shown?
 let activeTabUiId = -1;
 let nextUiTabId = 0;
 let isCreatingTab = false;
@@ -469,38 +467,8 @@ function getActivePtyId() {
   return tab.panes[tab.activePane]?.ptyId ?? tab.panes[0]?.ptyId ?? null;
 }
 
-function showAgentChatTab() {
-  // Hide current terminal tab
-  if (tabs.has(activeTabUiId)) {
-    tabs.get(activeTabUiId).containerEl.style.display = "none";
-  }
-  document.getElementById("agent-chat-tab").style.display = "flex";
-  agentTabActive = true;
-  renderTabBar();
-}
-
-function hideAgentChatTab() {
-  document.getElementById("agent-chat-tab").style.display = "none";
-  agentTabActive = false;
-  // Show the last active tab
-  if (tabs.has(activeTabUiId)) {
-    const tab = tabs.get(activeTabUiId);
-    tab.containerEl.style.display = "flex";
-    if (tab.type === "terminal") {
-      requestAnimationFrame(() => fitAllPanes(tab));
-    }
-  }
-  renderTabBar();
-}
-
 function switchTab(uiId) {
-  if (activeTabUiId === uiId && tabs.has(uiId) && !agentTabActive) return;
-
-  // Hide agent chat if showing
-  if (agentTabActive) {
-    document.getElementById("agent-chat-tab").style.display = "none";
-    agentTabActive = false;
-  }
+  if (activeTabUiId === uiId && tabs.has(uiId)) return;
 
   // Hide current tab
   if (tabs.has(activeTabUiId)) {
@@ -713,7 +681,7 @@ function renderTabBar() {
   let termIndex = 1;
   for (const [uiId, tab] of tabs) {
     if (tab._rightGroup) continue; // skip tabs in the right split group
-    const isActive = uiId === activeTabUiId && !agentTabActive;
+    const isActive = uiId === activeTabUiId;
     const tabEl = document.createElement("div");
     tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
     tabEl.dataset.tabId = uiId;
@@ -765,15 +733,6 @@ function renderTabBar() {
       startTabDrag(tabEl, uiId, "left", e);
     });
     tabBar.appendChild(tabEl);
-  }
-
-  // Agent chat tab (only show if agent is open)
-  if (isAgentVisible()) {
-    const agentTab = document.createElement("div");
-    agentTab.className = `tab tab-agent ${agentTabActive ? "tab-active" : ""}`;
-    agentTab.innerHTML = `<span class="tab-label">⚡ Agent</span>`;
-    agentTab.addEventListener("click", () => showAgentChatTab());
-    tabBar.appendChild(agentTab);
   }
 
   const newTabBtn = document.createElement("div");
@@ -895,7 +854,7 @@ const resizeObserver = new ResizeObserver((entries) => {
 });
 resizeObserver.observe(terminalContainer);
 
-// Refit terminal after git/agent panel close transition (ResizeObserver is blocked during transition)
+// Refit terminal after git panel close transition (ResizeObserver is blocked during transition)
 window.addEventListener("panel-transition-done", () => {
   const tab = tabs.get(activeTabUiId);
   if (tab?.type === "terminal") fitAllPanes(tab);
@@ -1605,8 +1564,6 @@ async function boot() {
   });
 
   initGitPanel(getCurrentPath, (filePath) => createEditorTab(filePath));
-  initAgentPanel(getCurrentPath);
-  setTabCallbacks(showAgentChatTab, hideAgentChatTab);
 
   onNavigate((path) => {
     fetchGitStatus(path);
