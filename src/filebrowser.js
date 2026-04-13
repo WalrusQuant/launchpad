@@ -321,9 +321,11 @@ function confirmWorkingDirectory() {
 }
 
 function updateSetWdButton() {
+  const diverged = currentPath !== workingDirectory;
   const btn = document.getElementById("set-wd-btn");
-  if (!btn) return;
-  btn.style.display = (currentPath !== workingDirectory) ? "inline-flex" : "none";
+  if (btn) btn.style.display = diverged ? "inline-flex" : "none";
+  const homeBtn = document.getElementById("go-home-btn");
+  if (homeBtn) homeBtn.style.display = diverged ? "inline-flex" : "none";
 }
 
 async function setRoot(path) {
@@ -379,6 +381,9 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
 
   const setWdBtn = document.getElementById("set-wd-btn");
   if (setWdBtn) setWdBtn.addEventListener("click", confirmWorkingDirectory);
+
+  const goHomeBtn = document.getElementById("go-home-btn");
+  if (goHomeBtn) goHomeBtn.addEventListener("click", () => setRoot(workingDirectory));
 
   const hiddenBtn = document.getElementById("toggle-hidden");
   if (hiddenBtn) hiddenBtn.addEventListener("click", toggleHidden);

@@ -207,6 +207,17 @@ html, body, #app {
   color: #81d4fa;
 }
 
+#go-home-btn {
+  color: #a5d6a7;
+  border-color: #a5d6a7;
+  font-size: 14px;
+}
+
+#go-home-btn:hover {
+  background: rgba(165, 214, 167, 0.15);
+  color: #c8e6c9;
+}
+
 #current-path {
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 11px;
