@@ -40,15 +40,15 @@
         <div class="crumb"><a href="index.html">Launchpad</a> / Architecture</div>
         <h1>Architecture</h1>
         <p>
-          Launchpad is deliberately small. The whole thing is ~1500 lines of Rust
-          and ~3000 lines of vanilla JS. This page is the map.
+          A map of how Launchpad is put together — stack, layout, and the
+          handful of patterns that show up across the codebase.
         </p>
 
         <h2 id="stack">Tech stack</h2>
         <ul>
           <li><strong>Tauri v2</strong> — the native shell. Gives us a Swift / Objective-C free macOS window with a system WebView inside.</li>
           <li><strong>Rust</strong> — PTY management (<code>portable-pty</code>), filesystem ops, git via <code>git2</code> (libgit2 bindings) plus shelled-out system <code>git</code> for network operations. Filesystem watching via <code>notify</code> (FSEvents on macOS).</li>
-          <li><strong>Vanilla JS</strong> — all frontend logic. No React, no Vue, no framework. Direct DOM manipulation.</li>
+          <li><strong>Vanilla JS</strong> — all frontend logic, direct DOM manipulation.</li>
           <li><strong>xterm.js 6</strong> — the terminal emulator, with WebGL renderer and Unicode 11 width tables.</li>
           <li><strong>CodeMirror 6</strong> — the editor, with syntax highlighting, search, autocompletion, bracket matching, code folding.</li>
           <li><strong>Vite</strong> — frontend bundler.</li>
@@ -262,13 +262,12 @@ specs/                # Design specs (project model, agent model, etc.)</code></
 
         <h2 id="contributing">Contributing</h2>
         <p>
-          Launchpad welcomes PRs. A few conventions that keep the codebase
-          small:
+          PRs welcome. A few conventions that keep things consistent:
         </p>
         <ul>
-          <li><strong>No framework creep.</strong> Vanilla JS with direct DOM manipulation. Keeps the bundle tiny.</li>
+          <li><strong>Vanilla JS, direct DOM manipulation.</strong> Keep it that way.</li>
           <li><strong>Project-scoped features rule.</strong> When wiring a new feature that cares about "the current directory", use <code>getActiveProject().path</code> — <em>not</em> <code>getCurrentPath()</code> from the file browser. <code>getCurrentPath()</code> tracks sub-folder navigation; only the file browser itself should read it.</li>
-          <li><strong>Prefer small.</strong> Don't add a framework, a state library, or a layer of abstraction to solve a problem you can solve in 30 lines.</li>
+          <li><strong>Prefer small.</strong> If 30 lines handle it, don't reach for a library or an abstraction.</li>
         </ul>
         <p>
           Read <a href="https://github.com/WalrusQuant/launchpad/blob/main/CLAUDE.md">CLAUDE.md</a>

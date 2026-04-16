@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Launchpad — terminal-first desktop workspace for macOS</title>
-  <meta name="description" content="A lightweight macOS workspace that puts your terminal front and center, wrapped with a file browser, code editor, and visual git. Built with Tauri + vanilla JS. ~8MB. MIT licensed." />
-  <meta property="og:title" content="Launchpad — terminal-first desktop workspace" />
-  <meta property="og:description" content="Terminal, editor, file browser, git — all in one native ~8MB macOS app. Built with Tauri + vanilla JS." />
+  <title>Launchpad — terminal-first macOS workspace</title>
+  <meta name="description" content="A native macOS workspace for running Claude Code and other CLI coding agents. Terminal, file browser, git panel, and a simple code editor — all scoped to a project. MIT licensed." />
+  <meta property="og:title" content="Launchpad — terminal-first macOS workspace" />
+  <meta property="og:description" content="A native macOS workspace for running CLI coding agents. Terminal, file browser, git panel, simple editor — scoped to one project per window." />
   <meta property="og:image" content="media/landing.png" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
@@ -29,9 +29,10 @@
       <span class="tag">v0.1 · macOS · MIT</span>
       <h1>Your terminal,<br/><span class="accent">with everything around it.</span></h1>
       <p class="lede">
-        A native desktop workspace for macOS that puts a real PTY-backed terminal
-        front and center, then wraps it with a file browser, code editor, and visual
-        git workflow. No Electron. No framework. ~8MB.
+        A native macOS workspace for running Claude Code, Aider, and other CLI
+        coding agents. A real PTY terminal up front, with the visual tools you
+        actually want around it — a file browser, a git panel, and a simple
+        code editor.
       </p>
       <div class="cta-row">
         <a href="getting-started.html" class="btn btn-primary">Get started →</a>
@@ -54,58 +55,67 @@
 
     <section class="section">
       <div class="wrap">
-        <h2>Why another dev tool?</h2>
+        <h2>Why I made it</h2>
         <p class="subtitle">
-          Most developer tools are either too heavy (VS Code, Electron apps) or too minimal
-          (a bare terminal). Launchpad sits in between — a workspace that respects your
-          terminal-first workflow while giving you visual tools for the things that are
-          genuinely better with a UI.
+          I wasn't trying to reinvent anything. I just wanted a tool that fit how
+          I actually code with CLI agents. Open a project, have a terminal ready,
+          click around files without worrying about breaking the shell, commit
+          stuff without remembering git flags. I told Claude I wanted a desktop
+          app — it suggested Tauri + Rust + vanilla JS. I said sounds good, we'll
+          figure it out. This is what we figured out.
         </p>
         <div class="grid">
           <div class="card">
-            <h3>// terminal-first</h3>
+            <h3>// terminal</h3>
             <p>
-              A real PTY, not a web shim. Proper signal handling, 256 colors, Unicode 11
-              widths, WebGL rendering. Run <code>claude</code>, <code>aider</code>, or any
-              CLI agent with zero surprises.
+              A real PTY with tabs, split panes, and a split workspace. Proper
+              signal handling, 256 colors, Unicode 11 widths, WebGL rendering.
+              Run <code>claude</code>, <code>aider</code>, or anything else you
+              normally run in a terminal.
             </p>
           </div>
           <div class="card">
             <h3>// project-scoped</h3>
             <p>
-              One window = one project. Every terminal spawns in the project root. The
-              file browser is root-locked. Cmd+P stays inside the project. Browse folders
-              without accidentally sending <code>cd</code> to your agent.
+              One window = one project. Every terminal spawns in the project
+              root. The file browser is root-locked. <kbd>⌘P</kbd> stays inside
+              the project. Browse folders without accidentally sending a
+              <code>cd</code> to your agent.
             </p>
           </div>
           <div class="card">
-            <h3>// native &amp; tiny</h3>
+            <h3>// git panel</h3>
             <p>
-              Tauri v2 + Rust backend = ~8MB app bundle. No Chromium, no 400MB
-              Electron install. Cold-starts in under a second.
+              Stage, commit, push, pull, stash, merge, create branches — all
+              from buttons. Structured diff preview. Conflict resolution with
+              Ours / Theirs. Ahead / behind indicators. I don't want to remember
+              git flags either.
             </p>
           </div>
           <div class="card">
-            <h3>// visual git</h3>
+            <h3>// simple editor</h3>
             <p>
-              A buttoned workflow for stage / commit / push / pull / merge / stash.
-              Structured diff preview. Conflict resolution with Ours / Theirs. Ahead /
-              behind indicators at a glance.
+              CodeMirror 6 with syntax highlighting for the languages I
+              actually use, find &amp; replace, bracket matching, autocompletion,
+              folding. Files open as tabs alongside your terminal tabs — one
+              unified tab bar.
             </p>
           </div>
           <div class="card">
-            <h3>// real editor</h3>
+            <h3>// file browser</h3>
             <p>
-              CodeMirror 6 with syntax highlighting for 15+ languages, find &amp; replace,
-              bracket matching, autocompletion, folding. Files open as tabs alongside
-              terminal tabs.
+              A tree view rooted at the project. Color-coded by git status and
+              file type. Right-click to create, rename, delete, reveal in
+              Finder. A live filesystem watcher picks up terminal-side changes
+              without a manual refresh.
             </p>
           </div>
           <div class="card">
-            <h3>// no framework tax</h3>
+            <h3>// built for how I work</h3>
             <p>
-              Vanilla JS. No React, no build-step-that-takes-forever, no dependency
-              cliff. ~3000 lines of JS, ~1500 lines of Rust, done.
+              The terminal is the center. Everything else orbits it and stays
+              out of the way unless you need it. No extension marketplace, no
+              language servers chewing RAM, no dashboards I have to click past.
             </p>
           </div>
         </div>

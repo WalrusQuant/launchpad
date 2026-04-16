@@ -1,6 +1,6 @@
 # Launchpad
 
-A terminal-first desktop workspace for macOS. Terminal, code editor, file browser, git — all scoped to a project directory and wrapped in one native app. No Electron, no bloat, no opinions.
+A terminal-first macOS workspace. Terminal, file browser, git panel, and a simple code editor — scoped to one project per window.
 
 ![Built with Tauri](https://img.shields.io/badge/Tauri-v2-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -10,9 +10,13 @@ A terminal-first desktop workspace for macOS. Terminal, code editor, file browse
 
 ## What is this?
 
-Launchpad is a lightweight macOS desktop app that puts your terminal front and center, then wraps it with everything you need to actually get work done — a file browser, a real code editor, a visual git workflow, and a settings panel. All in a single ~8MB native app.
+A desktop app I built because I wanted a comfortable place to run Claude Code and other CLI coding agents. I spend most of my time in the terminal now, and I wanted the rest of the workflow — file tree, git, the occasional file edit — wrapped around it in a way that felt natural to me.
 
-No framework. No Electron. No subscription. Just Rust + vanilla JS.
+## Why I made it
+
+I wasn't trying to reinvent anything or prove a point. I just wanted a tool that fit how I actually code with CLI agents. Open a project, have a terminal ready, click around files without worrying about accidentally breaking something in the shell, commit stuff without remembering git flags. That's it.
+
+I told Claude I wanted to build a desktop app. It suggested Tauri + Rust + vanilla JS. I said sounds good, we'll figure it out. This is what we figured out.
 
 <video src="https://github.com/WalrusQuant/launchpad/raw/main/docs/media/video.mp4" controls width="100%">
   Your browser doesn't support embedded video. <a href="docs/media/video.mp4">Download the demo</a>.
@@ -54,7 +58,7 @@ Launchpad is organized around **projects** — a project is just a root director
 - **Back to projects** — a `←` button in the toolbar tears down the workspace and returns to the picker.
 
 ### Terminal
-Full PTY-backed terminal with tabs, split panes, and a split workspace. Not a web terminal pretending to be real — it spawns actual zsh/bash processes with proper signal handling, 256-color support, and correct escape sequences.
+Full PTY-backed terminal with tabs, split panes, and a split workspace. Spawns real zsh/bash processes with proper signal handling, 256-color support, and correct escape sequences.
 
 - Multiple tabs (Cmd+T / Cmd+W / Cmd+1-9)
 - Split pane within a tab (Cmd+D) with draggable divider
@@ -164,18 +168,12 @@ A compact header bar with quick access to:
 
 | Layer | Technology |
 |-------|-----------|
-| Desktop shell | Tauri v2 (~8MB native app) |
+| Desktop shell | Tauri v2 |
 | Backend | Rust — PTY via portable-pty, git via libgit2 + system git for network ops |
-| Frontend | Vanilla JS — no React, no Vue, no framework |
+| Frontend | Vanilla JS |
 | Terminal | xterm.js 6 with WebGL renderer + Unicode 11 |
 | Editor | CodeMirror 6 |
 | Bundler | Vite |
-
-## Why?
-
-Most developer tools are either too heavy (VS Code, Electron apps) or too minimal (bare terminal). Launchpad sits in between — it's a workspace that respects your terminal-first workflow while giving you the visual tools for things that are genuinely better with a UI (git, file browsing, settings).
-
-It's also a proof of concept: you can build a fast, capable desktop IDE in ~1500 lines of Rust and ~3000 lines of vanilla JS. No framework tax, no dependency hell, no build step that takes longer than 1 second.
 
 ## License
 
