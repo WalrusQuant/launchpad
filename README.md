@@ -12,7 +12,9 @@ Launchpad is a lightweight macOS desktop app that puts your terminal front and c
 
 No framework. No Electron. No subscription. Just Rust + vanilla JS.
 
-https://github.com/WalrusQuant/launchpad/raw/main/docs/media/video.mov
+<video src="https://github.com/WalrusQuant/launchpad/raw/main/docs/media/video.mp4" controls width="100%">
+  Your browser doesn't support embedded video. <a href="docs/media/video.mp4">Download the demo</a>.
+</video>
 
 ![Workspace with terminal, file browser, and git panel](docs/media/main.png)
 
