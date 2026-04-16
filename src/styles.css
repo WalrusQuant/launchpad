@@ -2182,6 +2182,29 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   gap: 6px;
 }
 
+.settings-dir-group {
+  flex: 1;
+}
+
+.settings-dir-group .settings-input {
+  flex: 1;
+}
+
+.settings-browse-btn {
+  background: #333;
+  border: 1px solid #555;
+  color: #ccc;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.settings-browse-btn:hover {
+  background: #444;
+  border-color: #666;
+}
+
 .settings-unit {
   font-size: 11px;
   color: #666;

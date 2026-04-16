@@ -467,14 +467,9 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
   try {
     const home = await invoke("get_home_dir");
 
-    // Use configured default directory, or fall back to ~/Code, then ~
-    const startDir = defaultDirectory || (home + "/Code");
-    try {
-      await invoke("read_directory", { path: startDir });
-      await setRoot(startDir);
-    } catch {
-      await setRoot(home);
-    }
+    // Use configured default directory, or fall back to home
+    const startDir = defaultDirectory || home;
+    await setRoot(startDir);
     workingDirectory = currentPath;
   } catch (err) {
     console.error("Failed to init file browser:", err);

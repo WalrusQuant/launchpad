@@ -641,6 +641,23 @@ fn search_files(root: String, query: String, max_results: Option<usize>) -> Resu
 }
 
 #[tauri::command]
+fn pick_directory() -> Result<Option<String>, String> {
+    let output = std::process::Command::new("osascript")
+        .args(["-e", "POSIX path of (choose folder)"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Remove trailing slash
+        let path = path.trim_end_matches('/').to_string();
+        Ok(Some(path))
+    } else {
+        // User cancelled
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     std::process::Command::new("open")
         .arg("-R")
@@ -1300,6 +1317,7 @@ pub fn run() {
             load_settings,
             save_settings,
             search_files,
+            pick_directory,
             reveal_in_finder,
             read_file_preview,
             write_file,

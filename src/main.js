@@ -261,7 +261,9 @@ async function createTab() {
     containerEl.className = "terminal-instance";
     document.getElementById("terminal-instances").appendChild(containerEl);
 
-    const pane = await createPane(containerEl);
+    const s = getSettings();
+    const defaultCwd = s.defaultDirectory || getCurrentPath() || undefined;
+    const pane = await createPane(containerEl, defaultCwd);
 
     const tab = { type: "terminal", panes: [pane], containerEl, name: null, activePane: 0 };
     tabs.set(uiId, tab);
@@ -304,7 +306,8 @@ async function splitPane() {
   handle.className = "split-handle";
   tab.containerEl.appendChild(handle);
 
-  const secondPane = await createPane(tab.containerEl);
+  const s2 = getSettings();
+  const secondPane = await createPane(tab.containerEl, s2.defaultDirectory || getCurrentPath() || undefined);
   tab.panes.push(secondPane);
   tab.activePane = 1;
 
@@ -1455,7 +1458,9 @@ async function createTabInRight() {
     containerEl.className = "terminal-instance";
     rightInstancesEl.appendChild(containerEl);
 
-    const pane = await createPane(containerEl);
+    const s = getSettings();
+    const defaultCwd = s.defaultDirectory || getCurrentPath() || undefined;
+    const pane = await createPane(containerEl, defaultCwd);
     const tab = { type: "terminal", panes: [pane], containerEl, name: null, activePane: 0, _rightGroup: true };
     tabs.set(uiId, tab);
     rightGroupTabIds.push(uiId);
@@ -1693,14 +1698,15 @@ async function boot() {
     sidebar.style.width = settings.sidebarWidth + "px";
   }
 
+  // Init file browser FIRST so getCurrentPath() is set before the terminal spawns
+  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
+
   try {
     await createTab();
   } catch (err) {
     document.getElementById("terminal-container").innerHTML =
       `<div style="padding:20px;color:#ff6b6b;">Failed to start terminal: ${err}</div>`;
   }
-
-  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
   invoke("watch_directory", { path: getCurrentPath() });
 
   // Quick open: Cmd+P to search, select opens in editor tab
