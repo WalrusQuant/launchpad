@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Launchpad - Development Guide
 
 ## Overview
@@ -5,23 +9,23 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 
 ## Tech Stack
 - **Tauri v2** — native macOS desktop shell
-- **Rust** — PTY management, filesystem ops, git operations via `git2` crate + system `git` for network ops (push/pull/merge)
+- **Rust** — PTY management, filesystem ops, git operations via `git2` crate + system `git` for network ops (push/pull/fetch/merge)
 - **Vanilla JS** — all frontend logic, no React/Vue/Svelte
-- **xterm.js** — terminal emulator with WebGL renderer
-- **CodeMirror 6** — code editor with syntax highlighting and search
+- **xterm.js 6** — terminal emulator with WebGL renderer + Unicode 11 width tables
+- **CodeMirror 6** — code editor with syntax highlighting, search, autocompletion, bracket matching, code folding
 - **Vite** — frontend bundler
 
 ## Project Structure
 ```
 src/                    # Frontend (JS/CSS/HTML)
-  main.js              # App entry, unified tab management (terminal + editor + settings), split workspace (left/right groups), split panes, drag-to-move tabs, keyboard shortcuts
-  filebrowser.js        # File tree, context menu, drag & drop, git status colors, decoupled browsing/working directory
+  main.js              # App entry, unified tab management (terminal + editor + settings), split workspace (left/right groups), split panes, drag-to-move tabs, keyboard shortcuts, context menus
+  filebrowser.js        # File tree, context menu, drag & drop, git status colors, CRUD operations, decoupled browsing/working directory
   editor.js             # CodeMirror factory — creates independent editor instances with search, cursor tracking
   git.js                # Git status polling, file status colors in tree
   gitpanel.js           # Full git panel UI (toolbar, staged/unstaged, commit, branches, history, GitHub, conflicts, cheatsheet)
-  quickopen.js          # Cmd+P fuzzy file finder
+  quickopen.js          # Cmd+P fuzzy file finder (uses search_files command, ranks by path length)
   settings.js           # Persistent settings store (~/.launchpad/config.json)
-  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections)
+  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections) with native directory picker
   styles.css            # All styles (organized by section with comment headers)
 src-tauri/              # Rust backend
   src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings)
@@ -40,22 +44,30 @@ index.html              # Main HTML shell (includes toolbar with settings, short
 
 ### File Browser
 - **Decoupled browsing**: Navigating folders in the file browser does NOT change the terminal's working directory. A blue ⏎ button appears in the sidebar header when the browsed directory differs from the terminal's cwd. Clicking it sends `cd` to the active terminal.
+- **CRUD operations**: Right-click context menu supports new file, new folder, rename, delete, and reveal in Finder. Uses `create_file`, `create_directory`, `rename_path`, `delete_path`, and `reveal_in_finder` commands.
+- **Off-DOM tree building**: The file tree is built in a detached DOM fragment and swapped in a single operation to prevent flicker when expanding folders.
 - **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the current directory recursively. Emits `fs-changed` Tauri events that trigger `refreshFileBrowser()` and git status updates. Frontend throttles to 500ms. The watcher follows directory navigation and is managed in `AppState.fs_watcher`.
 
 ### Terminal
-- **Multi-PTY**: Each terminal tab/pane spawns its own PTY via `portable-pty`. PTY output is routed by ID through `paneMap`.
+- **Multi-PTY with deferred reader**: Each terminal tab/pane spawns its own PTY via `portable-pty`. The reader thread is NOT started during `spawn_pty` — instead, the frontend calls `start_pty_reader` AFTER registering the pane in `paneMap`, preventing a race where early output gets dropped.
+- **Backpressure flow control**: `pause_pty_reader` / `resume_pty_reader` let the frontend signal when xterm.js write queue exceeds its high-water mark. The reader thread sleeps until cleared; data stays in the OS PTY buffer.
 - **WebGL rendering**: xterm.js uses WebGL renderer by default with canvas fallback.
+- **Unicode 11**: Uses `@xterm/addon-unicode11` for correct CJK/emoji width measurement, avoiding ghost character bugs from width table mismatches.
+- **Context menu**: Right-click on terminal shows Copy, Paste, Clear options.
 
 ### Editor
 - **Editor factory pattern**: `editor.js` exports `createEditor()` which returns an `EditorView` instance. Callers own the lifecycle. No global singleton.
+- **Features**: Bracket matching, close brackets, fold gutter, indent on input, autocompletion, lint gutter, highlight selection matches, rectangular selection, crosshair cursor.
 - **Supported languages**: JS, TS, JSX, TSX, Python, Rust, HTML, CSS, JSON, Markdown, SCSS, TOML, YAML, Shell.
+- **Context menu**: Right-click in editor shows Cut, Copy, Paste, Select All with disabled states based on selection/clipboard.
 
 ### Git
-- **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers.
+- **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, fetch, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers. Network ops are cancellable via `cancel_git_op` which kills the spawned process by PID.
 - **Git status dual entries**: `get_git_status` emits separate entries for staged (`index_new`, `index_modified`, `index_deleted`) and unstaged (`new`, `modified`, `deleted`) changes. A file can appear in both lists.
 
 ### Settings & State
 - **Live settings**: Settings changes apply immediately to all open terminals/editors. Stored as JSON at `~/.launchpad/config.json`.
+- **Default directory**: `termDefaultDirectory` setting controls where new terminals open. A native folder picker (via `pick_directory` command using osascript) lets users browse for the directory.
 - **No framework**: Vanilla JS with direct DOM manipulation. Keeps the bundle small and fast.
 
 ## Commands
@@ -76,6 +88,7 @@ npx tauri build                # Build .app bundle
 ```bash
 cargo check --manifest-path src-tauri/Cargo.toml    # Type check
 cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
+cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 ```
 
 ## Keyboard Shortcuts
@@ -100,35 +113,49 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 ## Tauri Commands (Rust → JS IPC)
 
 ### PTY
-- `spawn_pty(id, rows, cols, cwd)` — spawn a new PTY process
-- `write_to_pty(id, data)` — write input to a PTY
-- `resize_pty(id, rows, cols)` — resize a PTY
-- `close_pty(id)` — close a PTY process
+- `spawn_pty(cwd?, rows?, cols?)` — spawn a new PTY, returns `{ tab_id }`. Does NOT start reading output yet.
+- `start_pty_reader(tab_id)` — start the output reader thread (call AFTER registering pane in `paneMap`)
+- `write_to_pty(tab_id, data)` — write input to a PTY
+- `resize_pty(tab_id, rows, cols)` — resize a PTY (skips redundant resizes)
+- `pause_pty_reader(tab_id)` / `resume_pty_reader(tab_id)` — backpressure flow control
+- `close_pty(tab_id)` — close a PTY process
+- `write_debug_log(content)` — write debug capture to `~/.launchpad/debug.log`
 
 ### Filesystem
-- `read_directory(path, show_hidden)` — list directory contents
-- `search_files(path, query)` — fuzzy file search
-- `read_file_preview(path)` — read file content (512KB limit)
+- `read_directory(path)` — list directory contents (sorted: dirs first, then alpha)
+- `search_files(root, query, max_results?)` — fuzzy file search (skips hidden dirs, node_modules, target, etc.)
+- `read_file_preview(path, max_bytes?)` — read file content (default 8KB limit, binary detection)
+- `write_file(path, content)` — write file to disk (10MB limit)
+- `create_file(path)` — create new empty file (errors if exists)
+- `create_directory(path)` — create directory (recursive)
+- `delete_path(path)` — delete file or directory recursively
+- `rename_path(old_path, new_path)` — rename/move file or directory
 - `watch_directory(path)` — start recursive filesystem watcher, emits `fs-changed` events
-- `write_file(path, content)` — write file to disk
+- `unwatch_directory(path)` — stop watching a directory
+- `pick_directory()` — native macOS folder picker via osascript
+- `reveal_in_finder(path)` — reveal file/folder in Finder
+- `get_home_dir()` — returns user's home directory path
 
 ### Git
-- `get_git_status(path)` — staged + unstaged file status
-- `list_branches(path)` — local and remote branches
-- `get_commits(path, count)` — commit history
+- `get_git_status(path)` — staged + unstaged file status, branch, ahead/behind counts
+- `list_branches(path)` — local branches with upstream info
+- `list_remote_branches(path)` — remote branches (strips `origin/` prefix)
+- `get_commits(path, count?)` — commit history (default 20)
 - `get_remote_url(path)` — remote origin URL
-- `checkout_branch(path, name)` / `create_branch(path, name)` / `delete_branch(path, name)`
-- `stage_file(path, file)` / `unstage_file(path, file)` / `stage_all(path)` / `unstage_all(path)`
-- `discard_file(path, file)` — discard unstaged changes
-- `commit(path, message)` — create commit
-- `git_push(path)` / `git_pull(path)` / `git_merge(path, branch)`
-- `stash_save(path)` / `stash_pop(path)`
-- `get_diff(path, file, staged)` — file diff
-- `get_commit_details(path, oid)` — commit detail with changed files
-- `resolve_conflict(path, file, resolution)` — resolve merge conflict (ours/theirs)
+- `checkout_branch(path, branch_name)` / `create_branch(path, branch_name, checkout?)` / `git_delete_branch(path, branch_name)`
+- `git_stage_file(path, file_path)` / `git_unstage_file(path, file_path)` / `git_stage_all(path)` / `git_unstage_all(path)`
+- `git_discard_file(path, file_path)` — discard unstaged changes
+- `git_commit(path, message)` — create commit, returns short OID
+- `git_push(path)` — push (auto-sets upstream if needed)
+- `git_pull(path)` / `git_fetch(path)` / `git_merge_branch(path, branch_name)`
+- `cancel_git_op()` — kill in-flight network git operation by PID
+- `git_stash_save(path)` / `git_stash_pop(path)` / `git_stash_list(path)` / `git_stash_apply(path, index)` / `git_stash_drop(path, index)`
+- `get_file_diff(path, file_path, staged?)` — structured file diff with hunks and line numbers
+- `get_commit_details(path, oid)` — commit detail with changed files and line stats
+- `git_resolve_ours(path, file_path)` / `git_resolve_theirs(path, file_path)` — resolve merge conflicts
 
 ### Settings
-- `load_settings()` / `save_settings(settings)`
+- `load_settings()` / `save_settings(data)` — JSON validated before write
 
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`
