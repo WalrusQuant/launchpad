@@ -2,8 +2,9 @@ const { invoke } = window.__TAURI__.core;
 
 let settings = {
   sidebarWidth: 260,
-  defaultDirectory: null, // null = auto-detect ~/Code
-  lastDirectory: null,
+  defaultDirectory: null, // deprecated — superseded by projects; kept for one release so old configs still load
+  lastDirectory: null, // deprecated — unused
+
   // Terminal
   termFontSize: 13,
   termFontFamily: '"SF Mono", "Menlo", "Monaco", "Courier New", monospace',

@@ -2,7 +2,7 @@ const { invoke } = window.__TAURI__.core;
 import { pushEscape, popEscape } from "./main.js";
 
 let currentPath = "";
-let workingDirectory = ""; // the terminal's actual cwd — only changes on explicit confirm
+let projectRoot = ""; // set by initFileBrowser; navigation is capped at or within this
 let showHidden = false;
 let expandedDirs = new Set();
 let onNavigateCallback = null;
@@ -423,25 +423,16 @@ function navigateToDirectory(path) {
   setRoot(path);
 }
 
-// Explicitly set the terminal working directory to match the browsed path
-function confirmWorkingDirectory() {
-  const tabId = getActiveTabId ? getActiveTabId() : null;
-  if (tabId !== null) {
-    invoke("write_to_pty", { tabId, data: `cd "${currentPath}"\r` });
-  }
-  workingDirectory = currentPath;
-  updateSetWdButton();
-}
-
-function updateSetWdButton() {
-  const diverged = currentPath !== workingDirectory;
-  const btn = document.getElementById("set-wd-btn");
-  if (btn) btn.style.display = diverged ? "inline-flex" : "none";
-  const homeBtn = document.getElementById("go-home-btn");
-  if (homeBtn) homeBtn.style.display = diverged ? "inline-flex" : "none";
+function isWithinProject(path) {
+  if (!projectRoot) return true;
+  const p = path.replace(/\/+$/, "");
+  const r = projectRoot.replace(/\/+$/, "");
+  return p === r || p.startsWith(r + "/");
 }
 
 async function setRoot(path) {
+  // Defensive: never let a caller steer the file browser outside the project.
+  if (!isWithinProject(path)) return;
   currentPath = path;
   expandedDirs.clear();
 
@@ -453,7 +444,6 @@ async function setRoot(path) {
   await loadDirectory(path, tree);
 
   if (onNavigateCallback) onNavigateCallback(path);
-  updateSetWdButton();
 }
 
 function toggleHidden() {
@@ -465,21 +455,20 @@ function toggleHidden() {
 }
 
 async function navigateUp() {
+  if (currentPath === projectRoot) return; // already at project root
   const parent = currentPath.split("/").slice(0, -1).join("/") || "/";
+  if (!isWithinProject(parent)) return; // would escape project — no-op
   navigateToDirectory(parent);
 }
 
-export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDirectory) {
+export async function initFileBrowser(activeTabIdGetter, openFileCb, projectRootPath) {
   getActiveTabId = activeTabIdGetter;
   openFileCallback = openFileCb || null;
 
   try {
     const home = await invoke("get_home_dir");
-
-    // Use configured default directory, or fall back to home
-    const startDir = defaultDirectory || home;
-    await setRoot(startDir);
-    workingDirectory = currentPath;
+    projectRoot = projectRootPath || home;
+    await setRoot(projectRoot);
   } catch (err) {
     console.error("Failed to init file browser:", err);
   }
@@ -487,11 +476,8 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
   const upBtn = document.getElementById("nav-up");
   if (upBtn) upBtn.addEventListener("click", navigateUp);
 
-  const setWdBtn = document.getElementById("set-wd-btn");
-  if (setWdBtn) setWdBtn.addEventListener("click", confirmWorkingDirectory);
-
   const goHomeBtn = document.getElementById("go-home-btn");
-  if (goHomeBtn) goHomeBtn.addEventListener("click", () => setRoot(workingDirectory));
+  if (goHomeBtn) goHomeBtn.addEventListener("click", () => setRoot(projectRoot));
 
   const hiddenBtn = document.getElementById("toggle-hidden");
   if (hiddenBtn) hiddenBtn.addEventListener("click", toggleHidden);

@@ -76,7 +76,8 @@ A project is a root directory. That's it.
 - Root is locked to the project directory.
 - Full tree navigation within the project — expand, collapse, scroll.
 - Cannot navigate above the project root.
-- The ⏎ "cd to this directory" button stays — useful for cd'ing into a subdirectory.
+- Nav-up ↑ and go-home ⌂ buttons stay — they're pure navigation and don't touch any terminal. Nav-up is capped at the project root; go-home jumps back to the project root.
+- The ⏎ "cd to this directory" button is **removed**. It was the only file-browser control that wrote `cd` to a terminal. Removing it protects running CLI agents from accidental `cd` disruption. Users who want to cd can type it in the shell.
 - Clicking a file still opens it in the editor.
 
 ### Git Panel

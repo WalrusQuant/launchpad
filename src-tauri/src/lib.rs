@@ -593,6 +593,139 @@ fn save_settings(data: String) -> Result<(), String> {
     Ok(())
 }
 
+// Projects
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct Project {
+    name: String,
+    path: String,
+    #[serde(rename = "lastOpened")]
+    last_opened: String,
+}
+
+fn projects_path() -> std::path::PathBuf {
+    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
+    home.join(".launchpad").join("projects.json")
+}
+
+fn read_projects_file() -> Result<Vec<Project>, String> {
+    let path = projects_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if data.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<Project>>(&data)
+        .map_err(|e| format!("Invalid projects.json: {}", e))
+}
+
+fn write_projects_file(projects: &[Project]) -> Result<(), String> {
+    let path = projects_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(projects)
+        .map_err(|e| format!("JSON serialization error: {}", e))?;
+    // Atomic write: temp + rename so a crash can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn normalize_project_path(path: &str) -> String {
+    // Canonicalize when possible so two different strings for the same dir dedupe.
+    // Fall back to the raw string if the path doesn't resolve (missing dir).
+    match fs::canonicalize(path) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.trim_end_matches('/').to_string(),
+    }
+}
+
+#[tauri::command]
+fn load_projects() -> Result<Vec<Project>, String> {
+    let mut projects = read_projects_file()?;
+    // Sort by lastOpened desc so recent projects come first.
+    projects.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+    Ok(projects)
+}
+
+#[tauri::command]
+fn add_project(
+    path: String,
+    name: Option<String>,
+    last_opened: String,
+) -> Result<Project, String> {
+    let normalized = normalize_project_path(&path);
+    let derived_name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+        std::path::Path::new(&normalized)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| normalized.clone())
+    });
+
+    let mut projects = read_projects_file()?;
+    if let Some(existing) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == normalized)
+    {
+        existing.last_opened = last_opened;
+        let out = existing.clone();
+        write_projects_file(&projects)?;
+        return Ok(out);
+    }
+
+    let project = Project {
+        name: derived_name,
+        path: normalized,
+        last_opened,
+    };
+    projects.push(project.clone());
+    write_projects_file(&projects)?;
+    Ok(project)
+}
+
+#[tauri::command]
+fn remove_project(path: String) -> Result<(), String> {
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    projects.retain(|p| normalize_project_path(&p.path) != target);
+    write_projects_file(&projects)
+}
+
+#[tauri::command]
+fn rename_project(path: String, new_name: String) -> Result<(), String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("Name cannot be empty".into());
+    }
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    if let Some(p) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == target)
+    {
+        p.name = trimmed.to_string();
+        write_projects_file(&projects)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn touch_project(path: String, last_opened: String) -> Result<(), String> {
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    if let Some(p) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == target)
+    {
+        p.last_opened = last_opened;
+        write_projects_file(&projects)?;
+    }
+    Ok(())
+}
+
 // Recursive file search for quick open
 #[tauri::command]
 fn search_files(root: String, query: String, max_results: Option<usize>) -> Result<Vec<String>, String> {
@@ -1346,6 +1479,11 @@ pub fn run() {
             create_branch,
             load_settings,
             save_settings,
+            load_projects,
+            add_project,
+            remove_project,
+            rename_project,
+            touch_project,
             search_files,
             pick_directory,
             reveal_in_finder,

@@ -319,17 +319,6 @@ html, body, #app {
   color: #e0e0e0;
 }
 
-#set-wd-btn {
-  color: #4fc3f7;
-  border-color: #4fc3f7;
-  font-size: 14px;
-}
-
-#set-wd-btn:hover {
-  background: rgba(79, 195, 247, 0.15);
-  color: #81d4fa;
-}
-
 #go-home-btn {
   color: #a5d6a7;
   border-color: #a5d6a7;
@@ -2409,3 +2398,227 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 ::-webkit-scrollbar-thumb:hover {
   background: #4a4a4a;
 }
+
+/* ============================================================
+   Project Picker
+   ============================================================ */
+#workspace-root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#workspace-root[hidden] {
+  display: none;
+}
+
+#picker-root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: #1a1a1a;
+  padding: 80px 20px 40px;
+  overflow-y: auto;
+  -webkit-app-region: drag; /* allow dragging the window by the picker background */
+}
+
+/* Welcome (no projects): vertically center because content is short and deserves focus */
+#picker-root:has(.picker-welcome) {
+  justify-content: center;
+  padding-top: 40px;
+}
+
+#picker-root[hidden] {
+  display: none;
+}
+
+.picker-shell {
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  -webkit-app-region: no-drag;
+}
+
+.picker-welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 48px 24px;
+  background: #232323;
+  border: 1px solid #333;
+  border-radius: 8px;
+}
+
+.picker-logo {
+  font-size: 28px;
+  font-weight: 600;
+  color: #e0e0e0;
+  letter-spacing: -0.01em;
+}
+
+.picker-tagline {
+  font-size: 14px;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.picker-header {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #888;
+  padding: 0 4px 4px;
+}
+
+.picker-list {
+  display: flex;
+  flex-direction: column;
+  background: #232323;
+  border: 1px solid #333;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 8px 12px 16px;
+  cursor: pointer;
+  border-bottom: 1px solid #2e2e2e;
+  transition: background 0.08s ease;
+  outline: none;
+}
+
+.picker-row:last-child {
+  border-bottom: none;
+}
+
+.picker-row:hover,
+.picker-row:focus {
+  background: #2e2e2e;
+}
+
+.picker-row-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.picker-row-name {
+  font-size: 14px;
+  color: #e0e0e0;
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+.picker-row-name-input {
+  font-size: 14px;
+  color: #e0e0e0;
+  font-weight: 500;
+  background: #1a1a1a;
+  border: 1px solid #57c7ff;
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin-bottom: 2px;
+  width: 100%;
+  font-family: inherit;
+  outline: none;
+}
+
+.picker-row-meta {
+  font-size: 12px;
+  color: #888;
+  font-family: "SF Mono", Menlo, monospace;
+}
+
+.picker-row-menu-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #888;
+  border-radius: 4px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.08s ease, background 0.08s ease;
+}
+
+.picker-row:hover .picker-row-menu-btn,
+.picker-row:focus-within .picker-row-menu-btn {
+  opacity: 1;
+}
+
+.picker-row-menu-btn:hover {
+  background: #3a3a3a;
+  color: #e0e0e0;
+}
+
+.picker-open-btn {
+  padding: 10px 16px;
+  background: #57c7ff;
+  color: #0a0a0a;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.08s ease;
+  align-self: center;
+}
+
+.picker-open-btn:hover {
+  background: #7dd6ff;
+}
+
+.picker-open-btn-secondary {
+  background: #2e2e2e;
+  color: #e0e0e0;
+  align-self: flex-start;
+  font-weight: 500;
+}
+
+.picker-open-btn-secondary:hover {
+  background: #3a3a3a;
+}
+
+.picker-ctx-menu {
+  position: fixed;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 160px;
+  z-index: 10000;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.picker-ctx-item {
+  padding: 6px 14px;
+  font-size: 13px;
+  color: #e0e0e0;
+  cursor: pointer;
+}
+
+.picker-ctx-item:hover {
+  background: #3a3a3a;
+}
+
+.picker-ctx-item-danger {
+  color: #e57373;
+}
+
+.picker-ctx-item-danger:hover {
+  background: #4a2424;
+  color: #ffabab;
+}
+
