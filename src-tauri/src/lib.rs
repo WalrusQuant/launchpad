@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,7 +31,9 @@ struct PtyInstance {
 struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
-    fs_watcher: Arc<Mutex<Option<FsWatcher>>>,
+    fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
+    // PID of in-flight git network operation (push/pull/fetch/merge) — used by cancel_git_op
+    git_op_pid: Arc<Mutex<Option<u32>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -62,6 +65,7 @@ struct FileEntry {
     is_hidden: bool,
     size: u64,
     modified: Option<u64>,
+    mode: u32,
 }
 
 #[tauri::command]
@@ -288,6 +292,7 @@ fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
                 is_hidden,
                 size: metadata.len(),
                 modified,
+                mode: metadata.permissions().mode(),
             })
         })
         .collect();
@@ -314,6 +319,7 @@ struct GitInfo {
     files: Vec<GitFileStatus>,
     ahead: usize,
     behind: usize,
+    has_upstream: bool,
 }
 
 #[tauri::command]
@@ -327,6 +333,7 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
                 files: vec![],
                 ahead: 0,
                 behind: 0,
+                has_upstream: false,
             });
         }
     };
@@ -338,7 +345,7 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
 
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
-        .recurse_untracked_dirs(false)
+        .recurse_untracked_dirs(true)
         .include_ignored(false);
 
     let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
@@ -379,7 +386,10 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
         }
     }
 
-    let (ahead, behind) = get_ahead_behind(&repo).unwrap_or((0, 0));
+    let ab = get_ahead_behind(&repo);
+    let has_upstream = ab.is_some();
+    let ahead = ab.map(|(a, _)| a).unwrap_or(0);
+    let behind = ab.map(|(_, b)| b).unwrap_or(0);
 
     Ok(GitInfo {
         is_repo: true,
@@ -387,6 +397,7 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
         files,
         ahead,
         behind,
+        has_upstream,
     })
 }
 
@@ -409,6 +420,7 @@ struct BranchInfo {
     is_current: bool,
     last_commit_msg: Option<String>,
     last_commit_time: Option<i64>,
+    upstream: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -444,11 +456,17 @@ fn list_branches(path: String) -> Result<Vec<BranchInfo>, String> {
                 .and_then(|c| c.summary().map(String::from));
             let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
 
+            let upstream = branch
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(String::from));
+
             Some(BranchInfo {
                 name,
                 is_current,
                 last_commit_msg,
                 last_commit_time,
+                upstream,
             })
         })
         .collect();
@@ -637,6 +655,10 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, S
     let limit = max_bytes.unwrap_or(8192);
     let data = fs::read(&path).map_err(|e| e.to_string())?;
     let truncated = &data[..data.len().min(limit)];
+    // Binary detection: null bytes in the first 8KB indicate a binary file
+    if truncated.contains(&0) {
+        return Err("Binary file \u{2014} cannot display".to_string());
+    }
     Ok(String::from_utf8_lossy(truncated).to_string())
 }
 
@@ -651,58 +673,139 @@ fn write_file(path: String, content: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_file_diff(path: String, file_path: String) -> Result<String, String> {
+fn create_file(path: String) -> Result<(), String> {
+    if std::path::Path::new(&path).exists() {
+        return Err("File already exists".into());
+    }
+    std::fs::write(&path, "").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_directory(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+    } else {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
+    std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Serialize)]
+struct DiffLine {
+    old_line_no: i32,
+    new_line_no: i32,
+    content: String,
+    origin: String,
+}
+
+#[derive(Clone, Serialize)]
+struct HunkDiff {
+    old_start: u32,
+    new_start: u32,
+    old_lines: u32,
+    new_lines: u32,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Clone, Serialize)]
+struct FileDiff {
+    old_path: Option<String>,
+    new_path: Option<String>,
+    hunks: Vec<HunkDiff>,
+}
+
+fn collect_structured_diff(diff: &git2::Diff) -> Result<FileDiff, String> {
+    let old_path = diff.deltas().next()
+        .and_then(|d| d.old_file().path().map(|p| p.to_string_lossy().to_string()));
+    let new_path = diff.deltas().next()
+        .and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().to_string()));
+
+    let hunks = std::cell::RefCell::new(Vec::<HunkDiff>::new());
+    let current_lines = std::cell::RefCell::new(Vec::<DiffLine>::new());
+    let current_hunk = std::cell::RefCell::new(Option::<(u32, u32, u32, u32)>::None);
+
+    diff.foreach(
+        &mut |_delta, _progress| true,
+        None,
+        Some(&mut |_delta, hunk| {
+            if let Some((old_start, new_start, old_lines, new_lines)) = current_hunk.borrow_mut().take() {
+                hunks.borrow_mut().push(HunkDiff {
+                    old_start, new_start, old_lines, new_lines,
+                    lines: current_lines.borrow_mut().drain(..).collect(),
+                });
+            }
+            *current_hunk.borrow_mut() = Some((
+                hunk.old_start(), hunk.new_start(), hunk.old_lines(), hunk.new_lines(),
+            ));
+            true
+        }),
+        Some(&mut |_delta, _hunk, line| {
+            let origin = match line.origin() {
+                '+' => "add",
+                '-' => "remove",
+                _ => "context",
+            }.to_string();
+            current_lines.borrow_mut().push(DiffLine {
+                old_line_no: line.old_lineno().map(|n| n as i32).unwrap_or(-1),
+                new_line_no: line.new_lineno().map(|n| n as i32).unwrap_or(-1),
+                content: String::from_utf8_lossy(line.content()).to_string(),
+                origin,
+            });
+            true
+        }),
+    ).map_err(|e| e.to_string())?;
+
+    // Flush the last hunk
+    if let Some((old_start, new_start, old_lines, new_lines)) = current_hunk.borrow_mut().take() {
+        hunks.borrow_mut().push(HunkDiff {
+            old_start, new_start, old_lines, new_lines,
+            lines: current_lines.borrow_mut().drain(..).collect(),
+        });
+    }
+
+    Ok(FileDiff { old_path, new_path, hunks: hunks.into_inner() })
+}
+
+#[tauri::command]
+fn get_file_diff(path: String, file_path: String, staged: Option<bool>) -> Result<FileDiff, String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
     let mut diff_opts = git2::DiffOptions::new();
     diff_opts.pathspec(&file_path);
 
-    let diff = repo
-        .diff_index_to_workdir(None, Some(&mut diff_opts))
-        .map_err(|e| e.to_string())?;
-
-    let mut result = String::new();
-    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-        let prefix = match line.origin() {
-            '+' => "+",
-            '-' => "-",
-            ' ' => " ",
-            _ => "",
-        };
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        result.push_str(prefix);
-        result.push_str(content);
-        true
-    })
-    .map_err(|e| e.to_string())?;
-
-    // If empty, try HEAD to index diff (for staged files)
-    if result.is_empty() {
-        let head_tree = repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_tree().ok());
-
+    if staged.unwrap_or(false) {
+        // Staged diff: index vs HEAD
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let diff = repo
             .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
             .map_err(|e| e.to_string())?;
-
-        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let prefix = match line.origin() {
-                '+' => "+",
-                '-' => "-",
-                ' ' => " ",
-                _ => "",
-            };
-            let content = std::str::from_utf8(line.content()).unwrap_or("");
-            result.push_str(prefix);
-            result.push_str(content);
-            true
-        })
-        .map_err(|e| e.to_string())?;
+        collect_structured_diff(&diff)
+    } else {
+        // Unstaged diff: workdir vs index
+        let diff = repo
+            .diff_index_to_workdir(None, Some(&mut diff_opts))
+            .map_err(|e| e.to_string())?;
+        let result = collect_structured_diff(&diff)?;
+        if !result.hunks.is_empty() {
+            return Ok(result);
+        }
+        // Fall back to staged if no unstaged changes (backwards compat)
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        let diff = repo
+            .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+            .map_err(|e| e.to_string())?;
+        collect_structured_diff(&diff)
     }
-
-    Ok(result)
 }
 
 #[tauri::command]
@@ -751,60 +854,67 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string()[..7].to_string())
 }
 
-#[tauri::command]
-fn git_push(path: String) -> Result<String, String> {
-    // First try a normal push
-    let output = std::process::Command::new("git")
-        .args(["push"])
-        .current_dir(&path)
-        .output()
+// Runs a git command as a spawned process, storing its PID in AppState so
+// cancel_git_op can kill it. Returns stdout on success, stderr on failure.
+fn run_git_cancellable(args: &[&str], path: &str, pid_store: &Arc<Mutex<Option<u32>>>) -> Result<String, String> {
+    let child = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| e.to_string())?;
 
+    *pid_store.lock().unwrap() = Some(child.id());
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    *pid_store.lock().unwrap() = None;
+
     if output.status.success() {
-        let msg = String::from_utf8_lossy(&output.stderr).to_string();
-        return Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg });
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    // If no upstream, automatically set it up
-    if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
-        let branch_output = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&path)
-            .output()
-            .map_err(|e| e.to_string())?;
-        let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-
-        let retry = std::process::Command::new("git")
-            .args(["push", "--set-upstream", "origin", &branch])
-            .current_dir(&path)
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if retry.status.success() {
-            let msg = String::from_utf8_lossy(&retry.stderr).to_string();
-            return Ok(if msg.trim().is_empty() { "Pushed successfully".into() } else { msg });
-        } else {
-            return Err(String::from_utf8_lossy(&retry.stderr).to_string());
-        }
-    }
-
-    Err(stderr)
-}
-
-#[tauri::command]
-fn git_pull(path: String) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(["pull"])
-        .current_dir(&path)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Ok(if stdout.trim().is_empty() { stderr } else { stdout })
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
+}
+
+#[tauri::command]
+fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
+    let pid_store = Arc::clone(&state.git_op_pid);
+    let result = run_git_cancellable(&["push"], &path, &pid_store);
+
+    if let Err(ref stderr) = result {
+        if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
+            let branch_output = std::process::Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .map_err(|e| e.to_string())?;
+            let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+            return run_git_cancellable(&["push", "--set-upstream", "origin", &branch], &path, &pid_store);
+        }
+    }
+    result
+}
+
+#[tauri::command]
+fn git_pull(path: String, state: State<AppState>) -> Result<String, String> {
+    run_git_cancellable(&["pull"], &path, &Arc::clone(&state.git_op_pid))
+}
+
+#[tauri::command]
+fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
+    run_git_cancellable(&["fetch", "--all"], &path, &Arc::clone(&state.git_op_pid))
+}
+
+#[tauri::command]
+fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
+    if let Some(pid) = state.git_op_pid.lock().unwrap().take() {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -937,6 +1047,44 @@ fn git_stash_pop(path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Serialize)]
+struct StashEntry {
+    index: usize,
+    message: String,
+}
+
+#[tauri::command]
+fn git_stash_list(path: String) -> Result<Vec<StashEntry>, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let mut repo = repo;
+    let mut entries = Vec::new();
+    repo.stash_foreach(|index, message, _oid| {
+        entries.push(StashEntry {
+            index,
+            message: message.to_string(),
+        });
+        true
+    }).map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+#[tauri::command]
+fn git_stash_apply(path: String, index: usize) -> Result<(), String> {
+    let mut repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    repo.stash_apply(index, None)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn git_stash_drop(path: String, index: usize) -> Result<(), String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let mut repo = repo;
+    repo.stash_drop(index)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn git_delete_branch(path: String, branch_name: String) -> Result<(), String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
@@ -979,6 +1127,7 @@ fn list_remote_branches(path: String) -> Result<Vec<BranchInfo>, String> {
                 is_current: false,
                 last_commit_msg,
                 last_commit_time,
+                upstream: None,
             })
         })
         .collect();
@@ -1108,9 +1257,16 @@ fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) 
         )
         .map_err(|e| e.to_string())?;
 
-    // Replace old watcher — dropping it stops the previous watch
+    // Insert into the map, replacing any existing watcher for this path (dropping it stops the previous watch)
     let mut guard = state.fs_watcher.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
-    *guard = Some(debouncer);
+    guard.remove(&path);
+    guard.insert(path, debouncer);
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String> {
+    state.fs_watcher.lock().map_err(|e| e.to_string())?.remove(&path);
     Ok(())
 }
 
@@ -1118,7 +1274,8 @@ pub fn run() {
     let app_state = AppState {
         ptys: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(Mutex::new(0)),
-        fs_watcher: Arc::new(Mutex::new(None)),
+        fs_watcher: Arc::new(Mutex::new(HashMap::new())),
+        git_op_pid: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -1146,12 +1303,17 @@ pub fn run() {
             reveal_in_finder,
             read_file_preview,
             write_file,
+            create_file,
+            create_directory,
+            delete_path,
+            rename_path,
             get_file_diff,
             git_stage_all,
             git_stage_file,
             git_commit,
             git_push,
             git_pull,
+            git_fetch,
             git_merge_branch,
             git_resolve_ours,
             git_resolve_theirs,
@@ -1160,11 +1322,16 @@ pub fn run() {
             git_discard_file,
             git_stash_save,
             git_stash_pop,
+            git_stash_list,
+            git_stash_apply,
+            git_stash_drop,
+            cancel_git_op,
             git_delete_branch,
             list_remote_branches,
             get_commit_details,
             get_remote_url,
-            watch_directory
+            watch_directory,
+            unwatch_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

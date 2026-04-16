@@ -32,6 +32,15 @@ const FIT_DEBOUNCE_MS = 60; // Coalesces ResizeObserver firehose during drags
 const FLOW_HIGH_WATER = 100_000; // chars — pause PTY when exceeded
 const FLOW_LOW_WATER = 25_000;   // chars — resume PTY when drained below
 
+// Escape handler stack — topmost handler fires first, prevents conflicts
+// between Quick Open, file search, diff preview, and dialogs.
+const escapeStack = [];
+export function pushEscape(handler) { escapeStack.push(handler); }
+export function popEscape(handler) {
+  const i = escapeStack.lastIndexOf(handler);
+  if (i !== -1) escapeStack.splice(i, 1);
+}
+
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -425,13 +434,51 @@ function switchTab(uiId) {
   renderTabBar();
 }
 
+function showConfirmDialog(message, onConfirm) {
+  document.querySelector(".confirm-overlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "confirm-overlay";
+  overlay.innerHTML = `
+    <div class="confirm-dialog">
+      <div class="confirm-message">${message}</div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-cancel">Cancel</button>
+        <button class="confirm-btn confirm-ok">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const dismiss = () => { overlay.remove(); popEscape(dismiss); };
+  overlay.querySelector(".confirm-cancel").addEventListener("click", dismiss);
+  overlay.querySelector(".confirm-ok").addEventListener("click", () => { dismiss(); onConfirm(); });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
+  pushEscape(dismiss);
+}
+
 async function closeTab(uiId) {
   const tab = tabs.get(uiId);
   if (!tab) return;
 
   if (tab.type === "editor" && tab.modified) {
-    if (!confirm(`"${tab.fileName}" has unsaved changes. Close anyway?`)) return;
+    showConfirmDialog(
+      `\u201C${tab.fileName}\u201D has unsaved changes. Close anyway?`,
+      () => doCloseTab(uiId)
+    );
+    return;
   }
+  if (tab.type === "terminal" && tab.panes.some(p => p.ptyId !== null)) {
+    showConfirmDialog(
+      "Terminal has a running process. Close anyway?",
+      () => doCloseTab(uiId)
+    );
+    return;
+  }
+  await doCloseTab(uiId);
+}
+
+async function doCloseTab(uiId) {
+  const tab = tabs.get(uiId);
+  if (!tab) return;
 
   // Remove tab from state and UI FIRST — before any cleanup that could fail
   tab.containerEl.style.display = "none";
@@ -549,8 +596,23 @@ async function saveEditorTab(uiId) {
     tab.originalContent = content;
     tab.modified = false;
     renderTabBar();
+    // Flash the tab label green briefly to confirm save
+    const tabEl = document.querySelector(`.tab[data-tab-id="${uiId}"] .tab-label`);
+    if (tabEl) {
+      tabEl.classList.add("tab-save-flash");
+      setTimeout(() => tabEl.classList.remove("tab-save-flash"), 600);
+    }
   } catch (err) {
     console.error("Save error:", err);
+    // Show inline error toast
+    const tabEl = document.querySelector(`.tab[data-tab-id="${uiId}"]`);
+    if (tabEl) {
+      const toast = document.createElement("div");
+      toast.className = "save-error-toast";
+      toast.textContent = `Save failed: ${err}`;
+      tabEl.parentElement.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
   }
 }
 
@@ -617,6 +679,8 @@ function renderTabBar() {
     const tabEl = document.createElement("div");
     tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
     tabEl.dataset.tabId = uiId;
+    tabEl.setAttribute("role", "tab");
+    tabEl.setAttribute("aria-selected", isActive ? "true" : "false");
 
     // Icon
     const icon = document.createElement("span");
@@ -994,7 +1058,18 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     markDebug("USER_MARK");
   }
+  // Cmd+/ — toggle keyboard shortcuts modal
+  if (e.metaKey && e.key === "/") {
+    e.preventDefault();
+    document.getElementById("shortcuts-modal").classList.toggle("shortcuts-visible");
+    return;
+  }
   if (e.key === "Escape") {
+    if (escapeStack.length > 0) {
+      e.preventDefault();
+      escapeStack[escapeStack.length - 1]();
+      return;
+    }
     closeFilePreview();
   }
   if (e.metaKey && e.key >= "1" && e.key <= "9") {
@@ -1033,9 +1108,46 @@ window.addEventListener("beforeunload", (e) => {
 // Custom mouse-based tab drag (HTML5 drag doesn't work reliably in WebKit/Tauri)
 let dragState = null;
 let dragGhost = null;
+let dropIndicator = null;
+
+function getTabInsertIndex(tabBar, mouseX, dragUiId) {
+  const tabEls = [...tabBar.querySelectorAll(".tab")];
+  for (let i = 0; i < tabEls.length; i++) {
+    const r = tabEls[i].getBoundingClientRect();
+    const mid = r.left + r.width / 2;
+    if (mouseX < mid) return i;
+  }
+  return tabEls.length;
+}
+
+function showDropIndicator(tabBar, insertIndex) {
+  if (!dropIndicator) {
+    dropIndicator = document.createElement("div");
+    dropIndicator.className = "tab-drop-indicator";
+  }
+  const tabEls = [...tabBar.querySelectorAll(".tab")];
+  if (insertIndex < tabEls.length) {
+    tabBar.insertBefore(dropIndicator, tabEls[insertIndex]);
+  } else {
+    // Insert before the + button (last child) or append
+    const addBtn = tabBar.querySelector(".tab-add");
+    if (addBtn) tabBar.insertBefore(dropIndicator, addBtn);
+    else tabBar.appendChild(dropIndicator);
+  }
+}
+
+function reorderTabs(tabsMap, fromKey, toIndex) {
+  const entries = [...tabsMap.entries()];
+  const fromIdx = entries.findIndex(([k]) => k === fromKey);
+  if (fromIdx === -1 || fromIdx === toIndex) return;
+  const [entry] = entries.splice(fromIdx, 1);
+  if (toIndex > fromIdx) toIndex--;
+  entries.splice(toIndex, 0, entry);
+  tabsMap.clear();
+  entries.forEach(([k, v]) => tabsMap.set(k, v));
+}
 
 function startTabDrag(tabEl, uiId, sourceGroup, e) {
-  if (!isSplit) return;
   e.preventDefault();
 
   dragState = { uiId, sourceGroup, startX: e.clientX, startY: e.clientY, started: false };
@@ -1055,17 +1167,26 @@ function startTabDrag(tabEl, uiId, sourceGroup, e) {
     dragGhost.style.left = me.clientX - 40 + "px";
     dragGhost.style.top = me.clientY - 12 + "px";
 
-    // Highlight target tab bar
     const rightBar = rightTabBarEl;
     const leftBar = document.getElementById("tab-bar");
     if (rightBar) rightBar.classList.toggle("drag-over", isOverEl(me, rightBar));
     leftBar.classList.toggle("drag-over", isOverEl(me, leftBar));
+
+    // Show reorder indicator within same group
+    const sameBar = sourceGroup === "left" ? leftBar : rightBar;
+    if (sameBar && isOverEl(me, sameBar)) {
+      const idx = getTabInsertIndex(sameBar, me.clientX, uiId);
+      showDropIndicator(sameBar, idx);
+    } else if (dropIndicator && dropIndicator.parentNode) {
+      dropIndicator.remove();
+    }
   };
 
   const onMouseUp = (me) => {
     document.removeEventListener("mousemove", onMouseMove);
     document.removeEventListener("mouseup", onMouseUp);
     if (dragGhost) { dragGhost.remove(); dragGhost = null; }
+    if (dropIndicator && dropIndicator.parentNode) dropIndicator.remove();
 
     const leftBar = document.getElementById("tab-bar");
     const rightBar = rightTabBarEl;
@@ -1074,11 +1195,35 @@ function startTabDrag(tabEl, uiId, sourceGroup, e) {
 
     if (!dragState || !dragState.started) { dragState = null; return; }
 
-    // Check drop target
-    if (rightBar && isOverEl(me, rightBar) && dragState.sourceGroup === "left") {
+    // Cross-group moves (only when split)
+    if (isSplit && rightBar && isOverEl(me, rightBar) && dragState.sourceGroup === "left") {
       moveTabToRight(dragState.uiId);
-    } else if (isOverEl(me, leftBar) && dragState.sourceGroup === "right") {
+    } else if (isSplit && isOverEl(me, leftBar) && dragState.sourceGroup === "right") {
       moveTabToLeft(dragState.uiId);
+    } else {
+      // Within-group reorder
+      const sameBar = sourceGroup === "left" ? leftBar : rightBar;
+      if (sameBar && isOverEl(me, sameBar)) {
+        const insertIdx = getTabInsertIndex(sameBar, me.clientX, uiId);
+        if (sourceGroup === "left") {
+          // Reorder in main tabs Map (only non-right-group tabs)
+          const leftEntries = [...tabs.entries()].filter(([, t]) => !t._rightGroup);
+          const fromIdx = leftEntries.findIndex(([k]) => k === uiId);
+          if (fromIdx !== -1 && fromIdx !== insertIdx) {
+            reorderTabs(tabs, uiId, insertIdx);
+            renderTabBar();
+          }
+        } else {
+          // Reorder in rightGroupTabIds array
+          const fromIdx = rightGroupTabIds.indexOf(uiId);
+          if (fromIdx !== -1 && fromIdx !== insertIdx) {
+            rightGroupTabIds.splice(fromIdx, 1);
+            const adj = insertIdx > fromIdx ? insertIdx - 1 : insertIdx;
+            rightGroupTabIds.splice(adj, 0, uiId);
+            renderRightTabBar();
+          }
+        }
+      }
     }
     dragState = null;
   };
@@ -1219,8 +1364,25 @@ async function closeRightTab(uiId) {
   if (!tab) return;
 
   if (tab.type === "editor" && tab.modified) {
-    if (!confirm(`"${tab.fileName}" has unsaved changes. Close anyway?`)) return;
+    showConfirmDialog(
+      `\u201C${tab.fileName}\u201D has unsaved changes. Close anyway?`,
+      () => doCloseRightTab(uiId)
+    );
+    return;
   }
+  if (tab.type === "terminal" && tab.panes.some(p => p.ptyId !== null)) {
+    showConfirmDialog(
+      "Terminal has a running process. Close anyway?",
+      () => doCloseRightTab(uiId)
+    );
+    return;
+  }
+  await doCloseRightTab(uiId);
+}
+
+async function doCloseRightTab(uiId) {
+  const tab = tabs.get(uiId);
+  if (!tab) return;
 
   // Remove from state and UI FIRST (same pattern as working closeTab)
   tab.containerEl.style.display = "none";
@@ -1237,7 +1399,6 @@ async function closeRightTab(uiId) {
   try { tab.containerEl.remove(); } catch (_) {}
 
   if (rightGroupTabIds.length === 0) {
-    // No tabs left in right group — unsplit
     unsplitWorkspace();
   } else if (rightActiveTabUiId === uiId) {
     switchRightTab(rightGroupTabIds[rightGroupTabIds.length - 1]);

@@ -1,4 +1,5 @@
 const { invoke } = window.__TAURI__.core;
+import { pushEscape, popEscape } from "./main.js";
 
 let visible = false;
 let currentRoot = "";
@@ -52,11 +53,13 @@ export function show(root) {
   input.value = "";
   results.innerHTML = "";
   input.focus();
+  pushEscape(hide);
 }
 
 export function hide() {
   visible = false;
   document.getElementById("quick-open").classList.remove("visible");
+  popEscape(hide);
 }
 
 export function updateRoot(root) {
@@ -69,6 +72,8 @@ async function search(query) {
     results.innerHTML = '<div class="qo-hint">Type to search files...</div>';
     return;
   }
+
+  results.innerHTML = '<div class="qo-hint">Searching\u2026</div>';
 
   try {
     const files = await invoke("search_files", {

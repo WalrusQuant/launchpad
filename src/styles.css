@@ -58,7 +58,8 @@ html, body, #app {
   white-space: nowrap;
 }
 
-#shortcuts-wrapper:hover #shortcuts-modal {
+#shortcuts-wrapper:hover #shortcuts-modal,
+#shortcuts-modal.shortcuts-visible {
   display: block;
 }
 
@@ -133,6 +134,128 @@ html, body, #app {
 @keyframes debug-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.5); }
   50% { box-shadow: 0 0 0 4px rgba(255, 82, 82, 0); }
+}
+
+/* Loading states */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+
+.skeleton-rows { padding: 4px 12px; }
+
+.skeleton-row {
+  height: 22px;
+  margin: 4px 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #2a2a2a 25%, #333 50%, #2a2a2a 75%);
+  background-size: 400px 100%;
+  animation: skeleton-shimmer 1.5s ease infinite;
+}
+
+.gp-refreshing { opacity: 0.6; }
+
+/* Confirm dialog (replaces native confirm()) */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.confirm-dialog {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 8px;
+  padding: 20px;
+  max-width: 400px;
+  min-width: 280px;
+}
+.confirm-message { color: #ddd; font-size: 13px; margin-bottom: 16px; }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.confirm-btn {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid #555;
+  background: #333;
+  color: #ddd;
+  cursor: pointer;
+  font-size: 12px;
+}
+.confirm-cancel:hover { background: #444; }
+.confirm-ok { background: #c0392b; border-color: #c0392b; color: #fff; }
+.confirm-ok:hover { background: #e74c3c; }
+
+/* Git cancel button */
+.gp-cancel-btn {
+  background: none;
+  border: 1px solid #ff5f56;
+  color: #ff5f56;
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+  margin-left: 4px;
+}
+.gp-cancel-btn:hover { background: rgba(255, 95, 86, 0.15); }
+
+/* Stash list */
+.gp-stash-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 16px;
+  font-size: 12px;
+  border-bottom: 1px solid #2a2a2a;
+}
+.gp-stash-entry:hover { background: #2a2a2a; }
+.gp-stash-msg {
+  color: #bbb;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.gp-stash-actions { display: flex; gap: 4px; flex-shrink: 0; margin-left: 8px; }
+.gp-stash-apply-btn, .gp-stash-drop-btn {
+  background: none;
+  border: 1px solid #555;
+  color: #aaa;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.gp-stash-apply-btn:hover { border-color: #5af78e; color: #5af78e; }
+.gp-stash-drop-btn:hover { border-color: #ff5f56; color: #ff5f56; }
+
+/* No upstream badge */
+.gp-no-upstream { color: #888; font-style: italic; }
+
+/* Tab drag reorder indicator */
+.tab-drop-indicator {
+  width: 2px;
+  background: #57c7ff;
+  align-self: stretch;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+/* Context menu separator */
+.ctx-menu-separator {
+  height: 1px;
+  background: #444;
+  margin: 4px 0;
+}
+
+/* Accessibility: focus-visible */
+:focus-visible {
+  outline: 2px solid #57c7ff;
+  outline-offset: -2px;
 }
 
 #main-layout {
@@ -589,6 +712,11 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   justify-content: space-between;
 }
 
+.gp-status-dot {
+  font-size: 10px;
+  margin-right: 6px;
+}
+
 .gp-branch-name {
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 13px;
@@ -755,6 +883,13 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   font-weight: 500;
 }
 
+.gp-branch-tracking {
+  color: #888;
+  font-size: 11px;
+  margin-left: 6px;
+  font-family: "SF Mono", "Menlo", monospace;
+}
+
 /* New branch input */
 .gp-new-branch-input {
   padding: 4px 16px;
@@ -789,13 +924,48 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: #4de67d;
 }
 
+.gp-commit-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: #333;
+}
+
 /* Diff line colors */
 .diff-line {
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 12px;
   line-height: 1.6;
-  padding: 0 4px;
+  padding: 0;
+  display: flex;
+}
+
+.diff-gutter {
+  display: inline-block;
+  width: 36px;
+  min-width: 36px;
+  text-align: right;
+  padding-right: 6px;
+  color: #555;
+  font-size: 11px;
+  user-select: none;
+  border-right: 1px solid #333;
+}
+
+.diff-content {
   white-space: pre;
+  padding: 0 6px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.diff-hunk-header {
+  color: #61afef;
+  background: #1a2332;
+  padding: 2px 8px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  border-top: 1px solid #333;
+  margin-top: 4px;
 }
 
 .diff-add {
@@ -892,31 +1062,6 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   gap: 4px;
   padding: 6px 16px;
   border-bottom: 1px solid #333;
-}
-
-.gp-pill-btn {
-  background: #2a2a2a;
-  border: 1px solid #444;
-  color: #aaa;
-  padding: 3px 0;
-  border-radius: 12px;
-  font-family: "SF Mono", "Menlo", monospace;
-  font-size: 10px;
-  cursor: pointer;
-  flex: 1;
-  text-align: center;
-  transition: border-color 0.15s;
-}
-
-.gp-pill-btn:hover {
-  background: #333;
-  color: #e0e0e0;
-  border-color: #57c7ff;
-}
-
-.gp-pill-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 /* Feedback toast */
@@ -1032,20 +1177,6 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: #e54c43;
 }
 
-.gp-confirm-no {
-  background: none;
-  border: 1px solid #555;
-  color: #aaa;
-  border-radius: 4px;
-  padding: 4px 12px;
-  cursor: pointer;
-  font-size: 11px;
-}
-
-.gp-confirm-no:hover {
-  background: #333;
-  color: #ddd;
-}
 
 /* Commit form improvements */
 .gp-commit-prefix-row {
@@ -1078,10 +1209,6 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 
 .gp-char-count-warn {
   color: #e5c07b;
-}
-
-.gp-char-count-over {
-  color: #ff5f56;
 }
 
 .gp-commit-form {
@@ -1725,17 +1852,7 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   color: #ccc;
 }
 
-/* GitHub PR button accent */
-.gp-gh-btn-pr {
-  border-color: #5af78e;
-  color: #5af78e;
-}
-
-.gp-gh-btn-pr:hover {
-  background: rgba(90, 247, 142, 0.1);
-  border-color: #5af78e;
-  color: #5af78e;
-}
+/* GitHub PR button — same style as other GitHub buttons */
 
 /* ===== Quick Open ===== */
 #quick-open {
@@ -2218,6 +2335,30 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   flex-shrink: 0;
 }
 
+.tab-save-flash {
+  color: #5af78e !important;
+  transition: color 0.3s ease;
+}
+
+.save-error-toast {
+  position: absolute;
+  top: 100%;
+  left: 8px;
+  right: 8px;
+  padding: 6px 10px;
+  background: #3a1a1a;
+  border: 1px solid #ff5f56;
+  color: #ff5f56;
+  font-size: 11px;
+  border-radius: 4px;
+  z-index: 100;
+  animation: toast-fade 3s ease forwards;
+}
+
+@keyframes toast-fade {
+  0%, 80% { opacity: 1; }
+  100% { opacity: 0; }
+}
 
 /* Scrollbar styling */
 ::-webkit-scrollbar {

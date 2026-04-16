@@ -1,4 +1,5 @@
 const { invoke } = window.__TAURI__.core;
+import { pushEscape, popEscape } from "./main.js";
 
 let currentPath = "";
 let workingDirectory = ""; // the terminal's actual cwd — only changes on explicit confirm
@@ -81,6 +82,11 @@ function isPreviewable(name) {
 
 async function loadDirectory(path, parentEl, depth = 0) {
   try {
+    // Show skeleton placeholder while loading (only for top-level loads)
+    if (depth === 0 && parentEl.children.length === 0) {
+      parentEl.innerHTML = '<div class="skeleton-rows">' +
+        '<div class="skeleton-row"></div>'.repeat(5) + '</div>';
+    }
     const entries = await invoke("read_directory", { path });
     let filtered = showHidden
       ? entries
@@ -101,6 +107,9 @@ async function loadDirectory(path, parentEl, depth = 0) {
       row.className = getFileClass(entry);
       row.style.paddingLeft = (12 + depth * 16) + "px";
       row.dataset.path = entry.path;
+      row.setAttribute("role", "treeitem");
+      row.tabIndex = 0;
+      if (entry.is_dir) row.setAttribute("aria-expanded", expandedDirs.has(entry.path) ? "true" : "false");
 
       const icon = document.createElement("span");
       icon.className = "file-icon";
@@ -210,6 +219,99 @@ function showContextMenu(x, y, entry) {
     action: () => invoke("reveal_in_finder", { path: entry.path }),
   });
 
+  // ── CRUD operations ────────────────────────────────────────────────────────
+  const targetDir = entry.is_dir
+    ? entry.path
+    : entry.path.substring(0, entry.path.lastIndexOf("/"));
+
+  items.push({ type: "separator" });
+  items.push({
+    label: "New File",
+    action: () => {
+      const name = window.prompt("New file name:");
+      if (!name || !name.trim()) return;
+      invoke("create_file", { path: targetDir + "/" + name.trim() })
+        .then(() => refreshFileBrowser())
+        .catch((err) => alert("Failed to create file: " + err));
+    },
+  });
+  items.push({
+    label: "New Folder",
+    action: () => {
+      const name = window.prompt("New folder name:");
+      if (!name || !name.trim()) return;
+      invoke("create_directory", { path: targetDir + "/" + name.trim() })
+        .then(() => refreshFileBrowser())
+        .catch((err) => alert("Failed to create folder: " + err));
+    },
+  });
+  items.push({ type: "separator" });
+  items.push({
+    label: "Rename",
+    action: () => {
+      // Find the name element in the already-rendered row and replace with inline input
+      const nameEl = document.querySelector(
+        `[data-path="${CSS.escape(entry.path)}"] .file-name`
+      );
+      if (!nameEl) {
+        // Fallback to prompt if DOM element not found
+        const newName = window.prompt("Rename to:", entry.name);
+        if (!newName || !newName.trim() || newName.trim() === entry.name) return;
+        const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/"));
+        invoke("rename_path", { oldPath: entry.path, newPath: parentDir + "/" + newName.trim() })
+          .then(() => refreshFileBrowser())
+          .catch((err) => alert("Failed to rename: " + err));
+        return;
+      }
+      const originalText = nameEl.textContent;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "file-rename-input";
+      input.value = entry.name;
+      nameEl.textContent = "";
+      nameEl.appendChild(input);
+      input.focus();
+      input.select();
+
+      let committed = false;
+      const commit = () => {
+        if (committed) return;
+        const newName = input.value.trim();
+        if (!newName || newName === entry.name) {
+          nameEl.textContent = originalText;
+          return;
+        }
+        committed = true;
+        const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/"));
+        invoke("rename_path", { oldPath: entry.path, newPath: parentDir + "/" + newName })
+          .then(() => refreshFileBrowser())
+          .catch((err) => {
+            committed = false;
+            alert("Failed to rename: " + err);
+            nameEl.textContent = originalText;
+          });
+      };
+
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        if (e.key === "Escape") { e.preventDefault(); nameEl.textContent = originalText; }
+      });
+      input.addEventListener("blur", () => {
+        if (!committed) nameEl.textContent = originalText;
+      });
+    },
+  });
+  items.push({
+    label: "Delete",
+    action: () => {
+      const kind = entry.is_dir ? "folder" : "file";
+      if (!window.confirm(`Delete ${kind} "${entry.name}"? This cannot be undone.`)) return;
+      invoke("delete_path", { path: entry.path })
+        .then(() => refreshFileBrowser())
+        .catch((err) => alert("Failed to delete: " + err));
+    },
+  });
+
   items.forEach((item) => {
     if (item.type === "separator") {
       const sep = document.createElement("div");
@@ -265,6 +367,7 @@ async function showFilePreview(entry) {
 export function closeFilePreview() {
   const preview = document.getElementById("file-preview");
   if (preview) preview.classList.remove("visible");
+  popEscape(closeFilePreview);
 }
 
 // Show diff in read-only preview mode (used by git panel)
@@ -284,6 +387,7 @@ export function showDiffPreview(fileName, diffHtml) {
   status.textContent = "";
 
   preview.classList.add("visible");
+  pushEscape(closeFilePreview);
 }
 
 async function toggleDirectory(entry, row, depth) {
@@ -388,6 +492,9 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
   const hiddenBtn = document.getElementById("toggle-hidden");
   if (hiddenBtn) hiddenBtn.addEventListener("click", toggleHidden);
 
+  const previewCloseBtn = document.getElementById("preview-close");
+  if (previewCloseBtn) previewCloseBtn.addEventListener("click", closeFilePreview);
+
   // File search
   const searchInput = document.getElementById("file-search-input");
   const searchBox = document.getElementById("file-search");
@@ -404,11 +511,7 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
 
   searchInput.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      searchQuery = "";
-      searchInput.value = "";
-      searchBox.style.display = "none";
-      const tree = document.getElementById("file-tree");
-      loadDirectory(currentPath, tree);
+      closeSearch();
     }
     e.stopPropagation();
   });
@@ -422,8 +525,18 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, defaultDire
       searchBox.style.display = "block";
       searchInput.focus();
       searchInput.select();
+      pushEscape(closeSearch);
     }
   });
+
+  function closeSearch() {
+    searchQuery = "";
+    searchInput.value = "";
+    searchBox.style.display = "none";
+    const tree = document.getElementById("file-tree");
+    loadDirectory(currentPath, tree);
+    popEscape(closeSearch);
+  }
 }
 
 export function getCurrentPath() {

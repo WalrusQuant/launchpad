@@ -10,7 +10,7 @@
     <div id="app">
       <div id="toolbar">
         <div id="toolbar-left">
-          <button id="open-settings" class="toolbar-btn" title="Settings (⌘,)">⚙</button>
+          <button id="open-settings" class="toolbar-btn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
           <div id="shortcuts-wrapper">
             <button id="show-shortcuts" class="toolbar-btn" title="Keyboard shortcuts">⌘</button>
             <div id="shortcuts-modal">
@@ -33,8 +33,8 @@
           </div>
         </div>
         <div id="toolbar-actions">
-          <button id="debug-capture" class="toolbar-btn" title="Debug capture">⦿</button>
-          <button id="toggle-git-panel" class="toolbar-btn" title="Git panel (⌘G)">⎇</button>
+          <button id="debug-capture" class="toolbar-btn" title="Debug capture" aria-label="Debug capture">⦿</button>
+          <button id="toggle-git-panel" class="toolbar-btn" title="Git panel (⌘G)" aria-label="Git panel">⎇</button>
         </div>
       </div>
       <div id="main-layout">
@@ -50,19 +50,19 @@
             <div id="file-search" class="file-search">
               <input id="file-search-input" type="text" placeholder="Search files..." autocomplete="off" />
             </div>
-            <div id="file-tree"></div>
+            <div id="file-tree" role="tree" aria-label="File browser"></div>
           </div>
           <div id="resize-handle" class="resize-handle"></div>
           <div id="terminal-container">
             <div id="split-wrapper">
               <div id="group-left">
-                <div id="tab-bar"></div>
+                <div id="tab-bar" role="tablist" aria-label="Open tabs"></div>
                 <div id="terminal-instances"></div>
               </div>
               <!-- #group-right created dynamically when split -->
             </div>
           </div>
-          <div id="git-panel">
+          <div id="git-panel" role="complementary" aria-label="Git panel">
             <div class="gp-empty">
               <div class="gp-empty-icon">⎇</div>
               <div class="gp-empty-text">Open a git repository</div>
@@ -72,7 +72,7 @@
       </div>
     </div>
     <!-- Quick open overlay -->
-    <div id="quick-open">
+    <div id="quick-open" role="dialog" aria-label="Quick open">
       <div id="quick-open-dialog">
         <input id="quick-open-input" type="text" placeholder="Search files by name..." autocomplete="off" />
         <div id="quick-open-results">

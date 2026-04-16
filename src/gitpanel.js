@@ -1,7 +1,17 @@
-import { showDiffPreview } from "./filebrowser.js";
+import { showDiffPreview, refreshFileBrowser } from "./filebrowser.js";
 import { setPanelTransitioning } from "./main.js";
 
 const { invoke } = window.__TAURI__.core;
+
+// Wraps invoke with a timeout to prevent indefinite hangs on network operations
+function invokeWithTimeout(command, args, timeoutMs = 30000) {
+  return Promise.race([
+    invoke(command, args),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Operation timed out")), timeoutMs)
+    ),
+  ]);
+}
 
 // ─── Module-level state ────────────────────────────────────────────────────────
 let panelVisible = false;
@@ -65,6 +75,8 @@ export async function refreshPanel(path, force = false) {
   if (!panelVisible) return;
 
   const panel = document.getElementById("git-panel");
+  const header = panel.querySelector(".gp-header");
+  if (header) header.classList.add("gp-refreshing");
 
   try {
     const status = await invoke("get_git_status", { path: currentPath });
@@ -79,20 +91,24 @@ export async function refreshPanel(path, force = false) {
       return;
     }
 
-    const [branches, remoteBranches, commits, remoteUrl] = await Promise.all([
+    const [branches, remoteBranches, commits, remoteUrl, stashes] = await Promise.all([
       invoke("list_branches", { path: currentPath }),
       invoke("list_remote_branches", { path: currentPath }).catch(() => []),
       invoke("get_commits", { path: currentPath, count: 30 }),
       invoke("get_remote_url", { path: currentPath }).catch(() => null),
+      invoke("git_stash_list", { path: currentPath }).catch(() => []),
     ]);
 
-    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits });
+    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, stashes });
     if (snapshot === lastSnapshot && !force) return;
     lastSnapshot = snapshot;
 
-    renderPanel(status, branches, remoteBranches, commits, remoteUrl);
+    renderPanel(status, branches, remoteBranches, commits, remoteUrl, stashes);
   } catch (err) {
     panel.innerHTML = `<div class="gp-error">Error: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    const h = panel.querySelector(".gp-header");
+    if (h) h.classList.remove("gp-refreshing");
   }
 }
 
@@ -236,7 +252,7 @@ function showCheatsheet() {
 }
 
 // ─── Main render function ─────────────────────────────────────────────────────
-function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
+function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stashes = []) {
   const panel = document.getElementById("git-panel");
 
   const branchName = status.branch || "HEAD";
@@ -250,11 +266,31 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
   const hasAnyFiles = stagedFiles.length > 0 || unstagedFiles.length > 0;
 
   // ── 1. Header ──────────────────────────────────────────────────────────────
+  // Status dot — single-glance repo health indicator
+  // Priority: diverged > behind > ahead > dirty > no-upstream > clean
+  const isDirty = stagedFiles.length > 0 || unstagedFiles.length > 0 || conflictFiles.length > 0;
+  let statusColor, statusTitle;
+  if (status.ahead > 0 && status.behind > 0) {
+    statusColor = "#ff5722"; statusTitle = "Diverged";
+  } else if (status.behind > 0) {
+    statusColor = "#f44336"; statusTitle = "Behind \u2014 pull needed";
+  } else if (status.ahead > 0) {
+    statusColor = "#2196f3"; statusTitle = "Ahead \u2014 push needed";
+  } else if (isDirty) {
+    statusColor = "#ff9800"; statusTitle = "Uncommitted changes";
+  } else if (!status.has_upstream) {
+    statusColor = "#888"; statusTitle = "No upstream configured";
+  } else {
+    statusColor = "#4caf50"; statusTitle = "Clean";
+  }
+
   let syncHtml = "";
-  if (status.ahead > 0 || status.behind > 0) {
+  if (!status.has_upstream) {
+    syncHtml = `<span class="gp-sync gp-no-upstream">No upstream</span>`;
+  } else if (status.ahead > 0 || status.behind > 0) {
     syncHtml = `<span class="gp-sync">`;
-    if (status.ahead > 0) syncHtml += `↑${status.ahead} `;
-    if (status.behind > 0) syncHtml += `↓${status.behind}`;
+    if (status.ahead > 0) syncHtml += `\u2191${status.ahead} `;
+    if (status.behind > 0) syncHtml += `\u2193${status.behind}`;
     syncHtml += `</span>`;
   }
 
@@ -268,7 +304,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
 
   const headerHtml = `
     <div class="gp-header">
-      <span class="gp-branch-name">⎇ ${escapeHtml(branchName)}</span>
+      <span class="gp-status-dot" style="color:${statusColor}" title="${statusTitle}">\u25CF</span><span class="gp-branch-name">\u2387 ${escapeHtml(branchName)}</span>
       ${syncHtml}
       <div class="gp-header-right">
         ${githubBtns}
@@ -279,11 +315,32 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
   // ── 2. Quick Actions Toolbar ───────────────────────────────────────────────
   const toolbarHtml = `
     <div class="gp-toolbar">
-      <button class="gp-tool-btn" id="gp-pull-btn">↓ Pull</button>
-      <button class="gp-tool-btn" id="gp-push-btn">↑ Push</button>
-      <button class="gp-tool-btn" id="gp-stash-btn">⊟ Stash</button>
-      <button class="gp-tool-btn" id="gp-pop-btn">⊞ Pop</button>
+      <button class="gp-tool-btn" id="gp-fetch-btn">\u21BB Fetch</button>
+      <button class="gp-tool-btn" id="gp-pull-btn">\u2193 Pull</button>
+      <button class="gp-tool-btn" id="gp-push-btn">\u2191 Push</button>
+      <button class="gp-tool-btn" id="gp-stash-btn">\u229F Stash</button>
+      <button class="gp-tool-btn" id="gp-pop-btn">\u229E Pop</button>
     </div>`;
+
+  // ── Stash list ──────────────────────────────────────────────────────────────
+  let stashHtml = "";
+  if (stashes.length > 0) {
+    const rows = stashes
+      .map((s) => `
+        <div class="gp-stash-entry" data-stash-index="${s.index}">
+          <span class="gp-stash-msg">${escapeHtml(s.message)}</span>
+          <div class="gp-stash-actions">
+            <button class="gp-stash-apply-btn" data-index="${s.index}" title="Apply">Apply</button>
+            <button class="gp-stash-drop-btn" data-index="${s.index}" title="Drop">\u00D7</button>
+          </div>
+        </div>`)
+      .join("");
+    stashHtml = `
+      <div class="gp-section">
+        <div class="gp-section-title">STASH (${stashes.length})</div>
+        ${rows}
+      </div>`;
+  }
 
   // ── 3. Conflicts ───────────────────────────────────────────────────────────
   let conflictsHtml = "";
@@ -406,7 +463,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
     branchesHtml += `
       <div class="gp-branch ${currentClass}" data-branch="${escapeHtml(b.name)}">
         <span class="gp-branch-indicator">${indicator}</span>
-        <span class="gp-branch-label">${escapeHtml(b.name)}</span>
+        <span class="gp-branch-label">${escapeHtml(b.name)}</span>${b.upstream ? `<span class="gp-branch-tracking">\u2192 ${escapeHtml(b.upstream)}</span>` : ""}
         ${actions}
       </div>`;
   });
@@ -455,6 +512,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
   panel.innerHTML =
     headerHtml +
     toolbarHtml +
+    stashHtml +
     conflictsHtml +
     stagedHtml +
     changedHtml +
@@ -473,6 +531,33 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
     });
   });
 
+  // Stash apply/drop buttons
+  panel.querySelectorAll(".gp-stash-apply-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await invoke("git_stash_apply", { path: currentPath, index: parseInt(btn.dataset.index) });
+        showGitFeedback("Stash applied", "success");
+        await refreshPanel(null, true);
+        refreshFileBrowser();
+      } catch (err) {
+        showGitFeedback(`Apply failed: ${err}`, "error");
+      }
+    });
+  });
+  panel.querySelectorAll(".gp-stash-drop-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await invoke("git_stash_drop", { path: currentPath, index: parseInt(btn.dataset.index) });
+        showGitFeedback("Stash dropped", "success");
+        await refreshPanel(null, true);
+      } catch (err) {
+        showGitFeedback(`Drop failed: ${err}`, "error");
+      }
+    });
+  });
+
   // Help / cheatsheet
   const helpBtn = panel.querySelector(".gp-help-btn");
   if (helpBtn) {
@@ -483,10 +568,11 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
   }
 
   // Quick action toolbar
-  wireToolbarBtn("gp-pull-btn", "git_pull", "↓ Pull", "↓ Pulling…", "Pull complete", "Pull failed");
-  wireToolbarBtn("gp-push-btn", "git_push", "↑ Push", "↑ Pushing…", "Push complete", "Push failed");
-  wireToolbarBtn("gp-stash-btn", "git_stash_save", "⊟ Stash", "⊟ Stashing…", "Stashed", "Stash failed");
-  wireToolbarBtn("gp-pop-btn", "git_stash_pop", "⊞ Pop", "⊞ Popping…", "Stash applied", "Pop failed");
+  wireToolbarBtn("gp-fetch-btn", "git_fetch", "\u21BB Fetch", "\u21BB Fetching\u2026", "Fetched", "Fetch failed");
+  wireToolbarBtn("gp-pull-btn", "git_pull", "\u2193 Pull", "\u2193 Pulling\u2026", "Pull complete", "Pull failed");
+  wireToolbarBtn("gp-push-btn", "git_push", "\u2191 Push", "\u2191 Pushing\u2026", "Push complete", "Push failed");
+  wireToolbarBtn("gp-stash-btn", "git_stash_save", "\u229F Stash", "\u229F Stashing\u2026", "Stashed", "Stash failed");
+  wireToolbarBtn("gp-pop-btn", "git_stash_pop", "\u229E Pop", "\u229E Popping\u2026", "Stash applied", "Pop failed");
 
   // Conflict resolution
   panel.querySelectorAll(".gp-conflict-btn").forEach((btn) => {
@@ -547,11 +633,11 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
     });
   }
 
-  // Staged file path click → show diff
+  // Staged file path click → show staged diff
   panel.querySelectorAll(".gp-file[data-file-status^='index_'] .gp-file-path").forEach((el) => {
     el.addEventListener("click", () => {
       const fileEl = el.closest(".gp-file");
-      showDiff(fileEl.dataset.filePath);
+      showDiff(fileEl.dataset.filePath, true);
     });
   });
 
@@ -662,6 +748,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
       await invoke("git_commit", { path: currentPath, message: msg });
       showGitFeedback("Committed successfully", "success");
       await refreshPanel(null, true);
+      refreshFileBrowser();
     } catch (err) {
       showGitFeedback(`Commit failed: ${err}`, "error");
     } finally {
@@ -684,6 +771,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
       try {
         await invoke("checkout_branch", { path: currentPath, branchName: name });
         await refreshPanel(null, true);
+        refreshFileBrowser();
       } catch (err) {
         showGitFeedback(`Checkout failed: ${err}`, "error");
       }
@@ -700,6 +788,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl) {
           await invoke("git_merge_branch", { path: currentPath, branchName });
           showGitFeedback(`Merged ${branchName}`, "success");
           await refreshPanel(null, true);
+          refreshFileBrowser();
         } catch (err) {
           showGitFeedback(`Merge failed: ${err}`, "error");
         }
@@ -816,33 +905,53 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     e.stopPropagation();
     btn.disabled = true;
     btn.textContent = labelBusy;
+    // Show cancel button for network operations
+    let cancelBtn = null;
+    if (["git_fetch", "git_pull", "git_push"].includes(command)) {
+      cancelBtn = document.createElement("button");
+      cancelBtn.className = "gp-cancel-btn";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", async (ce) => {
+        ce.stopPropagation();
+        await invoke("cancel_git_op");
+        showGitFeedback("Operation cancelled", "error");
+      });
+      btn.parentElement.insertBefore(cancelBtn, btn.nextSibling);
+    }
     try {
-      await invoke(command, { path: currentPath });
+      await invokeWithTimeout(command, { path: currentPath });
       showGitFeedback(msgSuccess, "success");
       await refreshPanel(null, true);
+      refreshFileBrowser();
     } catch (err) {
       showGitFeedback(`${msgError}: ${err}`, "error");
     } finally {
       btn.disabled = false;
       btn.textContent = labelDefault;
+      if (cancelBtn) cancelBtn.remove();
     }
   });
 }
 
 // ─── Diff preview ──────────────────────────────────────────────────────────────
-async function showDiff(filePath) {
+async function showDiff(filePath, staged = false) {
   try {
-    const diff = await invoke("get_file_diff", { path: currentPath, filePath });
+    const diff = await invoke("get_file_diff", { path: currentPath, filePath, staged });
     let html = "";
-    const lines = diff.split("\n");
-    lines.forEach((line) => {
-      const cls = line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-del" : "";
-      const escaped = line
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-      html += `<div class="diff-line ${cls}">${escaped}</div>`;
-    });
+    for (const hunk of diff.hunks) {
+      html += `<div class="diff-hunk-header">@@ -${hunk.old_start},${hunk.old_lines} +${hunk.new_start},${hunk.new_lines} @@</div>`;
+      for (const line of hunk.lines) {
+        const cls = line.origin === "add" ? "diff-add" : line.origin === "remove" ? "diff-del" : "";
+        const oldNo = line.old_line_no >= 0 ? line.old_line_no : "";
+        const newNo = line.new_line_no >= 0 ? line.new_line_no : "";
+        const escaped = line.content
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/\n$/, "");
+        html += `<div class="diff-line ${cls}"><span class="diff-gutter">${oldNo}</span><span class="diff-gutter">${newNo}</span><span class="diff-content">${escaped}</span></div>`;
+      }
+    }
     showDiffPreview(filePath, html);
   } catch (err) {
     console.error("Diff error:", err);
