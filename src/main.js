@@ -1,6 +1,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
 import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
@@ -23,10 +24,13 @@ let activeTabUiId = -1;
 let nextUiTabId = 0;
 let isCreatingTab = false;
 let panelTransitioning = false;
-// Per-pane resize coordination lives on each pane object (see createPane).
 // fitAllPanes uses a trailing-edge debounce stored on tab.fitDebounceTimer.
 const FIT_DEBOUNCE_MS = 60; // Coalesces ResizeObserver firehose during drags
-const RESIZE_SETTLE_MS = 50; // Time to let SIGWINCH propagate + shell repaint before flushing buffer
+// Flow control: pause PTY reader when xterm.js write queue exceeds high water,
+// resume when it drains below low water. Prevents ghost characters by keeping
+// PTY output rate in sync with xterm.js rendering speed.
+const FLOW_HIGH_WATER = 100_000; // chars — pause PTY when exceeded
+const FLOW_LOW_WATER = 25_000;   // chars — resume PTY when drained below
 
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
@@ -161,6 +165,12 @@ async function createPane(parentEl, cwd) {
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+  // Use Unicode 11 width tables so character widths match what modern CLI tools
+  // (Claude Code, Ink-based TUIs) expect. Without this, symbols like ● get
+  // wrong-width measurements and leave ghost fragments when erased.
+  const unicodeAddon = new Unicode11Addon();
+  term.loadAddon(unicodeAddon);
+  term.unicode.activeVersion = "11";
 
   const el = document.createElement("div");
   el.className = "pane";
@@ -172,12 +182,11 @@ async function createPane(parentEl, cwd) {
     term,
     fitAddon,
     el,
-    // Resize coordination — gates pty-output writes while xterm/pty dimensions sync
-    resizing: false,
-    resizeBuffer: [],
+    // Flow control — backpressure replaces gate/buffer/settle resize coordination
+    unackedChars: 0,
+    paused: false,
     lastSentRows: 0,
     lastSentCols: 0,
-    settleTimer: null,
   };
 
   term.onData((data) => {
@@ -331,64 +340,18 @@ async function splitPane() {
   secondPane.term.focus();
 }
 
-// Flushes a pane's resize buffer and reopens the gate.
-function flushPane(pane) {
-  if (pane.settleTimer) {
-    clearTimeout(pane.settleTimer);
-    pane.settleTimer = null;
-  }
-  pane.resizing = false;
-  if (pane.resizeBuffer.length > 0) {
-    pane.term.write(pane.resizeBuffer.join(""));
-    pane.resizeBuffer.length = 0;
-  }
-}
-
-// The actual fit/resize coordinator. Per-pane gating; awaits the IPC; settles before flush.
+// Fit each pane and sync PTY dimensions. Backpressure (via flow control on the
+// pty-output listener) naturally pauses the PTY when xterm.js is busy reflowing,
+// so no gating, buffering, or settle timers are needed.
 async function _runFit(tab) {
   dbg("runfit_start", { paneCount: tab.panes.length });
-  // Phase 1: gate every pane and cancel any pending settles. After this, new
-  // pty-output events will buffer in pane.resizeBuffer instead of writing
-  // directly.
-  for (const pane of tab.panes) {
-    pane.resizing = true;
-    if (pane.settleTimer) {
-      clearTimeout(pane.settleTimer);
-      pane.settleTimer = null;
-    }
-  }
-
-  // Phase 2: drain each pane's xterm write queue BEFORE changing dimensions.
-  // term.write() is async — xterm has an internal queue. If we call fit()
-  // (which synchronously resizes the xterm buffer) while bytes from the old
-  // column count are still queued, those bytes get processed against the new
-  // grid and land at wrong columns. term.write("", cb) fires cb after the
-  // queue drains, so awaiting it guarantees all pre-gate bytes have hit the
-  // old grid before we resize.
-  await Promise.all(
-    tab.panes.map(
-      (pane) =>
-        new Promise((resolve) => {
-          try {
-            pane.term.write("", resolve);
-          } catch (e) {
-            resolve();
-          }
-        })
-    )
-  );
-
-  // Phase 3: fit each pane and decide whether the IPC resize is needed.
-  const needIpc = [];
   for (const pane of tab.panes) {
     const beforeRows = pane.term.rows;
     const beforeCols = pane.term.cols;
-    const elW = pane.el?.clientWidth;
-    const elH = pane.el?.clientHeight;
     try {
       pane.fitAddon.fit();
     } catch (e) {
-      // term.open() may not have run yet (initial pane creation); fit is a no-op then.
+      // term.open() may not have run yet
     }
     dbg("fit", {
       pty: pane.ptyId,
@@ -396,50 +359,19 @@ async function _runFit(tab) {
       beforeCols,
       afterRows: pane.term.rows,
       afterCols: pane.term.cols,
-      elW,
-      elH,
     });
-    if (pane.ptyId === null) {
-      // PTY not spawned yet — nothing to gate against, drop the gate immediately.
-      pane.resizing = false;
-      continue;
-    }
+    if (pane.ptyId === null) continue;
     const rows = pane.term.rows;
     const cols = pane.term.cols;
-    if (rows === pane.lastSentRows && cols === pane.lastSentCols) {
-      // No-op short-circuit: dimensions unchanged, skip IPC and ungate immediately.
-      pane.resizing = false;
-      // Drain anything that may have buffered between gate-on and short-circuit.
-      if (pane.resizeBuffer.length > 0) {
-        pane.term.write(pane.resizeBuffer.join(""));
-        pane.resizeBuffer.length = 0;
-      }
-      continue;
+    if (rows === pane.lastSentRows && cols === pane.lastSentCols) continue;
+    pane.lastSentRows = rows;
+    pane.lastSentCols = cols;
+    try {
+      await invoke("resize_pty", { tabId: pane.ptyId, rows, cols });
+      dbg("resize_pty_ack", { pty: pane.ptyId, rows, cols });
+    } catch (e) {
+      console.warn("resize_pty failed", e);
     }
-    needIpc.push({ pane, rows, cols });
-  }
-
-  if (needIpc.length === 0) return;
-
-  // Issue all resize_pty calls in parallel and wait for them to land in Rust.
-  await Promise.all(
-    needIpc.map(({ pane, rows, cols }) => {
-      dbg("resize_pty_send", { pty: pane.ptyId, rows, cols });
-      return invoke("resize_pty", { tabId: pane.ptyId, rows, cols }).then(() => {
-        dbg("resize_pty_ack", { pty: pane.ptyId, rows, cols });
-        pane.lastSentRows = rows;
-        pane.lastSentCols = cols;
-      }).catch((e) => {
-        dbg("resize_pty_error", { pty: pane.ptyId, error: String(e) });
-        console.warn("resize_pty failed", e);
-      });
-    })
-  );
-
-  // Schedule per-pane settle. SIGWINCH + shell repaint needs a frame to land
-  // before we replay buffered output against the new grid.
-  for (const { pane } of needIpc) {
-    pane.settleTimer = setTimeout(() => flushPane(pane), RESIZE_SETTLE_MS);
   }
 }
 
@@ -775,18 +707,13 @@ function startTabRename(uiId, labelEl, index) {
 }
 
 // Listen for PTY output — route by ptyId to correct pane.
-// Per-pane gating: if this pane is currently resizing, buffer until the settle
-// timer flushes (avoids writing OLD-col-count bytes into a NEW-col-count grid).
+// Uses backpressure flow control: pauses the PTY reader when xterm.js falls
+// behind, resumes when drained. No gating or buffering needed.
 listen("pty-output", (event) => {
   const { tab_id, data } = event.payload;
   const pane = paneMap.get(tab_id);
   if (!pane) {
     dbg("pty_output_dropped", { pty: tab_id, len: data.length, hex: hexOf(data) });
-    return;
-  }
-  if (pane.resizing) {
-    dbg("pty_output_buffered", { pty: tab_id, len: data.length, hex: hexOf(data) });
-    pane.resizeBuffer.push(data);
     return;
   }
   dbg("pty_output", {
@@ -798,7 +725,23 @@ listen("pty-output", (event) => {
     rows: pane.term.rows,
     cols: pane.term.cols,
   });
-  pane.term.write(data);
+
+  pane.unackedChars += data.length;
+
+  // Backpressure: pause PTY reader when xterm.js write queue is deep
+  if (!pane.paused && pane.unackedChars > FLOW_HIGH_WATER) {
+    pane.paused = true;
+    invoke("pause_pty_reader", { tabId: tab_id });
+  }
+
+  // Write with ack callback — resume PTY when xterm.js drains below low water
+  pane.term.write(data, () => {
+    pane.unackedChars -= data.length;
+    if (pane.paused && pane.unackedChars < FLOW_LOW_WATER && paneMap.has(tab_id)) {
+      pane.paused = false;
+      invoke("resume_pty_reader", { tabId: tab_id });
+    }
+  });
 });
 
 // Listen for PTY exit — auto-close the tab when the shell process exits

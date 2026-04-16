@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, State};
@@ -20,6 +21,10 @@ struct PtyInstance {
     // claimed by start_pty_reader. Prevents the race where pty-output events
     // fire before paneMap.set() and get silently dropped by the JS listener.
     pending_reader: Option<Box<dyn Read + Send>>,
+    // Flow control: frontend sets this when xterm.js write queue exceeds the
+    // high-water mark. The reader thread checks it after each read and sleeps
+    // until cleared. Data stays in the OS PTY buffer — nothing is lost.
+    paused: Arc<AtomicBool>,
 }
 
 struct AppState {
@@ -119,6 +124,7 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
         master: pair.master,
         last_size: (pty_rows, pty_cols),
         pending_reader: Some(reader),
+        paused: Arc::new(AtomicBool::new(false)),
     };
 
     state
@@ -145,13 +151,14 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
 // fire before the frontend's listener has a pane to route them to.
 #[tauri::command]
 fn start_pty_reader(tab_id: u32, state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
-    let mut reader = {
+    let (mut reader, paused) = {
         let mut ptys = state.ptys.lock().map_err(|e| e.to_string())?;
         let instance = ptys.get_mut(&tab_id).ok_or("Tab not found")?;
-        instance
+        let r = instance
             .pending_reader
             .take()
-            .ok_or("Reader already started")?
+            .ok_or("Reader already started")?;
+        (r, Arc::clone(&instance.paused))
     };
 
     let handle = app.clone();
@@ -159,6 +166,11 @@ fn start_pty_reader(tab_id: u32, state: State<AppState>, app: tauri::AppHandle) 
         let mut buf = [0u8; 4096];
         let mut leftover = Vec::new();
         loop {
+            // Flow control: sleep while the frontend signals backpressure.
+            // Data stays in the OS PTY buffer — nothing is lost.
+            while paused.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -212,6 +224,22 @@ fn resize_pty(tab_id: u32, rows: u16, cols: u16, state: State<AppState>) -> Resu
         })
         .map_err(|e| e.to_string())?;
     instance.last_size = (rows, cols);
+    Ok(())
+}
+
+#[tauri::command]
+fn pause_pty_reader(tab_id: u32, state: State<AppState>) -> Result<(), String> {
+    let ptys = state.ptys.lock().map_err(|e| e.to_string())?;
+    let instance = ptys.get(&tab_id).ok_or("Tab not found")?;
+    instance.paused.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_pty_reader(tab_id: u32, state: State<AppState>) -> Result<(), String> {
+    let ptys = state.ptys.lock().map_err(|e| e.to_string())?;
+    let instance = ptys.get(&tab_id).ok_or("Tab not found")?;
+    instance.paused.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1101,6 +1129,8 @@ pub fn run() {
             start_pty_reader,
             write_to_pty,
             resize_pty,
+            pause_pty_reader,
+            resume_pty_reader,
             close_pty,
             write_debug_log,
             read_directory,
