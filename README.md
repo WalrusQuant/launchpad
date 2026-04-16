@@ -1,14 +1,22 @@
 # Launchpad
 
-A terminal-first desktop workspace for macOS. Terminal, code editor, file browser, git — all in one native app. No Electron, no bloat, no opinions.
+A terminal-first desktop workspace for macOS. Terminal, code editor, file browser, git — all scoped to a project directory and wrapped in one native app. No Electron, no bloat, no opinions.
 
 ![Built with Tauri](https://img.shields.io/badge/Tauri-v2-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
+
+![Launchpad welcome screen](docs/media/landing.png)
 
 ## What is this?
 
 Launchpad is a lightweight macOS desktop app that puts your terminal front and center, then wraps it with everything you need to actually get work done — a file browser, a real code editor, a visual git workflow, and a settings panel. All in a single ~8MB native app.
 
 No framework. No Electron. No subscription. Just Rust + vanilla JS.
+
+<video src="docs/media/video.mov" controls width="100%">
+  Your browser doesn't support embedded video. <a href="docs/media/video.mov">Download the demo</a>.
+</video>
+
+![Workspace with terminal, file browser, and git panel](docs/media/main.png)
 
 ## Install
 
@@ -18,7 +26,7 @@ No framework. No Electron. No subscription. Just Rust + vanilla JS.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/adamwickwire/launchpad.git
+git clone https://github.com/WalrusQuant/launchpad.git
 cd launchpad
 npm install
 npx tauri build
@@ -34,6 +42,14 @@ npx tauri dev
 ```
 
 ## Features
+
+### Projects
+Launchpad is organized around **projects** — a project is just a root directory. When you open one, every terminal spawned in that window starts at the project root, the file browser is locked there, and the git panel operates on that repo. Cmd+P fuzzy-search stays inside the project. This means you can run a CLI agent like `claude` or `aider` in a terminal tab and click around the file tree without ever sending a stray `cd` to the shell — the file browser is purely visual.
+
+- **One window = one project.** Opening a project in the picker takes over the current window (VS Code convention). Already-open projects get focused if you try to open them again.
+- **Multi-window on demand.** Cmd+Shift+N opens a fresh project picker so you can open a second project in parallel. Each window is fully independent.
+- **Picker with recents.** Projects are stored at `~/.launchpad/projects.json`. Right-click (or the ⋯ hover menu) to rename, open in a new window, or remove from the list.
+- **Back to projects** — a `←` button in the toolbar tears down the workspace and returns to the picker.
 
 ### Terminal
 Full PTY-backed terminal with tabs, split panes, and a split workspace. Not a web terminal pretending to be real — it spawns actual zsh/bash processes with proper signal handling, 256-color support, and correct escape sequences.
@@ -86,9 +102,10 @@ Open with Cmd+G. A visual git workflow designed so you never have to remember gi
 - **Ahead/behind indicators** — see how your branch compares to remote at a glance
 
 ### File Browser
-- Tree view with expandable directories
+- Tree view with expandable directories, rooted at the project directory
 - Color-coded by file type (JS=yellow, Python=green, Rust=pink, config=cyan) and git status (modified=yellow, new=green, deleted=red, staged=green, conflict=pink)
-- **Decoupled browsing** — navigating folders does NOT cd your terminal. Browse freely without disrupting running processes (like Claude Code). Click the blue ⏎ button in the sidebar header to explicitly set the working directory.
+- **Agent-safe** — navigating folders NEVER writes anything to a terminal. Browse freely while a CLI agent runs without risk of sending a surprise `cd`.
+- **Root-locked** — nav-up `↑` caps at the project root (can't escape above it), go-home `⌂` jumps back to the root from any depth
 - **CRUD operations** — right-click to create new files/folders, rename, delete, and reveal in Finder
 - **Live filesystem watcher** — files created, modified, or deleted from the terminal or externally appear instantly in the tree (no manual refresh needed)
 - **Off-DOM tree building** — folder expansion is flicker-free thanks to detached DOM fragment rendering
@@ -105,15 +122,17 @@ Fuzzy file search across your project. Case-insensitive, ranked by path length. 
 ### Settings (Cmd+,)
 All preferences in one place, applied live:
 
-- **General** — startup directory with native folder picker (Browse button), sidebar width
+- **General** — sidebar width
 - **Terminal** — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink
 - **Editor** — font size, tab size, word wrap
 - **Git** — auto-refresh interval, default commit prefix
 
-Settings saved to `~/.launchpad/config.json`.
+Settings saved to `~/.launchpad/config.json`. Project list saved to `~/.launchpad/projects.json`.
 
 ### Toolbar
 A compact header bar with quick access to:
+- ← Back to projects (close current workspace, return to picker)
+- + New window (Cmd+Shift+N)
 - ⚙ Settings
 - ⌘ Keyboard shortcuts reference (hover to see all shortcuts)
 - ⎇ Git panel toggle
@@ -122,6 +141,7 @@ A compact header bar with quick access to:
 
 | Shortcut | Action |
 |----------|--------|
+| Cmd+Shift+N | New window (opens a fresh project picker) |
 | Cmd+T | New terminal tab |
 | Cmd+W | Close current tab |
 | Cmd+1-9 | Switch to tab N |
