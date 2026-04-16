@@ -1,9 +1,11 @@
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from "@codemirror/view";
+import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, rectangularSelection, crosshairCursor } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 import { defaultKeymap, indentWithTab } from "@codemirror/commands";
-import { syntaxHighlighting, defaultHighlightStyle, bracketMatching } from "@codemirror/language";
+import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, foldGutter, indentOnInput } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { search, searchKeymap } from "@codemirror/search";
+import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
+import { autocompletion, closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
+import { lintGutter } from "@codemirror/lint";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { rust } from "@codemirror/lang-rust";
@@ -11,6 +13,10 @@ import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
 import { json } from "@codemirror/lang-json";
 import { markdown } from "@codemirror/lang-markdown";
+import { yaml } from "@codemirror/lang-yaml";
+import { StreamLanguage } from "@codemirror/language";
+import { toml } from "@codemirror/legacy-modes/mode/toml";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
 
 const langMap = {
   js: javascript,
@@ -28,6 +34,12 @@ const langMap = {
   json: json,
   md: markdown,
   mdx: markdown,
+  yaml: () => yaml(),
+  yml: () => yaml(),
+  toml: () => StreamLanguage.define(toml),
+  sh: () => StreamLanguage.define(shell),
+  bash: () => StreamLanguage.define(shell),
+  zsh: () => StreamLanguage.define(shell),
 };
 
 const langNames = {
@@ -112,6 +124,23 @@ const launchpadTheme = EditorView.theme({
     fontFamily: '"SF Mono", "Menlo", monospace',
     fontSize: "11px",
   },
+  // Fold gutter
+  ".cm-foldGutter .cm-gutterElement": {
+    cursor: "pointer",
+    color: "#666",
+  },
+  // Autocomplete
+  ".cm-tooltip-autocomplete": {
+    backgroundColor: "#252525",
+    border: "1px solid #444",
+  },
+  ".cm-tooltip-autocomplete ul li": {
+    color: "#ccc",
+  },
+  ".cm-tooltip-autocomplete ul li[aria-selected]": {
+    backgroundColor: "#333",
+    color: "#fff",
+  },
 });
 
 /**
@@ -124,10 +153,18 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     highlightActiveLine(),
     highlightActiveLineGutter(),
     bracketMatching(),
+    closeBrackets(),
+    foldGutter(),
+    indentOnInput(),
+    autocompletion(),
+    lintGutter(),
+    highlightSelectionMatches(),
+    rectangularSelection(),
+    crosshairCursor(),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     oneDark,
     launchpadTheme,
-    keymap.of([...defaultKeymap, ...searchKeymap, indentWithTab]),
+    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
     EditorState.tabSize.of(tabSize || 2),

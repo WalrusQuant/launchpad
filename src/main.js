@@ -4,6 +4,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
+import { undoDepth, redoDepth } from "@codemirror/commands";
 import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
@@ -570,9 +571,19 @@ async function createEditorTab(filePath) {
     onChange: (newContent) => {
       tab.modified = newContent !== tab.originalContent;
       renderTabBar();
+      // Update undo/redo in status bar
+      if (tab.editorView) {
+        const ud = undoDepth(tab.editorView.state);
+        const rd = redoDepth(tab.editorView.state);
+        const pos = tab.editorView.state.selection.main.head;
+        const ln = tab.editorView.state.doc.lineAt(pos);
+        statusBar.textContent = `Ln ${ln.number}, Col ${pos - ln.from + 1} · ${getLangName(fileName)}${ud || rd ? ` · Undo: ${ud} Redo: ${rd}` : ""}`;
+      }
     },
     onCursorChange: (line, col) => {
-      statusBar.textContent = `Ln ${line}, Col ${col} · ${getLangName(fileName)}`;
+      const ud = tab.editorView ? undoDepth(tab.editorView.state) : 0;
+      const rd = tab.editorView ? redoDepth(tab.editorView.state) : 0;
+      statusBar.textContent = `Ln ${line}, Col ${col} · ${getLangName(fileName)}${ud || rd ? ` · Undo: ${ud} Redo: ${rd}` : ""}`;
     },
     tabSize: editorSettings.editorTabSize,
     wordWrap: editorSettings.editorWordWrap,
@@ -832,11 +843,41 @@ listen("fs-changed", (event) => {
   if (path !== getCurrentPath()) return;
   if (fsRefreshScheduled) return;
   fsRefreshScheduled = true;
-  setTimeout(() => {
+  setTimeout(async () => {
     fsRefreshScheduled = false;
     refreshFileBrowser();
     fetchGitStatus(getCurrentPath());
     refreshPanel(null, true);
+
+    // Check open editor tabs for external file changes
+    for (const [uiId, tab] of tabs) {
+      if (tab.type !== "editor") continue;
+      try {
+        const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
+        const editorContent = tab.editorView.state.doc.toString();
+        if (diskContent === editorContent) continue;
+        if (!tab.modified) {
+          // No local edits — silently reload
+          tab.editorView.dispatch({
+            changes: { from: 0, to: editorContent.length, insert: diskContent },
+          });
+          tab.originalContent = diskContent;
+        } else {
+          // User has unsaved changes — prompt
+          showConfirmDialog(
+            `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
+            () => {
+              tab.editorView.dispatch({
+                changes: { from: 0, to: tab.editorView.state.doc.length, insert: diskContent },
+              });
+              tab.originalContent = diskContent;
+              tab.modified = false;
+              renderTabBar();
+            }
+          );
+        }
+      } catch (_) {}
+    }
   }, 500);
 });
 
