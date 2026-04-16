@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Keyboard shortcuts — Launchpad</title>
+  <meta name="description" content="Full keyboard shortcut reference for Launchpad." />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand">Launchpad</a>
+      <div class="nav-links">
+        <a href="getting-started.html">Get started</a>
+        <a href="features.html">Features</a>
+        <a href="shortcuts.html" class="active">Shortcuts</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="nav-gh">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <div class="page-layout">
+      <aside class="toc">
+        <div class="toc-title">On this page</div>
+        <a href="#windows">Windows &amp; projects</a>
+        <a href="#tabs">Tabs</a>
+        <a href="#terminal">Terminal</a>
+        <a href="#panes">Panes &amp; groups</a>
+        <a href="#editor">Editor</a>
+        <a href="#git">Git panel</a>
+        <a href="#navigation">Navigation</a>
+      </aside>
+
+      <article class="prose">
+        <div class="crumb"><a href="index.html">Launchpad</a> / Shortcuts</div>
+        <h1>Keyboard shortcuts</h1>
+        <p>
+          Launchpad is keyboard-first. Every shortcut also appears in-app if you
+          hover the <kbd>⌘</kbd> button in the toolbar.
+        </p>
+
+        <h2 id="windows">Windows &amp; projects</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘⇧N</kbd></td><td>New window (opens a fresh project picker)</td></tr>
+          <tr><td><kbd>⌘W</kbd></td><td>Close the current tab (if no tabs, hint: use the <kbd>←</kbd> button to return to picker)</td></tr>
+        </table>
+
+        <h2 id="tabs">Tabs</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘T</kbd></td><td>New terminal tab</td></tr>
+          <tr><td><kbd>⌘W</kbd></td><td>Close current tab</td></tr>
+          <tr><td><kbd>⌘1</kbd> … <kbd>⌘9</kbd></td><td>Switch to tab N</td></tr>
+          <tr><td><kbd>⌘⇧M</kbd></td><td>Move current tab to the other group (when workspace is split)</td></tr>
+        </table>
+
+        <h2 id="terminal">Terminal</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘K</kbd></td><td>Clear screen in the focused terminal</td></tr>
+          <tr><td><kbd>⌘C</kbd> / <kbd>⌘V</kbd></td><td>Copy / paste (context menu also available on right-click)</td></tr>
+        </table>
+
+        <h2 id="panes">Panes &amp; groups</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘D</kbd></td><td>Split / unsplit terminal pane (two PTYs inside one tab)</td></tr>
+          <tr><td><kbd>⌘\</kbd></td><td>Split / unsplit workspace (left / right groups, each with its own tab bar)</td></tr>
+          <tr><td><kbd>⌘⌥←</kbd> / <kbd>⌘⌥→</kbd></td><td>Switch focus between left and right groups</td></tr>
+          <tr><td><kbd>⌘⇧M</kbd></td><td>Move current tab to the other group</td></tr>
+        </table>
+
+        <h2 id="editor">Editor</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘S</kbd></td><td>Save file</td></tr>
+          <tr><td><kbd>⌘F</kbd></td><td>Find in editor (or search file tree when focused in sidebar)</td></tr>
+          <tr><td><kbd>⌘H</kbd></td><td>Find and replace</td></tr>
+          <tr><td><kbd>⌘P</kbd></td><td>Quick open — fuzzy file search across the project</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close diff preview / dialog</td></tr>
+        </table>
+
+        <h2 id="git">Git panel</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘G</kbd></td><td>Toggle git panel</td></tr>
+          <tr><td><kbd>?</kbd> (in git panel)</td><td>Open the git cheatsheet</td></tr>
+        </table>
+
+        <h2 id="navigation">Navigation &amp; misc</h2>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘,</kbd></td><td>Open settings</td></tr>
+          <tr><td><kbd>↑</kbd> (sidebar)</td><td>Navigate up one folder (capped at project root)</td></tr>
+          <tr><td><kbd>⌂</kbd> (sidebar)</td><td>Jump back to project root</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close quick-open / diff preview / confirmation popup</td></tr>
+        </table>
+
+        <hr/>
+        <p>Nothing here yet that you need? Open an issue on <a href="https://github.com/WalrusQuant/launchpad/issues">GitHub</a> with what you'd bind.</p>
+      </article>
+    </div>
+  </main>
+
+  <footer>
+    Launchpad · MIT · <a href="https://github.com/WalrusQuant/launchpad">github.com/WalrusQuant/launchpad</a>
+  </footer>
+</body>
+</html>

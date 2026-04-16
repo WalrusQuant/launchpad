@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Launchpad — terminal-first desktop workspace for macOS</title>
+  <meta name="description" content="A lightweight macOS workspace that puts your terminal front and center, wrapped with a file browser, code editor, and visual git. Built with Tauri + vanilla JS. ~8MB. MIT licensed." />
+  <meta property="og:title" content="Launchpad — terminal-first desktop workspace" />
+  <meta property="og:description" content="Terminal, editor, file browser, git — all in one native ~8MB macOS app. Built with Tauri + vanilla JS." />
+  <meta property="og:image" content="media/landing.png" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand">Launchpad</a>
+      <div class="nav-links">
+        <a href="getting-started.html">Get started</a>
+        <a href="features.html">Features</a>
+        <a href="shortcuts.html">Shortcuts</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="nav-gh">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <section class="hero">
+      <span class="tag">v0.1 · macOS · MIT</span>
+      <h1>Your terminal,<br/><span class="accent">with everything around it.</span></h1>
+      <p class="lede">
+        A native desktop workspace for macOS that puts a real PTY-backed terminal
+        front and center, then wraps it with a file browser, code editor, and visual
+        git workflow. No Electron. No framework. ~8MB.
+      </p>
+      <div class="cta-row">
+        <a href="getting-started.html" class="btn btn-primary">Get started →</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="btn">View on GitHub</a>
+      </div>
+      <div class="badges">
+        <span class="badge">Tauri v2</span>
+        <span class="badge">Rust</span>
+        <span class="badge">Vanilla JS</span>
+        <span class="badge">xterm.js 6</span>
+        <span class="badge">CodeMirror 6</span>
+      </div>
+    </section>
+
+    <div class="shot">
+      <div class="shot-frame">
+        <img src="media/main.png" alt="Launchpad workspace with terminal, file browser, and git panel" />
+      </div>
+    </div>
+
+    <section class="section">
+      <div class="wrap">
+        <h2>Why another dev tool?</h2>
+        <p class="subtitle">
+          Most developer tools are either too heavy (VS Code, Electron apps) or too minimal
+          (a bare terminal). Launchpad sits in between — a workspace that respects your
+          terminal-first workflow while giving you visual tools for the things that are
+          genuinely better with a UI.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>// terminal-first</h3>
+            <p>
+              A real PTY, not a web shim. Proper signal handling, 256 colors, Unicode 11
+              widths, WebGL rendering. Run <code>claude</code>, <code>aider</code>, or any
+              CLI agent with zero surprises.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// project-scoped</h3>
+            <p>
+              One window = one project. Every terminal spawns in the project root. The
+              file browser is root-locked. Cmd+P stays inside the project. Browse folders
+              without accidentally sending <code>cd</code> to your agent.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// native &amp; tiny</h3>
+            <p>
+              Tauri v2 + Rust backend = ~8MB app bundle. No Chromium, no 400MB
+              Electron install. Cold-starts in under a second.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// visual git</h3>
+            <p>
+              A buttoned workflow for stage / commit / push / pull / merge / stash.
+              Structured diff preview. Conflict resolution with Ours / Theirs. Ahead /
+              behind indicators at a glance.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// real editor</h3>
+            <p>
+              CodeMirror 6 with syntax highlighting for 15+ languages, find &amp; replace,
+              bracket matching, autocompletion, folding. Files open as tabs alongside
+              terminal tabs.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// no framework tax</h3>
+            <p>
+              Vanilla JS. No React, no build-step-that-takes-forever, no dependency
+              cliff. ~3000 lines of JS, ~1500 lines of Rust, done.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <h2>Install from source</h2>
+        <p class="subtitle">Prerequisites: Rust and Node.js. macOS only for now.</p>
+<pre><code>git clone https://github.com/WalrusQuant/launchpad.git
+cd launchpad
+npm install
+npx tauri build
+
+cp -R src-tauri/target/release/bundle/macos/Launchpad.app /Applications/</code></pre>
+        <p style="color: var(--text-dim); font-size: 14px;">
+          See <a href="getting-started.html">Getting started</a> for a full walkthrough,
+          including <code>npx tauri dev</code> for a hot-reload dev build.
+        </p>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <h2>The shortcuts that matter</h2>
+        <p class="subtitle">Everything is keyboard-first. Full list on the <a href="shortcuts.html">shortcuts page</a>.</p>
+        <table class="kbd-table">
+          <tr><td><kbd>⌘P</kbd></td><td>Quick open file (fuzzy search across the project)</td></tr>
+          <tr><td><kbd>⌘T</kbd> / <kbd>⌘W</kbd></td><td>New terminal tab / close tab</td></tr>
+          <tr><td><kbd>⌘D</kbd></td><td>Split terminal pane (two PTYs in one tab)</td></tr>
+          <tr><td><kbd>⌘\</kbd></td><td>Split workspace into left/right groups</td></tr>
+          <tr><td><kbd>⌘G</kbd></td><td>Toggle git panel</td></tr>
+          <tr><td><kbd>⌘⇧N</kbd></td><td>New window (opens a fresh project picker)</td></tr>
+          <tr><td><kbd>⌘,</kbd></td><td>Settings</td></tr>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap" style="text-align: center;">
+        <h2>Open source. MIT licensed.</h2>
+        <p class="subtitle" style="max-width: 560px; margin: 0 auto 28px;">
+          Fork it, steal bits from it, file an issue, send a PR.
+          It's all on GitHub.
+        </p>
+        <div class="cta-row">
+          <a href="https://github.com/WalrusQuant/launchpad" class="btn btn-primary">Star on GitHub</a>
+          <a href="https://github.com/WalrusQuant/launchpad/issues" class="btn">File an issue</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Launchpad · MIT · <a href="https://github.com/WalrusQuant/launchpad">github.com/WalrusQuant/launchpad</a>
+  </footer>
+</body>
+</html>

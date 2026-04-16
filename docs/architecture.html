@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Architecture — Launchpad</title>
+  <meta name="description" content="How Launchpad is built: Tauri v2, Rust backend, vanilla JS frontend, PTY via portable-pty, git via libgit2 + system git." />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand">Launchpad</a>
+      <div class="nav-links">
+        <a href="getting-started.html">Get started</a>
+        <a href="features.html">Features</a>
+        <a href="shortcuts.html">Shortcuts</a>
+        <a href="architecture.html" class="active">Architecture</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="nav-gh">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <div class="page-layout">
+      <aside class="toc">
+        <div class="toc-title">On this page</div>
+        <a href="#stack">Tech stack</a>
+        <a href="#layout">Project layout</a>
+        <a href="#projects">Projects model</a>
+        <a href="#tabs">Tab system</a>
+        <a href="#pty">PTY lifecycle</a>
+        <a href="#filebrowser">File browser</a>
+        <a href="#git">Git backend</a>
+        <a href="#ipc">Tauri commands</a>
+        <a href="#contributing">Contributing</a>
+      </aside>
+
+      <article class="prose">
+        <div class="crumb"><a href="index.html">Launchpad</a> / Architecture</div>
+        <h1>Architecture</h1>
+        <p>
+          Launchpad is deliberately small. The whole thing is ~1500 lines of Rust
+          and ~3000 lines of vanilla JS. This page is the map.
+        </p>
+
+        <h2 id="stack">Tech stack</h2>
+        <ul>
+          <li><strong>Tauri v2</strong> — the native shell. Gives us a Swift / Objective-C free macOS window with a system WebView inside.</li>
+          <li><strong>Rust</strong> — PTY management (<code>portable-pty</code>), filesystem ops, git via <code>git2</code> (libgit2 bindings) plus shelled-out system <code>git</code> for network operations. Filesystem watching via <code>notify</code> (FSEvents on macOS).</li>
+          <li><strong>Vanilla JS</strong> — all frontend logic. No React, no Vue, no framework. Direct DOM manipulation.</li>
+          <li><strong>xterm.js 6</strong> — the terminal emulator, with WebGL renderer and Unicode 11 width tables.</li>
+          <li><strong>CodeMirror 6</strong> — the editor, with syntax highlighting, search, autocompletion, bracket matching, code folding.</li>
+          <li><strong>Vite</strong> — frontend bundler.</li>
+        </ul>
+
+        <h2 id="layout">Project layout</h2>
+<pre><code>src/                  # Frontend (JS / CSS / HTML)
+  main.js             # App entry, tab mgmt, split workspace, panes, shortcuts
+  projects.js         # Active project state + project Tauri command wrappers
+  projectpicker.js    # Project picker UI (welcome / recents)
+  filebrowser.js      # File tree, context menu, DnD, git colors, CRUD
+  editor.js           # CodeMirror factory — creates independent editor instances
+  git.js              # Git status polling, file status colors
+  gitpanel.js         # Full git panel UI
+  quickopen.js        # Cmd+P fuzzy file finder
+  settings.js         # Persistent settings store (~/.launchpad/config.json)
+  settingspanel.js    # Settings form UI
+  styles.css          # All styles, organized by section
+
+src-tauri/            # Rust backend
+  src/lib.rs          # All Tauri commands (PTY, fs, git, settings, projects)
+  Cargo.toml          # Rust deps
+  tauri.conf.json     # App config
+
+index.html            # HTML shell — picker-root + workspace-root siblings
+specs/                # Design specs (project model, agent model, etc.)</code></pre>
+
+        <h2 id="projects">Projects model</h2>
+        <p>
+          A project is just a root directory stored in
+          <code>~/.launchpad/projects.json</code>. The workspace is gated behind
+          the picker; <code>enterWorkspace(project)</code> initializes the
+          terminal, file browser, and git panel only after a project is chosen.
+        </p>
+        <p>
+          The <strong>active project</strong> is held in <code>projects.js</code>
+          as module state (<code>activeProject</code>). It's the single source of
+          truth for:
+        </p>
+        <ul>
+          <li>Terminal spawn cwd</li>
+          <li>File browser root</li>
+          <li>Git panel path</li>
+          <li><kbd>⌘P</kbd> search root</li>
+          <li>Filesystem watcher</li>
+        </ul>
+        <p>
+          All three PTY spawn sites (<code>createTab</code>, <code>splitPane</code>,
+          <code>createTabInRight</code>) pass
+          <code>getActiveProject()?.path</code> directly — no inheritance from
+          the previous tab's cwd, no <code>defaultDirectory</code> setting, no
+          file-browser path.
+        </p>
+
+        <h3>Window routing</h3>
+        <p>
+          Single-window by default, multi-window when asked. Clicking a project
+          in the picker takes over the <em>current</em> window — the picker
+          view swaps for the workspace in-place. If the project is already open
+          in another window, <code>focus_project_window</code> focuses that
+          window and the current one stays on the picker.
+        </p>
+        <p>
+          <code>enterWorkspace(project)</code> calls
+          <code>register_project_window(path, current_window_label)</code>; the
+          "← Projects" teardown calls
+          <code>unregister_project_window(path)</code> before reloading. A
+          <code>project_windows: HashMap&lt;canonical_path, label&gt;</code> in
+          <code>AppState</code> is the routing table, cleaned lazily when
+          <code>get_webview_window</code> returns <code>None</code>.
+        </p>
+
+        <h2 id="tabs">Tab system &amp; split workspace</h2>
+        <p>
+          <strong>Unified tab bar.</strong> Terminal tabs, editor tabs, and the
+          settings tab share one tab bar. Each tab has a <code>type</code> field
+          (<code>"terminal"</code>, <code>"editor"</code>, or <code>"settings"</code>)
+          and tab-type guards protect terminal-specific code (fitAllPanes, PTY
+          writes, split panes).
+        </p>
+        <p>
+          <strong>Split workspace.</strong> <kbd>⌘\</kbd> toggles a vertical
+          split. The right group tracks its own tab IDs in
+          <code>rightGroupTabIds</code>. Each group has its own tab bar. Tabs can
+          be dragged between groups or moved with <kbd>⌘⇧M</kbd>. Closing the last
+          tab in the right group auto-collapses the workspace.
+        </p>
+        <p>
+          <strong>In-tab pane split.</strong> <kbd>⌘D</kbd> splits a single
+          terminal tab into two vertical panes (50/50, draggable divider). Each
+          pane gets its own PTY. Independent from the workspace split.
+        </p>
+        <p>
+          <strong>Tab drag-to-move.</strong> When the workspace is split, a
+          MutationObserver-based drag system moves tabs between left and right
+          groups. Group markers on tab objects track which group they belong to.
+        </p>
+
+        <h2 id="pty">PTY lifecycle</h2>
+        <p>
+          Each terminal tab or pane spawns its own PTY via <code>portable-pty</code>.
+          The reader thread is <strong>not</strong> started during
+          <code>spawn_pty</code> — instead, the frontend calls
+          <code>start_pty_reader</code> <em>after</em> registering the pane in
+          <code>paneMap</code>. This prevents a race where early output would be
+          dropped before the frontend had anywhere to route it.
+        </p>
+
+        <h3>Backpressure</h3>
+        <p>
+          <code>pause_pty_reader</code> and <code>resume_pty_reader</code> let
+          the frontend signal when xterm.js's write queue exceeds its high-water
+          mark. The reader thread sleeps until cleared; data stays buffered in
+          the OS PTY buffer. No queue explosion, no memory bloat.
+        </p>
+
+        <div class="callout">
+          <strong>Why not stream directly?</strong> A naïve implementation that
+          pipes PTY output straight into xterm.js as fast as it arrives can
+          overwhelm the renderer on a <code>cat /very/large/file</code>, peg the
+          CPU, and make the terminal feel stuck. Flow control fixes that.
+        </div>
+
+        <h2 id="filebrowser">File browser</h2>
+        <p>
+          <strong>Root-locked.</strong> <code>setRoot()</code> guards against
+          any path outside <code>projectRoot</code>. Nav-up <kbd>↑</kbd> caps at
+          the project root (no-op when already there). Go-home <kbd>⌂</kbd>
+          jumps back to the root.
+        </p>
+        <p>
+          <strong>No terminal disruption.</strong> The file browser holds no
+          concept of the terminal's cwd. Browsing subfolders never writes
+          anything to a PTY — CLI agents (Claude, Aider, etc.) are safe from
+          accidental <code>cd</code>.
+        </p>
+        <p>
+          <strong>Off-DOM tree building.</strong> The file tree is built in a
+          detached DOM fragment and swapped in a single operation to prevent
+          flicker when expanding folders.
+        </p>
+        <p>
+          <strong>Live filesystem watcher.</strong> Uses the <code>notify</code>
+          crate (FSEvents on macOS) with a 300ms debounce to watch the project
+          root recursively. Started once in <code>enterWorkspace()</code>.
+          Emits <code>fs-changed</code> Tauri events that trigger
+          <code>refreshFileBrowser()</code> and git status updates. Frontend
+          throttles to 500ms.
+        </p>
+
+        <h2 id="git">Git backend</h2>
+        <p>
+          <strong>libgit2 for local, system git for network.</strong> Local
+          operations (stage, unstage, stash, branch) use the <code>git2</code>
+          crate — fast, in-process, no fork overhead. Network operations (push,
+          pull, fetch, merge) shell out to system <code>git</code> via
+          <code>std::process::Command</code> so they respect the user's SSH
+          keys, credential helpers, and <code>.gitconfig</code>. Network ops
+          are cancellable via <code>cancel_git_op</code>, which kills the
+          spawned process by PID.
+        </p>
+        <p>
+          <strong>Dual status entries.</strong> <code>get_git_status</code>
+          emits separate entries for staged (<code>index_new</code>,
+          <code>index_modified</code>, <code>index_deleted</code>) and unstaged
+          (<code>new</code>, <code>modified</code>, <code>deleted</code>)
+          changes. A file can appear in both lists.
+        </p>
+        <p>
+          <strong>Panel re-rendering.</strong> The git panel rebuilds its
+          <code>innerHTML</code> on every refresh but uses a snapshot comparison
+          (<code>JSON.stringify</code>) to skip redundant re-renders during the
+          3-second poll. Module-level state
+          (<code>expandedCommitOid</code>) persists across re-renders.
+        </p>
+
+        <h2 id="ipc">Tauri commands (Rust → JS IPC)</h2>
+        <p>All commands live in <code>src-tauri/src/lib.rs</code>. A partial index:</p>
+
+        <h3>PTY</h3>
+        <ul>
+          <li><code>spawn_pty(cwd?, rows?, cols?)</code> — spawn a new PTY, returns <code>{ tab_id }</code>. Does not start reading output yet.</li>
+          <li><code>start_pty_reader(tab_id)</code> — start the output reader thread (call after registering the pane)</li>
+          <li><code>write_to_pty</code>, <code>resize_pty</code>, <code>pause_pty_reader</code>, <code>resume_pty_reader</code>, <code>close_pty</code></li>
+        </ul>
+
+        <h3>Filesystem</h3>
+        <ul>
+          <li><code>read_directory</code>, <code>search_files</code>, <code>read_file_preview</code></li>
+          <li><code>write_file</code>, <code>create_file</code>, <code>create_directory</code>, <code>delete_path</code>, <code>rename_path</code></li>
+          <li><code>watch_directory</code> / <code>unwatch_directory</code> — emits <code>fs-changed</code> events</li>
+          <li><code>pick_directory</code>, <code>reveal_in_finder</code>, <code>get_home_dir</code></li>
+        </ul>
+
+        <h3>Git</h3>
+        <ul>
+          <li><code>get_git_status</code>, <code>list_branches</code>, <code>list_remote_branches</code>, <code>get_commits</code>, <code>get_remote_url</code></li>
+          <li><code>checkout_branch</code>, <code>create_branch</code>, <code>git_delete_branch</code></li>
+          <li><code>git_stage_file</code>, <code>git_unstage_file</code>, <code>git_stage_all</code>, <code>git_unstage_all</code>, <code>git_discard_file</code></li>
+          <li><code>git_commit</code>, <code>git_push</code>, <code>git_pull</code>, <code>git_fetch</code>, <code>git_merge_branch</code>, <code>cancel_git_op</code></li>
+          <li><code>git_stash_save</code> / <code>pop</code> / <code>list</code> / <code>apply</code> / <code>drop</code></li>
+          <li><code>get_file_diff</code>, <code>get_commit_details</code>, <code>git_resolve_ours</code>, <code>git_resolve_theirs</code></li>
+        </ul>
+
+        <h3>Projects &amp; windows</h3>
+        <ul>
+          <li><code>load_projects</code>, <code>add_project</code>, <code>remove_project</code>, <code>rename_project</code>, <code>touch_project</code></li>
+          <li><code>focus_project_window</code>, <code>register_project_window</code>, <code>unregister_project_window</code></li>
+          <li><code>open_new_window(path?)</code> — creates a new Tauri window (with path: URL <code>?folder=&lt;path&gt;</code>; without: boots into picker)</li>
+        </ul>
+
+        <h2 id="contributing">Contributing</h2>
+        <p>
+          Launchpad welcomes PRs. A few conventions that keep the codebase
+          small:
+        </p>
+        <ul>
+          <li><strong>No framework creep.</strong> Vanilla JS with direct DOM manipulation. Keeps the bundle tiny.</li>
+          <li><strong>Project-scoped features rule.</strong> When wiring a new feature that cares about "the current directory", use <code>getActiveProject().path</code> — <em>not</em> <code>getCurrentPath()</code> from the file browser. <code>getCurrentPath()</code> tracks sub-folder navigation; only the file browser itself should read it.</li>
+          <li><strong>Prefer small.</strong> Don't add a framework, a state library, or a layer of abstraction to solve a problem you can solve in 30 lines.</li>
+        </ul>
+        <p>
+          Read <a href="https://github.com/WalrusQuant/launchpad/blob/main/CLAUDE.md">CLAUDE.md</a>
+          in the repo for a more exhaustive architecture rundown, and
+          <a href="https://github.com/WalrusQuant/launchpad/blob/main/specs/project-model-spec.md">specs/project-model-spec.md</a>
+          for the projects design doc.
+        </p>
+
+        <hr/>
+        <p>Done exploring? <a href="getting-started.html">Get started &rarr;</a></p>
+      </article>
+    </div>
+  </main>
+
+  <footer>
+    Launchpad · MIT · <a href="https://github.com/WalrusQuant/launchpad">github.com/WalrusQuant/launchpad</a>
+  </footer>
+</body>
+</html>
