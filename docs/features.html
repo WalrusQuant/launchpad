@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Features — Launchpad</title>
+  <meta name="description" content="Full feature reference for Launchpad: projects, terminals, editor, git panel, file browser, quick open, and settings." />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand">Launchpad</a>
+      <div class="nav-links">
+        <a href="getting-started.html">Get started</a>
+        <a href="features.html" class="active">Features</a>
+        <a href="shortcuts.html">Shortcuts</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="nav-gh">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <div class="page-layout">
+      <aside class="toc">
+        <div class="toc-title">On this page</div>
+        <a href="#projects">Projects</a>
+        <a href="#terminal">Terminal</a>
+        <a href="#editor">Code editor</a>
+        <a href="#git">Git panel</a>
+        <a href="#filebrowser">File browser</a>
+        <a href="#quickopen">Quick open</a>
+        <a href="#settings">Settings</a>
+      </aside>
+
+      <article class="prose">
+        <div class="crumb"><a href="index.html">Launchpad</a> / Features</div>
+        <h1>Features</h1>
+        <p>
+          Every feature is scoped to a project and designed to stay out of the way
+          of a terminal-first workflow. Visual tools where they help, keyboard where
+          they don't.
+        </p>
+
+        <h2 id="projects">Projects</h2>
+        <p>
+          A project is just a root directory. When you open one, every terminal
+          spawned in that window starts at the project root, the file browser is
+          locked there, and the git panel operates on that repo. <kbd>⌘P</kbd>
+          fuzzy-search stays inside the project.
+        </p>
+        <p>
+          This means you can run a CLI agent like <code>claude</code> or
+          <code>aider</code> in a terminal tab and click around the file tree
+          without ever sending a stray <code>cd</code> to the shell — the file
+          browser is purely visual.
+        </p>
+        <ul>
+          <li><strong>One window = one project.</strong> Opening a project in the picker takes over the current window (VS Code convention). Already-open projects get focused if you try to open them again.</li>
+          <li><strong>Multi-window on demand.</strong> <kbd>⌘⇧N</kbd> opens a fresh project picker so you can open a second project in parallel. Each window is fully independent.</li>
+          <li><strong>Picker with recents.</strong> Projects are stored at <code>~/.launchpad/projects.json</code>. Right-click (or the <kbd>⋯</kbd> hover menu) to rename, open in a new window, or remove from the list.</li>
+          <li><strong>Back to projects</strong> — a <kbd>←</kbd> button in the toolbar tears down the workspace and returns to the picker.</li>
+        </ul>
+
+        <h2 id="terminal">Terminal</h2>
+        <p>
+          Full PTY-backed terminal with tabs, split panes, and a split workspace.
+          Not a web terminal pretending to be real — it spawns actual
+          zsh/bash processes with proper signal handling, 256-color support,
+          and correct escape sequences.
+        </p>
+
+        <h3>Tabs and panes</h3>
+        <ul>
+          <li>Multiple tabs (<kbd>⌘T</kbd> / <kbd>⌘W</kbd> / <kbd>⌘1-9</kbd>)</li>
+          <li>Split pane within a tab (<kbd>⌘D</kbd>) with draggable divider</li>
+          <li>Split workspace into left/right groups (<kbd>⌘\</kbd>) — each group has its own tab bar</li>
+          <li>Drag tabs between groups, or move with <kbd>⌘⇧M</kbd></li>
+          <li>Switch focus between groups with <kbd>⌘⌥←</kbd> / <kbd>⌘⌥→</kbd></li>
+          <li>Clear screen (<kbd>⌘K</kbd>)</li>
+        </ul>
+
+        <h3>Under the hood</h3>
+        <ul>
+          <li>WebGL-accelerated rendering with canvas fallback</li>
+          <li>Unicode 11 width tables for correct CJK/emoji rendering</li>
+          <li>Backpressure flow control prevents xterm.js write queue overflow</li>
+          <li>Right-click context menu (Copy, Paste, Clear)</li>
+          <li>Drag files from the sidebar to paste paths</li>
+          <li>Configurable font, size, cursor style, scrollback</li>
+        </ul>
+
+        <div class="callout">
+          <strong>Deferred reader pattern.</strong> Each PTY's output reader thread
+          starts only <em>after</em> the frontend registers the pane — preventing
+          a race where early output gets dropped. See
+          <a href="architecture.html#pty">Architecture &rarr; PTY</a>.
+        </div>
+
+        <h2 id="editor">Code editor</h2>
+        <p>
+          Files open as tabs alongside your terminal tabs — one unified tab bar.
+          Click a file in the sidebar or use <kbd>⌘P</kbd>, and it opens in a full
+          CodeMirror 6 editor.
+        </p>
+        <ul>
+          <li>Syntax highlighting for JS, TS, JSX, TSX, Python, Rust, HTML, CSS, JSON, Markdown, SCSS, TOML, YAML, Shell</li>
+          <li>Find and replace (<kbd>⌘F</kbd> / <kbd>⌘H</kbd>)</li>
+          <li>Bracket matching, close brackets, code folding</li>
+          <li>Autocompletion, highlight selection matches</li>
+          <li>Rectangular selection, crosshair cursor</li>
+          <li>Line numbers, active line highlight, indent guides</li>
+          <li>File path breadcrumb with <code>›</code> separators + line/column status bar</li>
+          <li>Modified indicator in tab (yellow dot)</li>
+          <li>Unsaved changes warning on close</li>
+          <li>Right-click context menu (Cut, Copy, Paste, Select All)</li>
+          <li>Save with <kbd>⌘S</kbd></li>
+        </ul>
+
+        <h2 id="git">Git panel</h2>
+        <p>
+          Open with <kbd>⌘G</kbd>. A visual git workflow designed so you never
+          have to remember git commands. Stage, commit, push, pull, stash, merge,
+          create branches — all from buttons.
+        </p>
+
+        <h3>Working with changes</h3>
+        <ul>
+          <li><strong>Quick actions toolbar</strong> — Pull, Push, Fetch, Stash, Pop in one click</li>
+          <li><strong>Staged vs unstaged split</strong> — clear separation of what's going into your commit</li>
+          <li><strong>Stage / unstage / discard</strong> — per-file buttons with confirmation on destructive actions</li>
+          <li><strong>Commit form</strong> — multi-line textarea with conventional commit prefix dropdown (feat / fix / chore / ...) and character counter</li>
+          <li><strong>Diff preview</strong> — click any changed file to see a structured diff with line numbers and hunk headers</li>
+        </ul>
+
+        <h3>Branches and history</h3>
+        <ul>
+          <li><strong>Branch management</strong> — create, switch, delete, merge branches. View local and remote branches with last commit info.</li>
+          <li><strong>Commit history</strong> — last 30 commits with OID, message, author, and timestamp. Click to expand and see changed files with +/- line counts.</li>
+          <li><strong>Ahead/behind indicators</strong> — see how your branch compares to remote at a glance</li>
+          <li><strong>Auto-push with upstream</strong> — first push to a new branch automatically sets up tracking</li>
+        </ul>
+
+        <h3>GitHub and conflicts</h3>
+        <ul>
+          <li><strong>GitHub integration</strong> — Open Repo, Open Branch, and Create PR buttons (auto-detected from your remote URL, works for SSH and HTTPS)</li>
+          <li><strong>Conflict resolution</strong> — when merge conflicts happen, resolve with Ours / Theirs buttons or open the file in the editor</li>
+          <li><strong>Stash management</strong> — save, pop, apply, and drop stashes</li>
+          <li><strong>Cancellable network ops</strong> — push, pull, fetch, merge can be cancelled mid-operation</li>
+          <li><strong>Git cheatsheet</strong> — hit <kbd>?</kbd> for a plain-English explanation of git concepts</li>
+        </ul>
+
+        <div class="callout">
+          <strong>libgit2 + system git.</strong> Local operations use the
+          <code>git2</code> crate for speed. Network operations shell out to your
+          system <code>git</code> so they respect your SSH keys, credential
+          helpers, and <code>.gitconfig</code>. No credential storage reinvention.
+        </div>
+
+        <h2 id="filebrowser">File browser</h2>
+        <ul>
+          <li>Tree view with expandable directories, rooted at the project directory</li>
+          <li>Color-coded by file type (JS yellow, Python green, Rust pink, config cyan) and git status (modified yellow, new green, deleted red, staged green, conflict pink)</li>
+          <li><strong>Agent-safe</strong> — navigating folders <em>never</em> writes to a terminal. Browse freely while a CLI agent runs, without risk of sending a surprise <code>cd</code>.</li>
+          <li><strong>Root-locked</strong> — nav-up <kbd>↑</kbd> caps at the project root, go-home <kbd>⌂</kbd> jumps back to the root from any depth</li>
+          <li><strong>CRUD operations</strong> — right-click to create new files/folders, rename, delete, reveal in Finder</li>
+          <li><strong>Live filesystem watcher</strong> — files created, modified, or deleted from the terminal or externally appear instantly in the tree (no manual refresh needed)</li>
+          <li><strong>Off-DOM tree building</strong> — folder expansion is flicker-free thanks to detached DOM fragment rendering</li>
+          <li>Click to open in editor, double-click folder to navigate</li>
+          <li>Drag files to terminal to paste the path</li>
+          <li>Right-click: copy path, copy name, reveal in Finder</li>
+          <li>Search / filter with <kbd>⌘F</kbd></li>
+          <li>Toggle hidden files, resizable sidebar</li>
+        </ul>
+
+        <h2 id="quickopen">Quick open (⌘P)</h2>
+        <p>
+          Fuzzy file search across your project. Case-insensitive, ranked by path
+          length. Skips hidden dirs, <code>node_modules</code>, <code>target</code>,
+          and other build noise. Arrow keys to navigate, Enter to open as an
+          editor tab.
+        </p>
+
+        <h2 id="settings">Settings (⌘,)</h2>
+        <p>All preferences in one place, applied live to open terminals and editors:</p>
+        <ul>
+          <li><strong>General</strong> — sidebar width</li>
+          <li><strong>Terminal</strong> — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink</li>
+          <li><strong>Editor</strong> — font size, tab size, word wrap</li>
+          <li><strong>Git</strong> — auto-refresh interval, default commit prefix</li>
+        </ul>
+        <p>Settings saved to <code>~/.launchpad/config.json</code>. Project list saved to <code>~/.launchpad/projects.json</code>.</p>
+
+        <hr/>
+        <p>Keep going: <a href="shortcuts.html">keyboard shortcuts</a> · <a href="architecture.html">architecture</a>.</p>
+      </article>
+    </div>
+  </main>
+
+  <footer>
+    Launchpad · MIT · <a href="https://github.com/WalrusQuant/launchpad">github.com/WalrusQuant/launchpad</a>
+  </footer>
+</body>
+</html>

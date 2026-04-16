@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Getting started — Launchpad</title>
+  <meta name="description" content="Install Launchpad from source, run the dev build, and open your first project." />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-brand">Launchpad</a>
+      <div class="nav-links">
+        <a href="getting-started.html" class="active">Get started</a>
+        <a href="features.html">Features</a>
+        <a href="shortcuts.html">Shortcuts</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="https://github.com/WalrusQuant/launchpad" class="nav-gh">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <div class="page-layout">
+      <aside class="toc">
+        <div class="toc-title">On this page</div>
+        <a href="#prerequisites">Prerequisites</a>
+        <a href="#install">Install from source</a>
+        <a href="#dev">Dev build</a>
+        <a href="#first-project">Your first project</a>
+        <a href="#multi-window">Multi-window</a>
+        <a href="#config">Config files</a>
+        <a href="#troubleshooting">Troubleshooting</a>
+      </aside>
+
+      <article class="prose">
+        <div class="crumb"><a href="index.html">Launchpad</a> / Getting started</div>
+        <h1>Getting started</h1>
+        <p>
+          Launchpad is a native macOS app. There's no pre-built binary yet — you
+          build it from source, which takes a couple of minutes the first time
+          (Rust compiles everything) and a few seconds on subsequent builds.
+        </p>
+
+        <h2 id="prerequisites">Prerequisites</h2>
+        <ul>
+          <li><strong>macOS</strong> — Launchpad is macOS-only at the moment (some features like Finder integration and the folder picker use <code>osascript</code>).</li>
+          <li><strong>Rust</strong> — install via <a href="https://rustup.rs">rustup</a>.</li>
+          <li><strong>Node.js</strong> 18+ — for Vite and the frontend toolchain.</li>
+          <li><strong>Xcode Command Line Tools</strong> — for linking against system frameworks.</li>
+        </ul>
+<pre><code>curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+xcode-select --install</code></pre>
+
+        <h2 id="install">Install from source</h2>
+        <p>Clone the repo, install JS deps, run a release build, and drop the <code>.app</code> into <code>/Applications</code>.</p>
+<pre><code>git clone https://github.com/WalrusQuant/launchpad.git
+cd launchpad
+npm install
+npx tauri build
+
+cp -R src-tauri/target/release/bundle/macos/Launchpad.app /Applications/</code></pre>
+        <p>
+          The first build compiles the Rust backend and can take 2–5 minutes
+          depending on your machine. Incremental builds are under 10 seconds.
+        </p>
+        <div class="callout">
+          <strong>Note:</strong> the app isn't code-signed or notarized. macOS
+          Gatekeeper will complain on first launch — right-click the app and
+          choose <em>Open</em>, or <code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code>.
+        </div>
+
+        <h2 id="dev">Dev build</h2>
+        <p>For hacking on Launchpad itself, use the dev command. It hot-reloads the frontend and recompiles the Rust side on change.</p>
+<pre><code>npm install
+npx tauri dev</code></pre>
+        <p>Other useful commands:</p>
+<pre><code># Rust-only typecheck (faster than a full build)
+cargo check --manifest-path src-tauri/Cargo.toml
+
+# Rust tests
+cargo test --manifest-path src-tauri/Cargo.toml
+
+# Frontend-only dev (no native shell, less useful)
+npm run dev</code></pre>
+
+        <h2 id="first-project">Your first project</h2>
+        <p>Open Launchpad. You'll land on the project picker — an empty welcome state the first time. Click <strong>Open folder</strong> (or drop a folder onto the window) to pick any directory on disk.</p>
+        <p>That directory becomes the project. The window transforms into the workspace:</p>
+        <ul>
+          <li>The <strong>file browser</strong> on the left is rooted at the project.</li>
+          <li>The <strong>terminal</strong> on the right spawns at the project root.</li>
+          <li>Press <kbd>⌘G</kbd> to open the <strong>git panel</strong> if the directory is a git repo.</li>
+          <li>Press <kbd>⌘P</kbd> to <strong>fuzzy-search</strong> files in the project.</li>
+        </ul>
+        <p>Open as many files as you like — each opens as an editor tab next to your terminal tabs in a single unified tab bar.</p>
+
+        <h2 id="multi-window">Multi-window</h2>
+        <p>
+          One window = one project. Clicking a project in the picker takes over
+          the <em>current</em> window (VS Code convention). To open a second
+          project in parallel, hit <kbd>⌘⇧N</kbd> — a fresh picker appears in a
+          new window so you can choose another folder.
+        </p>
+        <p>
+          If you try to open a project that's already open in another window,
+          that window gets focused instead of opening a duplicate.
+        </p>
+        <p>The <kbd>←</kbd> button in the toolbar tears down the workspace and returns to the picker.</p>
+
+        <h2 id="config">Config files</h2>
+        <p>Launchpad persists two files under <code>~/.launchpad/</code>:</p>
+        <ul>
+          <li><code>~/.launchpad/config.json</code> — settings (font, size, scrollback, git refresh interval, etc.)</li>
+          <li><code>~/.launchpad/projects.json</code> — your recent projects list</li>
+        </ul>
+        <p>Both are plain JSON. You can edit them by hand if you want — changes to <code>config.json</code> are picked up on app restart.</p>
+        <p>Open the settings UI any time with <kbd>⌘,</kbd>.</p>
+
+        <h2 id="troubleshooting">Troubleshooting</h2>
+
+        <h3>"Launchpad can't be opened because Apple cannot check it for malicious software"</h3>
+        <p>The app isn't code-signed. Either right-click &rarr; Open, or clear the quarantine attribute:</p>
+<pre><code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code></pre>
+
+        <h3>Terminal shows no output / is blank</h3>
+        <p>Likely your shell config (<code>.zshrc</code>, <code>.bash_profile</code>) is erroring. Launch from Terminal.app to see stderr:</p>
+<pre><code>/Applications/Launchpad.app/Contents/MacOS/Launchpad</code></pre>
+
+        <h3>Git panel says "not a git repository"</h3>
+        <p>The project directory isn't a git repo. Run <code>git init</code> in the terminal and the panel picks it up on the next poll (within 3 seconds).</p>
+
+        <h3>Need a debug log</h3>
+        <p>Click the <kbd>⦿</kbd> debug-capture button in the toolbar. It writes recent activity to <code>~/.launchpad/debug.log</code>.</p>
+
+        <hr/>
+        <p>Next: dig into the <a href="features.html">full feature list</a>, or skim the <a href="shortcuts.html">keyboard reference</a>.</p>
+      </article>
+    </div>
+  </main>
+
+  <footer>
+    Launchpad · MIT · <a href="https://github.com/WalrusQuant/launchpad">github.com/WalrusQuant/launchpad</a>
+  </footer>
+</body>
+</html>

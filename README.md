@@ -4,6 +4,8 @@ A terminal-first desktop workspace for macOS. Terminal, code editor, file browse
 
 ![Built with Tauri](https://img.shields.io/badge/Tauri-v2-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
+**Docs:** [walrusquant.github.io/launchpad](https://walrusquant.github.io/launchpad/) — landing, getting started, features, shortcuts, architecture.
+
 ![Launchpad welcome screen](docs/media/landing.png)
 
 ## What is this?
@@ -177,4 +179,4 @@ It's also a proof of concept: you can build a fast, capable desktop IDE in ~1500
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
