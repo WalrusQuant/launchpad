@@ -82,7 +82,7 @@ function isPreviewable(name) {
 
 async function loadDirectory(path, parentEl, depth = 0) {
   try {
-    // Show skeleton placeholder while loading (only for top-level loads)
+    // Show skeleton placeholder while loading (only for initial empty load)
     if (depth === 0 && parentEl.children.length === 0) {
       parentEl.innerHTML = '<div class="skeleton-rows">' +
         '<div class="skeleton-row"></div>'.repeat(5) + '</div>';
@@ -100,7 +100,9 @@ async function loadDirectory(path, parentEl, depth = 0) {
       );
     }
 
-    parentEl.innerHTML = "";
+    // Build new content in a fragment off-DOM to avoid flicker
+    const fragment = document.createDocumentFragment();
+    const childLoadPromises = [];
 
     filtered.forEach((entry) => {
       const row = document.createElement("div");
@@ -163,15 +165,22 @@ async function loadDirectory(path, parentEl, depth = 0) {
         showContextMenu(e.clientX, e.clientY, entry);
       });
 
-      parentEl.appendChild(row);
+      fragment.appendChild(row);
 
       if (entry.is_dir && expandedDirs.has(entry.path)) {
         const childContainer = document.createElement("div");
         childContainer.className = "dir-children";
-        parentEl.appendChild(childContainer);
-        loadDirectory(entry.path, childContainer, depth + 1);
+        fragment.appendChild(childContainer);
+        childLoadPromises.push(loadDirectory(entry.path, childContainer, depth + 1));
       }
     });
+
+    // Wait for all expanded subdirectories to finish loading
+    await Promise.all(childLoadPromises);
+
+    // Swap in the complete tree atomically — no flash of empty content
+    parentEl.innerHTML = "";
+    parentEl.appendChild(fragment);
   } catch (err) {
     parentEl.innerHTML = `<div class="file-error">Cannot read directory</div>`;
   }
@@ -551,9 +560,14 @@ export function openFileByPath(fullPath) {
   }
 }
 
-export function refreshFileBrowser() {
-  if (currentPath) {
+let refreshInFlight = false;
+export async function refreshFileBrowser() {
+  if (!currentPath || refreshInFlight) return;
+  refreshInFlight = true;
+  try {
     const tree = document.getElementById("file-tree");
-    loadDirectory(currentPath, tree);
+    await loadDirectory(currentPath, tree);
+  } finally {
+    refreshInFlight = false;
   }
 }
