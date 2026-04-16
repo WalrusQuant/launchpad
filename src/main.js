@@ -1104,6 +1104,11 @@ document.addEventListener("keydown", (e) => {
   const activeTab = tabs.get(activeTabUiId);
   const isEditorTab = activeTab?.type === "editor";
 
+  if (e.metaKey && e.shiftKey && (e.key === "N" || e.key === "n")) {
+    e.preventDefault();
+    invoke("open_new_window", { path: null });
+    return;
+  }
   if (e.metaKey && e.key === ",") {
     e.preventDefault();
     openSettingsTab();
@@ -1358,6 +1363,9 @@ function isOverEl(mouseEvent, el) {
   return mouseEvent.clientX >= r.left && mouseEvent.clientX <= r.right &&
          mouseEvent.clientY >= r.top && mouseEvent.clientY <= r.bottom;
 }
+
+// New window button
+document.getElementById("open-new-window").addEventListener("click", () => invoke("open_new_window", { path: null }));
 
 // Settings button
 document.getElementById("open-settings").addEventListener("click", () => openSettingsTab());
@@ -1769,13 +1777,41 @@ function unsplitWorkspace() {
 async function boot() {
   const settings = await loadSettings();
 
+  // Determine startup folder from URL query params (multi-window support)
+  const params = new URLSearchParams(window.location.search);
+  const folderParam = params.get("folder");
+  const pickParam = params.get("pick");
+
+  let startFolder = null;
+  if (folderParam) {
+    startFolder = decodeURIComponent(folderParam);
+  } else if (pickParam) {
+    const picked = await invoke("pick_directory");
+    if (!picked) {
+      // User cancelled — close this window
+      const { getCurrentWindow } = window.__TAURI__.window;
+      getCurrentWindow().close();
+      return;
+    }
+    startFolder = picked;
+  }
+
+  const initDir = startFolder || settings.defaultDirectory;
+
   // Apply saved sidebar width
   if (settings.sidebarWidth) {
     sidebar.style.width = settings.sidebarWidth + "px";
   }
 
   // Init file browser FIRST so getCurrentPath() is set before the terminal spawns
-  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), settings.defaultDirectory);
+  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), initDir);
+
+  // Set window title to folder name
+  if (startFolder) {
+    const folderName = startFolder.split("/").pop();
+    const { getCurrentWindow } = window.__TAURI__.window;
+    getCurrentWindow().setTitle(folderName || "Launchpad");
+  }
 
   try {
     await createTab();
@@ -1798,6 +1834,9 @@ async function boot() {
     updateQuickOpenRoot(path);
     saveSetting("lastDirectory", path);
     invoke("watch_directory", { path });
+    const folderName = path.split("/").pop();
+    const { getCurrentWindow } = window.__TAURI__.window;
+    getCurrentWindow().setTitle(folderName || "Launchpad");
   });
 
   fetchGitStatus(getCurrentPath());

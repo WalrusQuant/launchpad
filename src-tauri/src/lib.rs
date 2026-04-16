@@ -1287,6 +1287,36 @@ fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String>
     Ok(())
 }
 
+#[tauri::command]
+fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
+    let label = format!(
+        "window-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    let url = match &path {
+        Some(p) => format!("index.html?folder={}", urlencoding::encode(p)),
+        None => "index.html?pick=1".to_string(),
+    };
+
+    let title = path
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .unwrap_or("Launchpad");
+
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(1200.0, 800.0)
+        .min_inner_size(800.0, 500.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 pub fn run() {
     let app_state = AppState {
         ptys: Arc::new(Mutex::new(HashMap::new())),
@@ -1349,7 +1379,8 @@ pub fn run() {
             get_commit_details,
             get_remote_url,
             watch_directory,
-            unwatch_directory
+            unwatch_directory,
+            open_new_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
