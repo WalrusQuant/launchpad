@@ -24,6 +24,13 @@ I told Claude I wanted to build a desktop app. It suggested Tauri + Rust + vanil
 
 ## Install
 
+### Download (easiest)
+
+Grab the latest `.dmg` from [Releases](https://github.com/WalrusQuant/launchpad/releases/latest). Apple Silicon only for now.
+
+1. Open the DMG, drag `Launchpad.app` to `/Applications`
+2. First launch: right-click the app → **Open** (the app isn't code-signed, so macOS will warn). Or run `xattr -dr com.apple.quarantine /Applications/Launchpad.app`.
+
 ### From source
 ```bash
 # Prerequisites: Rust, Node.js

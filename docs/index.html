@@ -35,7 +35,8 @@
         code editor.
       </p>
       <div class="cta-row">
-        <a href="getting-started.html" class="btn btn-primary">Get started →</a>
+        <a href="https://github.com/WalrusQuant/launchpad/releases/latest" class="btn btn-primary">Download for macOS →</a>
+        <a href="getting-started.html" class="btn">Get started</a>
         <a href="https://github.com/WalrusQuant/launchpad" class="btn">View on GitHub</a>
       </div>
       <div class="badges">
@@ -124,8 +125,19 @@
 
     <section class="section">
       <div class="wrap">
-        <h2>Install from source</h2>
-        <p class="subtitle">Prerequisites: Rust and Node.js. macOS only for now.</p>
+        <h2>Install</h2>
+        <p class="subtitle">Two paths: download the DMG (Apple Silicon, easiest) or build from source.</p>
+        <h3 style="margin: 28px 0 12px;">Download</h3>
+        <p>
+          Grab the latest <code>.dmg</code> from
+          <a href="https://github.com/WalrusQuant/launchpad/releases/latest">Releases</a>.
+          Open it, drag <code>Launchpad.app</code> to <code>/Applications</code>. On
+          first launch, right-click the app &rarr; <strong>Open</strong> (the app
+          isn't code-signed, so macOS will warn). Or clear the quarantine flag:
+        </p>
+<pre><code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code></pre>
+        <h3 style="margin: 28px 0 12px;">From source</h3>
+        <p>Prerequisites: Rust and Node.js.</p>
 <pre><code>git clone https://github.com/WalrusQuant/launchpad.git
 cd launchpad
 npm install
