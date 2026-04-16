@@ -1492,6 +1492,21 @@ fn unregister_project_window(
     Ok(())
 }
 
+/// Remove every entry in the map whose value equals `label`. Called when a
+/// window enters picker mode so a stale registration (from Cmd+R, a crash,
+/// or any non-"← Projects" path) doesn't make focus_project_window think
+/// this window is still hosting a project.
+#[tauri::command]
+fn unregister_window_label(
+    label: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    if let Ok(mut map) = state.project_windows.lock() {
+        map.retain(|_, v| v != &label);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn focus_project_window(
     path: String,
@@ -1598,7 +1613,8 @@ pub fn run() {
             open_new_window,
             focus_project_window,
             register_project_window,
-            unregister_project_window
+            unregister_project_window,
+            unregister_window_label
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

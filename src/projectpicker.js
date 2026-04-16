@@ -174,8 +174,14 @@ export async function showPicker(onOpen) {
       shell.innerHTML = `
         <div class="picker-welcome">
           <div class="picker-logo">Launchpad</div>
-          <div class="picker-tagline">Open a project to get started.</div>
-          <button id="picker-open-btn" class="picker-open-btn">+ Open Project</button>
+          <div class="picker-subtle">Terminal-first workspace for developers</div>
+          <div class="picker-blurb">
+            A project is a directory. Open one and every terminal, the file tree, git panel, and Cmd+P all lock to it — so CLI agents never get a surprise <code>cd</code>.
+          </div>
+          <div class="picker-cta-wrap">
+            <button id="picker-open-btn" class="picker-open-btn">+ Open Project</button>
+            <div class="picker-footer-hint">⌘⇧N opens another window anytime</div>
+          </div>
         </div>
       `;
     } else {

@@ -11,7 +11,7 @@ import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
 import { initQuickOpen, show as showQuickOpen } from "./quickopen.js";
 import { createSettingsPanel } from "./settingspanel.js";
-import { loadProjects, addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow } from "./projects.js";
+import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -1825,22 +1825,18 @@ async function boot() {
     } catch (err) {
       console.error("Failed to add project from ?folder=:", err);
     }
-  } else {
-    // Phase 1 migration: seed the first project from the legacy defaultDirectory
-    // setting so existing users don't land in an empty picker on upgrade.
-    const projects = await loadProjects();
-    if (projects.length === 0 && settings.defaultDirectory) {
-      try {
-        startProject = await addProject(settings.defaultDirectory);
-      } catch {
-        // Path doesn't exist or otherwise invalid — fall through to picker.
-      }
-    }
   }
+  // No auto-migration from legacy defaultDirectory. If projects.json is empty, the
+  // user sees the welcome state and adds a project explicitly — that's the whole
+  // point of the picker being truthful about what they've opened.
 
   if (startProject) {
     await enterWorkspace(startProject, settings);
   } else {
+    // Scrub any stale project registration for this window (e.g. from Cmd+R
+    // after a previous workspace session) so focus_project_window won't think
+    // this window is still hosting a project.
+    await unregisterCurrentWindow().catch(() => {});
     await showPicker((project) => openProjectInWindow(project, settings));
   }
 }

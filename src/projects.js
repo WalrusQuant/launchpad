@@ -54,6 +54,12 @@ export async function unregisterProjectWindow(path) {
   return await invoke("unregister_project_window", { path });
 }
 
+export async function unregisterCurrentWindow() {
+  const { getCurrentWindow } = window.__TAURI__.window;
+  const label = getCurrentWindow().label;
+  return await invoke("unregister_window_label", { label });
+}
+
 export async function touchProject(path) {
   return await invoke("touch_project", {
     path,
