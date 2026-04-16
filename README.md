@@ -18,9 +18,7 @@ I wasn't trying to reinvent anything or prove a point. I just wanted a tool that
 
 I told Claude I wanted to build a desktop app. It suggested Tauri + Rust + vanilla JS. I said sounds good, we'll figure it out. This is what we figured out.
 
-<video src="https://github.com/WalrusQuant/launchpad/raw/main/docs/media/video.mp4" controls width="100%">
-  Your browser doesn't support embedded video. <a href="docs/media/video.mp4">Download the demo</a>.
-</video>
+![Launchpad demo](docs/media/demo.gif)
 
 ![Workspace with terminal, file browser, and git panel](docs/media/main.png)
 
