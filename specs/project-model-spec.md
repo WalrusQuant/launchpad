@@ -216,10 +216,10 @@ The project model makes both built-in and CLI agents better:
 3. Lock workspace to project root — terminals, file browser, git panel, quick open all scoped
 4. Window title shows project name
 
-### Phase 2: Multi-window
-5. Open projects in separate Tauri windows
-6. One window per project enforcement (focus existing window if already open)
-7. Project picker becomes the "home" window
+### Phase 2: Multi-window ✅
+5. ✅ Open projects in separate Tauri windows
+6. ✅ One window per project enforcement (focus existing window if already open)
+7. ✅ Project picker window stays put on click and can open more projects — effectively "home" for the session
 
 ### Phase 3: Polish
 8. Tab auto-labeling for detected CLI agents

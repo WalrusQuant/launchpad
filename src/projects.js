@@ -31,6 +31,29 @@ export async function renameProject(path, newName) {
   return await invoke("rename_project", { path, newName });
 }
 
+export async function focusProjectWindow(path) {
+  try {
+    return await invoke("focus_project_window", { path });
+  } catch (err) {
+    console.error("focus_project_window failed:", err);
+    return false;
+  }
+}
+
+export async function openProjectWindow(path) {
+  return await invoke("open_new_window", { path });
+}
+
+export async function registerProjectWindow(path) {
+  const { getCurrentWindow } = window.__TAURI__.window;
+  const label = getCurrentWindow().label;
+  return await invoke("register_project_window", { path, label });
+}
+
+export async function unregisterProjectWindow(path) {
+  return await invoke("unregister_project_window", { path });
+}
+
 export async function touchProject(path) {
   return await invoke("touch_project", {
     path,

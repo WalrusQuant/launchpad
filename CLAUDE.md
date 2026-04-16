@@ -43,7 +43,8 @@ specs/                  # Design specs (project model, agent model, etc.)
 - **One window = one project.** A project is just a root directory stored in `~/.launchpad/projects.json`. The workspace is gated behind a picker; `enterWorkspace(project)` initializes terminal/file-browser/git-panel only after a project is chosen.
 - **Active project** is held in `projects.js` as module state (`activeProject`). It's the single source of truth for: terminal spawn cwd, file browser root, git panel path, Cmd+P search root, filesystem watcher.
 - **All three PTY spawn sites** (`createTab`, `splitPane`, `createTabInRight`) pass `getActiveProject()?.path` directly — no inheritance from the previous tab's cwd, no `defaultDirectory` setting, no file-browser path.
-- **Multi-window is Phase 2.** Currently one project per app session; quit & relaunch to switch projects. The `?folder=` URL param auto-adds a folder and enters it (dev hatch for Phase 2 multi-window).
+- **Single-window by default, multi-window when asked.** Clicking a project in the picker takes over the *current* window — the picker view swaps for the workspace in-place. If the project is already open in another window, `focus_project_window` focuses that window and the current one stays on the picker. To genuinely open a second project in parallel, use **Cmd+Shift+N** (opens a new picker window) and pick from there. This matches VS Code / Xcode behavior — a window IS a project, not a project-spawner.
+- **Window registration.** `enterWorkspace(project)` calls `register_project_window(path, current_window_label)`; the "← Projects" teardown calls `unregister_project_window(path)` before reloading. `project_windows: HashMap<canonical_path, label>` in `AppState` is the routing table, cleaned lazily when `get_webview_window` returns `None` (covers the closed-without-unregister case).
 - **Deprecated settings**: `defaultDirectory` and `lastDirectory` in `settings.js` are kept as null placeholders so old configs still load; `defaultDirectory` is auto-migrated into a first project entry on first post-upgrade boot.
 
 ### Tab System & Split Workspace
@@ -174,6 +175,10 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - `remove_project(path)` — removes by canonicalized path
 - `rename_project(path, new_name)` — renames the entry matching the canonicalized path
 - `touch_project(path, last_opened)` — updates `lastOpened` on the matching entry
+- `focus_project_window(path) -> bool` — if a window is registered for the canonicalized path AND still alive, shows + focuses it and returns `true`; otherwise cleans any stale entry and returns `false`
+- `register_project_window(path, label)` — called from `enterWorkspace` to claim the current window for a project; any prior entry for the same label is removed
+- `unregister_project_window(path)` — called from "← Projects" teardown before reloading so a stale registration doesn't fool `focus_project_window`
+- `open_new_window(path?)` — creates a new Tauri window. With `path`: URL `?folder=<path>`, title = folder name. Without: URL `/`, title "Launchpad", boots into picker. Registration now happens on the frontend side (in `enterWorkspace`), so this command is the same for both cases.
 
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`

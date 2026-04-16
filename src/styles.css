@@ -2622,3 +2622,9 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   color: #ffabab;
 }
 
+.picker-ctx-separator {
+  height: 1px;
+  background: #3a3a3a;
+  margin: 4px 0;
+}
+

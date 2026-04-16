@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 
@@ -34,6 +34,10 @@ struct AppState {
     fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
     // PID of in-flight git network operation (push/pull/fetch/merge) — used by cancel_git_op
     git_op_pid: Arc<Mutex<Option<u32>>>,
+    // Canonicalized project path → Tauri window label. Used by focus_project_window
+    // to focus an existing window instead of opening a duplicate. Stale entries are
+    // cleaned lazily on focus attempt (when get_webview_window returns None).
+    project_windows: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1421,7 +1425,11 @@ fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
+fn open_new_window(
+    path: Option<String>,
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<(), String> {
     let label = format!(
         "window-{}",
         std::time::SystemTime::now()
@@ -1430,9 +1438,10 @@ fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), St
             .as_millis()
     );
 
+    // Project windows boot with ?folder=; bare windows land on the picker.
     let url = match &path {
         Some(p) => format!("index.html?folder={}", urlencoding::encode(p)),
-        None => "index.html?pick=1".to_string(),
+        None => "index.html".to_string(),
     };
 
     let title = path
@@ -1447,7 +1456,74 @@ fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), St
         .build()
         .map_err(|e| e.to_string())?;
 
+    // Registration is handled by the frontend when `enterWorkspace` runs, so
+    // both "new window with ?folder=" and "current window takes over a project"
+    // register through the same path.
+    let _ = state; // reserved for future per-window bookkeeping
     Ok(())
+}
+
+#[tauri::command]
+fn register_project_window(
+    path: String,
+    label: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let canonical = normalize_project_path(&path);
+    if let Ok(mut map) = state.project_windows.lock() {
+        // Drop any stale entry that was registered under this same label (e.g. a
+        // different project previously held this window) so a label only points
+        // at one project at a time.
+        map.retain(|_, v| v != &label);
+        map.insert(canonical, label);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_project_window(
+    path: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let canonical = normalize_project_path(&path);
+    if let Ok(mut map) = state.project_windows.lock() {
+        map.remove(&canonical);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn focus_project_window(
+    path: String,
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<bool, String> {
+    let canonical = normalize_project_path(&path);
+    let label_opt = state
+        .project_windows
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&canonical).cloned());
+
+    let Some(label) = label_opt else {
+        return Ok(false);
+    };
+
+    match app.get_webview_window(&label) {
+        Some(win) => {
+            // show() first in case the window is hidden/minimized; focus() alone doesn't restore.
+            let _ = win.show();
+            win.set_focus().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => {
+            // Stale entry — the window was closed. Drop it so the caller can open fresh.
+            if let Ok(mut map) = state.project_windows.lock() {
+                map.remove(&canonical);
+            }
+            Ok(false)
+        }
+    }
 }
 
 pub fn run() {
@@ -1456,6 +1532,7 @@ pub fn run() {
         next_id: Arc::new(Mutex::new(0)),
         fs_watcher: Arc::new(Mutex::new(HashMap::new())),
         git_op_pid: Arc::new(Mutex::new(None)),
+        project_windows: Arc::new(Mutex::new(HashMap::new())),
     };
 
     tauri::Builder::default()
@@ -1518,7 +1595,10 @@ pub fn run() {
             get_remote_url,
             watch_directory,
             unwatch_directory,
-            open_new_window
+            open_new_window,
+            focus_project_window,
+            register_project_window,
+            unregister_project_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

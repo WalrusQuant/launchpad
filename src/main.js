@@ -11,7 +11,7 @@ import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
 import { initQuickOpen, show as showQuickOpen } from "./quickopen.js";
 import { createSettingsPanel } from "./settingspanel.js";
-import { loadProjects, addProject, touchProject, setActiveProject, getActiveProject } from "./projects.js";
+import { loadProjects, addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -1382,6 +1382,7 @@ document.getElementById("back-to-projects").addEventListener("click", async () =
 
   const project = getActiveProject();
   if (project) {
+    await unregisterProjectWindow(project.path).catch(() => {});
     invoke("unwatch_directory", { path: project.path }).catch(() => {});
   }
 
@@ -1797,16 +1798,24 @@ function unsplitWorkspace() {
   }
 }
 
+// Route a picker row click to the right window. If the project is already open
+// somewhere, focus that window and leave the picker here alone. Otherwise the
+// current window takes over and becomes the project window — no extra window
+// is spawned. Use Cmd+Shift+N to get genuine multi-window.
+async function openProjectInWindow(project, settings) {
+  await touchProject(project.path);
+  const focused = await focusProjectWindow(project.path);
+  if (focused) return;
+  await enterWorkspace(project, settings);
+}
+
 // Boot
 async function boot() {
   const settings = await loadSettings();
 
-  // Determine a startup project from URL query params (dev/multi-window hatch).
-  // ?folder=/path → auto-add as a project and enter it.
-  // ?pick=1 → show native picker; on cancel, close the window.
+  // A window booting with ?folder= is a dedicated project window — enter it directly.
   const params = new URLSearchParams(window.location.search);
   const folderParam = params.get("folder");
-  const pickParam = params.get("pick");
 
   let startProject = null;
   if (folderParam) {
@@ -1816,18 +1825,9 @@ async function boot() {
     } catch (err) {
       console.error("Failed to add project from ?folder=:", err);
     }
-  } else if (pickParam) {
-    const picked = await invoke("pick_directory");
-    if (!picked) {
-      const { getCurrentWindow } = window.__TAURI__.window;
-      getCurrentWindow().close();
-      return;
-    }
-    startProject = await addProject(picked);
   } else {
-    // Phase 1B/1H migration: if no projects yet and the old defaultDirectory
-    // setting points at a real path, seed it as the first project so existing
-    // users don't land in an empty picker.
+    // Phase 1 migration: seed the first project from the legacy defaultDirectory
+    // setting so existing users don't land in an empty picker on upgrade.
     const projects = await loadProjects();
     if (projects.length === 0 && settings.defaultDirectory) {
       try {
@@ -1841,13 +1841,16 @@ async function boot() {
   if (startProject) {
     await enterWorkspace(startProject, settings);
   } else {
-    await showPicker((project) => enterWorkspace(project, settings));
+    await showPicker((project) => openProjectInWindow(project, settings));
   }
 }
 
 async function enterWorkspace(project, settings) {
   setActiveProject(project);
   await touchProject(project.path);
+  // Register this window as hosting the project so other windows' pickers focus
+  // it instead of spawning duplicates.
+  registerProjectWindow(project.path).catch(() => {});
   hidePicker();
   document.getElementById("workspace-root").hidden = false;
 

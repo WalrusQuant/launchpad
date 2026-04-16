@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-import { loadProjects, addProject, removeProject, renameProject } from "./projects.js";
+import { loadProjects, addProject, removeProject, renameProject, focusProjectWindow, openProjectWindow } from "./projects.js";
 
 const pickerRoot = document.getElementById("picker-root");
 let homeDir = null;
@@ -104,7 +104,9 @@ function showRowContextMenu(x, y, project, row, onChange) {
   menu.id = "picker-ctx-menu";
   menu.className = "picker-ctx-menu";
   menu.innerHTML = `
+    <div class="picker-ctx-item" data-action="new-window">Open in New Window</div>
     <div class="picker-ctx-item" data-action="rename">Rename</div>
+    <div class="picker-ctx-separator"></div>
     <div class="picker-ctx-item picker-ctx-item-danger" data-action="remove">Remove from list</div>
   `;
   menu.style.left = x + "px";
@@ -117,6 +119,13 @@ function showRowContextMenu(x, y, project, row, onChange) {
     menu.style.left = Math.max(8, x - rect.width) + "px";
   }
 
+  menu.querySelector('[data-action="new-window"]').addEventListener("click", async (e) => {
+    e.stopPropagation();
+    closeRowContextMenu();
+    // If it's already open elsewhere, just focus that window — don't spawn a duplicate.
+    const focused = await focusProjectWindow(project.path);
+    if (!focused) await openProjectWindow(project.path);
+  });
   menu.querySelector('[data-action="rename"]').addEventListener("click", (e) => {
     e.stopPropagation();
     closeRowContextMenu();
