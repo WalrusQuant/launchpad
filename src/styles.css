@@ -1964,6 +1964,15 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   color: #111;
 }
 
+.context-menu-item-disabled {
+  color: #666;
+  cursor: default;
+}
+.context-menu-item-disabled:hover {
+  background: none;
+  color: #666;
+}
+
 .context-menu-separator {
   height: 1px;
   background: #444;

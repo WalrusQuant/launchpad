@@ -595,6 +595,82 @@ async function createEditorTab(filePath) {
   tab.editorView = editorView;
   tabs.set(uiId, tab);
 
+  // Right-click context menu for editor
+  editorContent.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const old = document.getElementById("context-menu");
+    if (old) old.remove();
+
+    const menu = document.createElement("div");
+    menu.id = "context-menu";
+    menu.className = "context-menu";
+
+    const sel = editorView.state.sliceDoc(
+      editorView.state.selection.main.from,
+      editorView.state.selection.main.to
+    );
+
+    const copyItem = document.createElement("div");
+    copyItem.className = "context-menu-item";
+    copyItem.textContent = "Copy";
+    if (!sel) copyItem.classList.add("context-menu-item-disabled");
+    copyItem.addEventListener("click", () => {
+      if (sel) navigator.clipboard.writeText(sel);
+      menu.remove();
+    });
+
+    const cutItem = document.createElement("div");
+    cutItem.className = "context-menu-item";
+    cutItem.textContent = "Cut";
+    if (!sel) cutItem.classList.add("context-menu-item-disabled");
+    cutItem.addEventListener("click", () => {
+      if (sel) {
+        navigator.clipboard.writeText(sel);
+        editorView.dispatch({ changes: editorView.state.selection.main });
+      }
+      menu.remove();
+    });
+
+    const pasteItem = document.createElement("div");
+    pasteItem.className = "context-menu-item";
+    pasteItem.textContent = "Paste";
+    pasteItem.addEventListener("click", async () => {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        editorView.dispatch({
+          changes: { from: editorView.state.selection.main.from, to: editorView.state.selection.main.to, insert: text },
+        });
+      }
+      menu.remove();
+    });
+
+    const selectAllItem = document.createElement("div");
+    selectAllItem.className = "context-menu-item";
+    selectAllItem.textContent = "Select All";
+    selectAllItem.addEventListener("click", () => {
+      editorView.dispatch({
+        selection: { anchor: 0, head: editorView.state.doc.length },
+      });
+      menu.remove();
+    });
+
+    menu.appendChild(cutItem);
+    menu.appendChild(copyItem);
+    menu.appendChild(pasteItem);
+    const sep = document.createElement("div");
+    sep.className = "context-menu-separator";
+    menu.appendChild(sep);
+    menu.appendChild(selectAllItem);
+
+    menu.style.left = e.clientX + "px";
+    menu.style.top = e.clientY + "px";
+    document.body.appendChild(menu);
+
+    setTimeout(() => {
+      document.addEventListener("click", () => menu.remove(), { once: true });
+    }, 0);
+  });
+
   renderTabBar();
   switchTab(uiId);
   return uiId;
