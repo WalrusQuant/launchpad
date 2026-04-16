@@ -38,6 +38,9 @@ struct AppState {
     // to focus an existing window instead of opening a duplicate. Stale entries are
     // cleaned lazily on focus attempt (when get_webview_window returns None).
     project_windows: Arc<Mutex<HashMap<String, String>>>,
+    // Serializes read→mutate→write of ~/.launchpad/projects.json so concurrent
+    // commands (e.g. two windows both hitting add_project) can't lose updates.
+    projects_file_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -660,7 +663,13 @@ fn add_project(
     path: String,
     name: Option<String>,
     last_opened: String,
+    state: State<AppState>,
 ) -> Result<Project, String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
+
     let normalized = normalize_project_path(&path);
     let derived_name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
         std::path::Path::new(&normalized)
@@ -691,7 +700,11 @@ fn add_project(
 }
 
 #[tauri::command]
-fn remove_project(path: String) -> Result<(), String> {
+fn remove_project(path: String, state: State<AppState>) -> Result<(), String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
     let target = normalize_project_path(&path);
     let mut projects = read_projects_file()?;
     projects.retain(|p| normalize_project_path(&p.path) != target);
@@ -699,11 +712,19 @@ fn remove_project(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn rename_project(path: String, new_name: String) -> Result<(), String> {
+fn rename_project(
+    path: String,
+    new_name: String,
+    state: State<AppState>,
+) -> Result<(), String> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() {
         return Err("Name cannot be empty".into());
     }
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
     let target = normalize_project_path(&path);
     let mut projects = read_projects_file()?;
     if let Some(p) = projects
@@ -717,7 +738,15 @@ fn rename_project(path: String, new_name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn touch_project(path: String, last_opened: String) -> Result<(), String> {
+fn touch_project(
+    path: String,
+    last_opened: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
     let target = normalize_project_path(&path);
     let mut projects = read_projects_file()?;
     if let Some(p) = projects
@@ -1425,11 +1454,7 @@ fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn open_new_window(
-    path: Option<String>,
-    app: tauri::AppHandle,
-    state: State<AppState>,
-) -> Result<(), String> {
+fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
     let label = format!(
         "window-{}",
         std::time::SystemTime::now()
@@ -1459,7 +1484,6 @@ fn open_new_window(
     // Registration is handled by the frontend when `enterWorkspace` runs, so
     // both "new window with ?folder=" and "current window takes over a project"
     // register through the same path.
-    let _ = state; // reserved for future per-window bookkeeping
     Ok(())
 }
 
@@ -1514,13 +1538,13 @@ fn focus_project_window(
     state: State<AppState>,
 ) -> Result<bool, String> {
     let canonical = normalize_project_path(&path);
-    let label_opt = state
+    // Single critical section so no other thread can insert a fresh entry
+    // between our read and the stale-remove in the `None` branch.
+    let mut map = state
         .project_windows
         .lock()
-        .ok()
-        .and_then(|m| m.get(&canonical).cloned());
-
-    let Some(label) = label_opt else {
+        .map_err(|e| format!("project_windows lock poisoned: {}", e))?;
+    let Some(label) = map.get(&canonical).cloned() else {
         return Ok(false);
     };
 
@@ -1533,9 +1557,7 @@ fn focus_project_window(
         }
         None => {
             // Stale entry — the window was closed. Drop it so the caller can open fresh.
-            if let Ok(mut map) = state.project_windows.lock() {
-                map.remove(&canonical);
-            }
+            map.remove(&canonical);
             Ok(false)
         }
     }
@@ -1548,6 +1570,7 @@ pub fn run() {
         fs_watcher: Arc::new(Mutex::new(HashMap::new())),
         git_op_pid: Arc::new(Mutex::new(None)),
         project_windows: Arc::new(Mutex::new(HashMap::new())),
+        projects_file_lock: Arc::new(Mutex::new(())),
     };
 
     tauri::Builder::default()

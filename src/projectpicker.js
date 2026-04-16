@@ -143,20 +143,29 @@ function showRowContextMenu(x, y, project, row, onChange) {
   }, 0);
 }
 
-async function annotateBranches(projects, list) {
-  projects.forEach(async (p, i) => {
-    try {
-      const status = await invoke("get_git_status", { path: p.path });
-      if (!status?.branch) return;
-      const row = list.children[i];
-      const meta = row?.querySelector(".picker-row-meta");
-      if (meta) {
-        meta.textContent = `${prettyPath(p.path)} · ${status.branch} · ${formatRelativeTime(p.lastOpened)}`;
+function annotateBranches(projects, list) {
+  // Fire concurrently but guard with list.isConnected so a rerender that
+  // detaches this list doesn't let late-arriving responses mutate stale DOM
+  // (or, worse, paint one render's git branch into another render's row).
+  if (!list.isConnected) return;
+  Promise.allSettled(
+    projects.map(async (p, i) => {
+      try {
+        const status = await invoke("get_git_status", { path: p.path });
+        if (!list.isConnected) return;
+        if (!status?.branch) return;
+        const row = list.children[i];
+        if (!row) return;
+        const meta = row.querySelector(".picker-row-meta");
+        if (meta) {
+          // textContent is safe regardless of what branch/path/time contain.
+          meta.textContent = `${prettyPath(p.path)} · ${status.branch} · ${formatRelativeTime(p.lastOpened)}`;
+        }
+      } catch {
+        // Not a git repo — leave row as-is.
       }
-    } catch {
-      // Not a git repo — leave row as-is.
-    }
-  });
+    })
+  );
 }
 
 export async function showPicker(onOpen) {
@@ -199,7 +208,7 @@ export async function showPicker(onOpen) {
         row.innerHTML = `
           <div class="picker-row-body">
             <div class="picker-row-name">${escapeHtml(p.name)}</div>
-            <div class="picker-row-meta">${escapeHtml(prettyPath(p.path))} · ${formatRelativeTime(p.lastOpened)}</div>
+            <div class="picker-row-meta">${escapeHtml(prettyPath(p.path))} · ${escapeHtml(formatRelativeTime(p.lastOpened))}</div>
           </div>
           <button class="picker-row-menu-btn" title="Project options" aria-label="Project options">⋯</button>
         `;

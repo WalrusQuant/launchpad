@@ -5,7 +5,6 @@ let currentPath = "";
 let projectRoot = ""; // set by initFileBrowser; navigation is capped at or within this
 let showHidden = false;
 let expandedDirs = new Set();
-let onNavigateCallback = null;
 let getActiveTabId = null; // set by main.js
 let openFileCallback = null; // set by main.js — opens file as editor tab
 let searchQuery = "";
@@ -442,8 +441,6 @@ async function setRoot(path) {
 
   const tree = document.getElementById("file-tree");
   await loadDirectory(path, tree);
-
-  if (onNavigateCallback) onNavigateCallback(path);
 }
 
 function toggleHidden() {
@@ -531,10 +528,6 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, projectRoot
 
 export function getCurrentPath() {
   return currentPath;
-}
-
-export function onNavigate(callback) {
-  onNavigateCallback = callback;
 }
 
 export function openFileByPath(fullPath) {

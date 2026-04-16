@@ -1845,8 +1845,14 @@ async function enterWorkspace(project, settings) {
   setActiveProject(project);
   await touchProject(project.path);
   // Register this window as hosting the project so other windows' pickers focus
-  // it instead of spawning duplicates.
-  registerProjectWindow(project.path).catch(() => {});
+  // it instead of spawning duplicates. Awaited — if the register races with a
+  // second window's focus_project_window, the second window could otherwise
+  // miss our registration and open a duplicate.
+  try {
+    await registerProjectWindow(project.path);
+  } catch (err) {
+    console.error("registerProjectWindow failed:", err);
+  }
   hidePicker();
   document.getElementById("workspace-root").hidden = false;
 
