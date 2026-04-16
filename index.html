@@ -8,8 +8,11 @@
   </head>
   <body>
     <div id="app">
+      <div id="picker-root"></div>
+      <div id="workspace-root" hidden>
       <div id="toolbar">
         <div id="toolbar-left">
+          <button id="back-to-projects" class="toolbar-btn" title="Back to projects" aria-label="Back to projects">←</button>
           <button id="open-new-window" class="toolbar-btn" title="New window (⌘⇧N)" aria-label="New window">+</button>
           <button id="open-settings" class="toolbar-btn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
           <div id="shortcuts-wrapper">
@@ -45,8 +48,7 @@
             <div id="sidebar-header">
               <button id="nav-up" class="sidebar-btn" title="Go up">↑</button>
               <span id="current-path">~/Code</span>
-              <button id="set-wd-btn" class="sidebar-btn" title="Set as working directory" style="display:none">⏎</button>
-              <button id="go-home-btn" class="sidebar-btn" title="Back to working directory" style="display:none">⌂</button>
+              <button id="go-home-btn" class="sidebar-btn" title="Back to project root">⌂</button>
               <button id="toggle-hidden" class="sidebar-btn" title="Show hidden files">•</button>
             </div>
             <div id="file-search" class="file-search">
@@ -72,6 +74,7 @@
           </div>
         </div>
       </div>
+      </div><!-- /workspace-root -->
     </div>
     <!-- Quick open overlay -->
     <div id="quick-open" role="dialog" aria-label="Quick open">

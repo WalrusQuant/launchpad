@@ -18,23 +18,34 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 ## Project Structure
 ```
 src/                    # Frontend (JS/CSS/HTML)
-  main.js              # App entry, unified tab management (terminal + editor + settings), split workspace (left/right groups), split panes, drag-to-move tabs, keyboard shortcuts, context menus
-  filebrowser.js        # File tree, context menu, drag & drop, git status colors, CRUD operations, decoupled browsing/working directory
+  main.js              # App entry, project-gated workspace init, unified tab management (terminal + editor + settings), split workspace, split panes, drag-to-move tabs, keyboard shortcuts, context menus
+  projects.js           # Active project state + thin wrappers around project Tauri commands
+  projectpicker.js      # Project picker UI (welcome state / recent list) shown before any workspace exists
+  filebrowser.js        # File tree rooted at project.path, context menu, drag & drop, git status colors, CRUD operations
   editor.js             # CodeMirror factory — creates independent editor instances with search, cursor tracking
   git.js                # Git status polling, file status colors in tree
   gitpanel.js           # Full git panel UI (toolbar, staged/unstaged, commit, branches, history, GitHub, conflicts, cheatsheet)
   quickopen.js          # Cmd+P fuzzy file finder (uses search_files command, ranks by path length)
   settings.js           # Persistent settings store (~/.launchpad/config.json)
-  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections) with native directory picker
+  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections)
   styles.css            # All styles (organized by section with comment headers)
 src-tauri/              # Rust backend
-  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings)
+  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings, projects)
   Cargo.toml            # Rust dependencies
   tauri.conf.json       # App configuration
-index.html              # Main HTML shell (includes toolbar with settings, shortcuts, git buttons)
+index.html              # Main HTML shell — picker-root + workspace-root sibling containers
+specs/                  # Design specs (project model, agent model, etc.)
 ```
 
 ## Key Architecture Decisions
+
+### Projects (see `specs/project-model-spec.md`)
+- **One window = one project.** A project is just a root directory stored in `~/.launchpad/projects.json`. The workspace is gated behind a picker; `enterWorkspace(project)` initializes terminal/file-browser/git-panel only after a project is chosen.
+- **Active project** is held in `projects.js` as module state (`activeProject`). It's the single source of truth for: terminal spawn cwd, file browser root, git panel path, Cmd+P search root, filesystem watcher.
+- **All three PTY spawn sites** (`createTab`, `splitPane`, `createTabInRight`) pass `getActiveProject()?.path` directly — no inheritance from the previous tab's cwd, no `defaultDirectory` setting, no file-browser path.
+- **Single-window by default, multi-window when asked.** Clicking a project in the picker takes over the *current* window — the picker view swaps for the workspace in-place. If the project is already open in another window, `focus_project_window` focuses that window and the current one stays on the picker. To genuinely open a second project in parallel, use **Cmd+Shift+N** (opens a new picker window) and pick from there. This matches VS Code / Xcode behavior — a window IS a project, not a project-spawner.
+- **Window registration.** `enterWorkspace(project)` calls `register_project_window(path, current_window_label)`; the "← Projects" teardown calls `unregister_project_window(path)` before reloading. `project_windows: HashMap<canonical_path, label>` in `AppState` is the routing table, cleaned lazily when `get_webview_window` returns `None` (covers the closed-without-unregister case).
+- **No auto-migration** from any legacy setting. An empty `~/.launchpad/projects.json` always lands the user on the picker's welcome state; projects only exist because the user explicitly opened a folder.
 
 ### Tab System & Split Workspace
 - **Unified tab bar**: Terminal tabs, editor tabs, and settings tab share one tab bar. Each tab has a `type` field: `"terminal"`, `"editor"`, or `"settings"`. Tab-type guards protect terminal-specific code (fitAllPanes, PTY writes, split panes).
@@ -43,10 +54,11 @@ index.html              # Main HTML shell (includes toolbar with settings, short
 - **Tab drag-to-move**: When workspace is split, tabs use a MutationObserver-based drag system to move between left and right groups. Group markers on tab objects track which group they belong to.
 
 ### File Browser
-- **Decoupled browsing**: Navigating folders in the file browser does NOT change the terminal's working directory. A blue ⏎ button appears in the sidebar header when the browsed directory differs from the terminal's cwd. Clicking it sends `cd` to the active terminal.
+- **Root locked to project**: `setRoot()` guards against any path outside `projectRoot`. Nav-up ↑ is capped at the project root (no-op when already there). Go-home ⌂ jumps back to the project root.
+- **No terminal disruption**: The file browser holds no concept of the terminal's cwd. Browsing subfolders never writes anything to a PTY — CLI agents (Claude, Aider, etc.) are safe from accidental `cd`.
 - **CRUD operations**: Right-click context menu supports new file, new folder, rename, delete, and reveal in Finder. Uses `create_file`, `create_directory`, `rename_path`, `delete_path`, and `reveal_in_finder` commands.
 - **Off-DOM tree building**: The file tree is built in a detached DOM fragment and swapped in a single operation to prevent flicker when expanding folders.
-- **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the current directory recursively. Emits `fs-changed` Tauri events that trigger `refreshFileBrowser()` and git status updates. Frontend throttles to 500ms. The watcher follows directory navigation and is managed in `AppState.fs_watcher`.
+- **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the project root recursively. Started once in `enterWorkspace()`. Emits `fs-changed` Tauri events that trigger `refreshFileBrowser()` and git status updates. Frontend throttles to 500ms.
 
 ### Terminal
 - **Multi-PTY with deferred reader**: Each terminal tab/pane spawns its own PTY via `portable-pty`. The reader thread is NOT started during `spawn_pty` — instead, the frontend calls `start_pty_reader` AFTER registering the pane in `paneMap`, preventing a race where early output gets dropped.
@@ -67,7 +79,7 @@ index.html              # Main HTML shell (includes toolbar with settings, short
 
 ### Settings & State
 - **Live settings**: Settings changes apply immediately to all open terminals/editors. Stored as JSON at `~/.launchpad/config.json`.
-- **Default directory**: `termDefaultDirectory` setting controls where new terminals open. A native folder picker (via `pick_directory` command using osascript) lets users browse for the directory.
+- **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Written atomically via temp-file + rename. Path canonicalization dedupes equivalent paths. See `specs/project-model-spec.md`.
 - **No framework**: Vanilla JS with direct DOM manipulation. Keeps the bundle small and fast.
 
 ## Commands
@@ -157,6 +169,17 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 ### Settings
 - `load_settings()` / `save_settings(data)` — JSON validated before write
 
+### Projects
+- `load_projects()` — returns `Vec<Project>` sorted by `lastOpened` desc; empty array if file missing
+- `add_project(path, name?, last_opened)` — upserts by canonicalized path; derives name from directory if null; returns the Project
+- `remove_project(path)` — removes by canonicalized path
+- `rename_project(path, new_name)` — renames the entry matching the canonicalized path
+- `touch_project(path, last_opened)` — updates `lastOpened` on the matching entry
+- `focus_project_window(path) -> bool` — if a window is registered for the canonicalized path AND still alive, shows + focuses it and returns `true`; otherwise cleans any stale entry and returns `false`
+- `register_project_window(path, label)` — called from `enterWorkspace` to claim the current window for a project; any prior entry for the same label is removed
+- `unregister_project_window(path)` — called from "← Projects" teardown before reloading so a stale registration doesn't fool `focus_project_window`
+- `open_new_window(path?)` — creates a new Tauri window. With `path`: URL `?folder=<path>`, title = folder name. Without: URL `/`, title "Launchpad", boots into picker. Registration now happens on the frontend side (in `enterWorkspace`), so this command is the same for both cases.
+
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`
 2. Register it in the `invoke_handler` in `run()`
@@ -169,7 +192,10 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - Git features → `gitpanel.js`
 - Editor features → `editor.js`
 - Settings → `settingspanel.js` (UI) + `settings.js` (storage)
+- Project picker / project data → `projectpicker.js` (UI) + `projects.js` (state)
 - Styles → `styles.css` (organized by section with comment headers)
+
+**Project-scoped features rule**: when wiring a new feature that cares about "the current directory", use `getActiveProject().path` (or a closure over it) — **not** `getCurrentPath()` from the file browser. `getCurrentPath()` tracks sub-folder navigation; only the file browser itself should read it.
 
 ## Git Panel Architecture
 The git panel (`gitpanel.js`) rebuilds its innerHTML on every refresh but uses a snapshot comparison (`JSON.stringify`) to skip redundant re-renders during 3-second polling. Module-level state (`expandedCommitOid`) persists across re-renders.

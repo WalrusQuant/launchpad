@@ -5,12 +5,14 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
-import { initFileBrowser, getCurrentPath, onNavigate, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
+import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
-import { initQuickOpen, show as showQuickOpen, updateRoot as updateQuickOpenRoot } from "./quickopen.js";
+import { initQuickOpen, show as showQuickOpen } from "./quickopen.js";
 import { createSettingsPanel } from "./settingspanel.js";
+import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
+import { showPicker, hidePicker } from "./projectpicker.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -261,9 +263,7 @@ async function createTab() {
     containerEl.className = "terminal-instance";
     document.getElementById("terminal-instances").appendChild(containerEl);
 
-    const s = getSettings();
-    const defaultCwd = s.defaultDirectory || getCurrentPath() || undefined;
-    const pane = await createPane(containerEl, defaultCwd);
+    const pane = await createPane(containerEl, getActiveProject()?.path);
 
     const tab = { type: "terminal", panes: [pane], containerEl, name: null, activePane: 0 };
     tabs.set(uiId, tab);
@@ -306,8 +306,7 @@ async function splitPane() {
   handle.className = "split-handle";
   tab.containerEl.appendChild(handle);
 
-  const s2 = getSettings();
-  const secondPane = await createPane(tab.containerEl, s2.defaultDirectory || getCurrentPath() || undefined);
+  const secondPane = await createPane(tab.containerEl, getActiveProject()?.path);
   tab.panes.push(secondPane);
   tab.activePane = 1;
 
@@ -1101,6 +1100,10 @@ terminalContainer.addEventListener("contextmenu", (e) => {
 
 // Keyboard shortcuts
 document.addEventListener("keydown", (e) => {
+  // While the project picker is visible no workspace exists yet — skip all
+  // workspace shortcuts so the picker is interactable (Enter/typing etc.).
+  if (!getActiveProject()) return;
+
   const activeTab = tabs.get(activeTabUiId);
   const isEditorTab = activeTab?.type === "editor";
 
@@ -1364,6 +1367,30 @@ function isOverEl(mouseEvent, el) {
          mouseEvent.clientY >= r.top && mouseEvent.clientY <= r.bottom;
 }
 
+// Back to projects — tear down the current workspace and return to the picker.
+document.getElementById("back-to-projects").addEventListener("click", async () => {
+  // Close every PTY across all tabs + panes + right group.
+  const ptyIds = [];
+  tabs.forEach((tab) => {
+    if (tab.type === "terminal" && Array.isArray(tab.panes)) {
+      tab.panes.forEach((pane) => {
+        if (pane.ptyId !== null && pane.ptyId !== undefined) ptyIds.push(pane.ptyId);
+      });
+    }
+  });
+  await Promise.all(ptyIds.map((id) => invoke("close_pty", { tabId: id }).catch(() => {})));
+
+  const project = getActiveProject();
+  if (project) {
+    await unregisterProjectWindow(project.path).catch(() => {});
+    invoke("unwatch_directory", { path: project.path }).catch(() => {});
+  }
+
+  // Full reload resets all module state and triggers boot() → picker.
+  setActiveProject(null);
+  window.location.reload();
+});
+
 // New window button
 document.getElementById("open-new-window").addEventListener("click", () => invoke("open_new_window", { path: null }));
 
@@ -1542,9 +1569,7 @@ async function createTabInRight() {
     containerEl.className = "terminal-instance";
     rightInstancesEl.appendChild(containerEl);
 
-    const s = getSettings();
-    const defaultCwd = s.defaultDirectory || getCurrentPath() || undefined;
-    const pane = await createPane(containerEl, defaultCwd);
+    const pane = await createPane(containerEl, getActiveProject()?.path);
     const tab = { type: "terminal", panes: [pane], containerEl, name: null, activePane: 0, _rightGroup: true };
     tabs.set(uiId, tab);
     rightGroupTabIds.push(uiId);
@@ -1773,30 +1798,63 @@ function unsplitWorkspace() {
   }
 }
 
+// Route a picker row click to the right window. If the project is already open
+// somewhere, focus that window and leave the picker here alone. Otherwise the
+// current window takes over and becomes the project window — no extra window
+// is spawned. Use Cmd+Shift+N to get genuine multi-window.
+async function openProjectInWindow(project, settings) {
+  await touchProject(project.path);
+  const focused = await focusProjectWindow(project.path);
+  if (focused) return;
+  await enterWorkspace(project, settings);
+}
+
 // Boot
 async function boot() {
   const settings = await loadSettings();
 
-  // Determine startup folder from URL query params (multi-window support)
+  // A window booting with ?folder= is a dedicated project window — enter it directly.
   const params = new URLSearchParams(window.location.search);
   const folderParam = params.get("folder");
-  const pickParam = params.get("pick");
 
-  let startFolder = null;
+  let startProject = null;
   if (folderParam) {
-    startFolder = decodeURIComponent(folderParam);
-  } else if (pickParam) {
-    const picked = await invoke("pick_directory");
-    if (!picked) {
-      // User cancelled — close this window
-      const { getCurrentWindow } = window.__TAURI__.window;
-      getCurrentWindow().close();
-      return;
+    const decoded = decodeURIComponent(folderParam);
+    try {
+      startProject = await addProject(decoded);
+    } catch (err) {
+      console.error("Failed to add project from ?folder=:", err);
     }
-    startFolder = picked;
   }
+  // No auto-migration from legacy defaultDirectory. If projects.json is empty, the
+  // user sees the welcome state and adds a project explicitly — that's the whole
+  // point of the picker being truthful about what they've opened.
 
-  const initDir = startFolder || settings.defaultDirectory;
+  if (startProject) {
+    await enterWorkspace(startProject, settings);
+  } else {
+    // Scrub any stale project registration for this window (e.g. from Cmd+R
+    // after a previous workspace session) so focus_project_window won't think
+    // this window is still hosting a project.
+    await unregisterCurrentWindow().catch(() => {});
+    await showPicker((project) => openProjectInWindow(project, settings));
+  }
+}
+
+async function enterWorkspace(project, settings) {
+  setActiveProject(project);
+  await touchProject(project.path);
+  // Register this window as hosting the project so other windows' pickers focus
+  // it instead of spawning duplicates. Awaited — if the register races with a
+  // second window's focus_project_window, the second window could otherwise
+  // miss our registration and open a duplicate.
+  try {
+    await registerProjectWindow(project.path);
+  } catch (err) {
+    console.error("registerProjectWindow failed:", err);
+  }
+  hidePicker();
+  document.getElementById("workspace-root").hidden = false;
 
   // Apply saved sidebar width
   if (settings.sidebarWidth) {
@@ -1804,14 +1862,10 @@ async function boot() {
   }
 
   // Init file browser FIRST so getCurrentPath() is set before the terminal spawns
-  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), initDir);
+  await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), project.path);
 
-  // Set window title to folder name
-  if (startFolder) {
-    const folderName = startFolder.split("/").pop();
-    const { getCurrentWindow } = window.__TAURI__.window;
-    getCurrentWindow().setTitle(folderName || "Launchpad");
-  }
+  const { getCurrentWindow } = window.__TAURI__.window;
+  getCurrentWindow().setTitle(project.name || "Launchpad");
 
   try {
     await createTab();
@@ -1819,28 +1873,14 @@ async function boot() {
     document.getElementById("terminal-container").innerHTML =
       `<div style="padding:20px;color:#ff6b6b;">Failed to start terminal: ${err}</div>`;
   }
-  invoke("watch_directory", { path: getCurrentPath() });
 
-  // Quick open: Cmd+P to search, select opens in editor tab
-  initQuickOpen(getCurrentPath, (fullPath) => {
-    createEditorTab(fullPath);
-  });
-
-  initGitPanel(getCurrentPath, (filePath) => createEditorTab(filePath));
-
-  onNavigate((path) => {
-    fetchGitStatus(path);
-    refreshPanel(path);
-    updateQuickOpenRoot(path);
-    saveSetting("lastDirectory", path);
-    invoke("watch_directory", { path });
-    const folderName = path.split("/").pop();
-    const { getCurrentWindow } = window.__TAURI__.window;
-    getCurrentWindow().setTitle(folderName || "Launchpad");
-  });
-
-  fetchGitStatus(getCurrentPath());
-  startGitPolling(getCurrentPath, settings.gitPollInterval);
+  // Everything project-scoped pins to project.path — no re-pointing on sub-folder navigation.
+  const projectPathFn = () => project.path;
+  invoke("watch_directory", { path: project.path });
+  initQuickOpen(projectPathFn, (fullPath) => createEditorTab(fullPath));
+  initGitPanel(projectPathFn, (filePath) => createEditorTab(filePath));
+  fetchGitStatus(project.path);
+  startGitPolling(projectPathFn, settings.gitPollInterval);
 }
 
 export function setPanelTransitioning(value) {

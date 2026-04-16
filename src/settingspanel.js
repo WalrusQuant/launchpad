@@ -14,16 +14,6 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       <h3 class="settings-section-title">General</h3>
 
       <div class="settings-row">
-        <label class="settings-label" for="set-defaultDirectory">Startup Directory</label>
-        <div class="settings-input-group settings-dir-group">
-          <input class="settings-input" id="set-defaultDirectory" type="text"
-            value="${escapeAttr(settings.defaultDirectory || "")}"
-            placeholder="~ (home directory)" />
-          <button class="settings-browse-btn" id="browse-default-dir" title="Browse">Browse</button>
-        </div>
-      </div>
-
-      <div class="settings-row">
         <label class="settings-label" for="set-sidebarWidth">Sidebar Width</label>
         <div class="settings-input-group">
           <input class="settings-input settings-input-sm" id="set-sidebarWidth" type="number"
@@ -144,22 +134,6 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   containerEl.appendChild(content);
 
   // Wire up all inputs
-  wireInput("defaultDirectory", "input", (v) => v || null);
-
-  // Browse button for startup directory
-  const browseBtn = content.querySelector("#browse-default-dir");
-  if (browseBtn) {
-    browseBtn.addEventListener("click", async () => {
-      try {
-        const path = await window.__TAURI__.core.invoke("pick_directory");
-        if (path) {
-          const input = content.querySelector("#set-defaultDirectory");
-          input.value = path;
-          onSettingChange("defaultDirectory", path);
-        }
-      } catch (_) {}
-    });
-  }
   wireInput("sidebarWidth", "input", (v) => parseInt(v) || 260);
   wireInput("termFontSize", "input", (v) => parseInt(v) || 13);
   wireInput("termFontFamily", "change", (v) => v);

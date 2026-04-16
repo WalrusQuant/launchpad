@@ -2,8 +2,7 @@ const { invoke } = window.__TAURI__.core;
 
 let settings = {
   sidebarWidth: 260,
-  defaultDirectory: null, // null = auto-detect ~/Code
-  lastDirectory: null,
+
   // Terminal
   termFontSize: 13,
   termFontFamily: '"SF Mono", "Menlo", "Monaco", "Courier New", monospace',

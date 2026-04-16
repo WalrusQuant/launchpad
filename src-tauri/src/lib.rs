@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 
@@ -34,6 +34,13 @@ struct AppState {
     fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
     // PID of in-flight git network operation (push/pull/fetch/merge) — used by cancel_git_op
     git_op_pid: Arc<Mutex<Option<u32>>>,
+    // Canonicalized project path → Tauri window label. Used by focus_project_window
+    // to focus an existing window instead of opening a duplicate. Stale entries are
+    // cleaned lazily on focus attempt (when get_webview_window returns None).
+    project_windows: Arc<Mutex<HashMap<String, String>>>,
+    // Serializes read→mutate→write of ~/.launchpad/projects.json so concurrent
+    // commands (e.g. two windows both hitting add_project) can't lose updates.
+    projects_file_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -590,6 +597,165 @@ fn save_settings(data: String) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Projects
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct Project {
+    name: String,
+    path: String,
+    #[serde(rename = "lastOpened")]
+    last_opened: String,
+}
+
+fn projects_path() -> std::path::PathBuf {
+    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
+    home.join(".launchpad").join("projects.json")
+}
+
+fn read_projects_file() -> Result<Vec<Project>, String> {
+    let path = projects_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if data.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<Project>>(&data)
+        .map_err(|e| format!("Invalid projects.json: {}", e))
+}
+
+fn write_projects_file(projects: &[Project]) -> Result<(), String> {
+    let path = projects_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(projects)
+        .map_err(|e| format!("JSON serialization error: {}", e))?;
+    // Atomic write: temp + rename so a crash can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn normalize_project_path(path: &str) -> String {
+    // Canonicalize when possible so two different strings for the same dir dedupe.
+    // Fall back to the raw string if the path doesn't resolve (missing dir).
+    match fs::canonicalize(path) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.trim_end_matches('/').to_string(),
+    }
+}
+
+#[tauri::command]
+fn load_projects() -> Result<Vec<Project>, String> {
+    let mut projects = read_projects_file()?;
+    // Sort by lastOpened desc so recent projects come first.
+    projects.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+    Ok(projects)
+}
+
+#[tauri::command]
+fn add_project(
+    path: String,
+    name: Option<String>,
+    last_opened: String,
+    state: State<AppState>,
+) -> Result<Project, String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
+
+    let normalized = normalize_project_path(&path);
+    let derived_name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+        std::path::Path::new(&normalized)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| normalized.clone())
+    });
+
+    let mut projects = read_projects_file()?;
+    if let Some(existing) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == normalized)
+    {
+        existing.last_opened = last_opened;
+        let out = existing.clone();
+        write_projects_file(&projects)?;
+        return Ok(out);
+    }
+
+    let project = Project {
+        name: derived_name,
+        path: normalized,
+        last_opened,
+    };
+    projects.push(project.clone());
+    write_projects_file(&projects)?;
+    Ok(project)
+}
+
+#[tauri::command]
+fn remove_project(path: String, state: State<AppState>) -> Result<(), String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    projects.retain(|p| normalize_project_path(&p.path) != target);
+    write_projects_file(&projects)
+}
+
+#[tauri::command]
+fn rename_project(
+    path: String,
+    new_name: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("Name cannot be empty".into());
+    }
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    if let Some(p) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == target)
+    {
+        p.name = trimmed.to_string();
+        write_projects_file(&projects)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn touch_project(
+    path: String,
+    last_opened: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let _guard = state
+        .projects_file_lock
+        .lock()
+        .map_err(|e| format!("projects lock poisoned: {}", e))?;
+    let target = normalize_project_path(&path);
+    let mut projects = read_projects_file()?;
+    if let Some(p) = projects
+        .iter_mut()
+        .find(|p| normalize_project_path(&p.path) == target)
+    {
+        p.last_opened = last_opened;
+        write_projects_file(&projects)?;
+    }
     Ok(())
 }
 
@@ -1297,9 +1463,10 @@ fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), St
             .as_millis()
     );
 
+    // Project windows boot with ?folder=; bare windows land on the picker.
     let url = match &path {
         Some(p) => format!("index.html?folder={}", urlencoding::encode(p)),
-        None => "index.html?pick=1".to_string(),
+        None => "index.html".to_string(),
     };
 
     let title = path
@@ -1314,7 +1481,86 @@ fn open_new_window(path: Option<String>, app: tauri::AppHandle) -> Result<(), St
         .build()
         .map_err(|e| e.to_string())?;
 
+    // Registration is handled by the frontend when `enterWorkspace` runs, so
+    // both "new window with ?folder=" and "current window takes over a project"
+    // register through the same path.
     Ok(())
+}
+
+#[tauri::command]
+fn register_project_window(
+    path: String,
+    label: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let canonical = normalize_project_path(&path);
+    if let Ok(mut map) = state.project_windows.lock() {
+        // Drop any stale entry that was registered under this same label (e.g. a
+        // different project previously held this window) so a label only points
+        // at one project at a time.
+        map.retain(|_, v| v != &label);
+        map.insert(canonical, label);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unregister_project_window(
+    path: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let canonical = normalize_project_path(&path);
+    if let Ok(mut map) = state.project_windows.lock() {
+        map.remove(&canonical);
+    }
+    Ok(())
+}
+
+/// Remove every entry in the map whose value equals `label`. Called when a
+/// window enters picker mode so a stale registration (from Cmd+R, a crash,
+/// or any non-"← Projects" path) doesn't make focus_project_window think
+/// this window is still hosting a project.
+#[tauri::command]
+fn unregister_window_label(
+    label: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    if let Ok(mut map) = state.project_windows.lock() {
+        map.retain(|_, v| v != &label);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn focus_project_window(
+    path: String,
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<bool, String> {
+    let canonical = normalize_project_path(&path);
+    // Single critical section so no other thread can insert a fresh entry
+    // between our read and the stale-remove in the `None` branch.
+    let mut map = state
+        .project_windows
+        .lock()
+        .map_err(|e| format!("project_windows lock poisoned: {}", e))?;
+    let Some(label) = map.get(&canonical).cloned() else {
+        return Ok(false);
+    };
+
+    match app.get_webview_window(&label) {
+        Some(win) => {
+            // show() first in case the window is hidden/minimized; focus() alone doesn't restore.
+            let _ = win.show();
+            win.set_focus().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => {
+            // Stale entry — the window was closed. Drop it so the caller can open fresh.
+            map.remove(&canonical);
+            Ok(false)
+        }
+    }
 }
 
 pub fn run() {
@@ -1323,6 +1569,8 @@ pub fn run() {
         next_id: Arc::new(Mutex::new(0)),
         fs_watcher: Arc::new(Mutex::new(HashMap::new())),
         git_op_pid: Arc::new(Mutex::new(None)),
+        project_windows: Arc::new(Mutex::new(HashMap::new())),
+        projects_file_lock: Arc::new(Mutex::new(())),
     };
 
     tauri::Builder::default()
@@ -1346,6 +1594,11 @@ pub fn run() {
             create_branch,
             load_settings,
             save_settings,
+            load_projects,
+            add_project,
+            remove_project,
+            rename_project,
+            touch_project,
             search_files,
             pick_directory,
             reveal_in_finder,
@@ -1380,7 +1633,11 @@ pub fn run() {
             get_remote_url,
             watch_directory,
             unwatch_directory,
-            open_new_window
+            open_new_window,
+            focus_project_window,
+            register_project_window,
+            unregister_project_window,
+            unregister_window_label
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
