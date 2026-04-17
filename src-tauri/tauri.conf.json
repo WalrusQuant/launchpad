@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicovank/tauri-v2-schema/refs/heads/main/schema.json",
   "productName": "Launchpad",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.adamwickwire.launchpad",
   "build": {
     "frontendDist": "../dist",
