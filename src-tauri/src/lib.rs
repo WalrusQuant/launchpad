@@ -111,7 +111,12 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
     // Override / set the terminal-identifying vars that iTerm and Terminal.app set.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "Launchpad");
+    // Masquerade as Apple_Terminal: Charm/termenv (crush, opencode, etc.) branches
+    // on TERM_PROGRAM to pick a capability profile. An unknown value falls back to
+    // modern terminal probes (OSC 10/11, DA queries) that xterm.js doesn't fully
+    // answer, deadlocking Bubble Tea's startup and leaving a blank screen.
+    // Apple_Terminal is the most conservative known-good profile.
+    cmd.env("TERM_PROGRAM", "Apple_Terminal");
     // Ensure UTF-8 locale so multi-byte glyph widths get measured correctly.
     if std::env::var("LANG").is_err() {
         cmd.env("LANG", "en_US.UTF-8");
