@@ -79,7 +79,22 @@ function isPreviewable(name) {
   return previewExts.has(ext);
 }
 
-async function loadDirectory(path, parentEl, depth = 0) {
+// Top-level loads are serialized so rapid user actions (toggle-hidden,
+// search input, setRoot) can't race and swap stale trees into the DOM.
+// Recursive child loads (depth > 0) run inside their parent's promise and
+// don't need the guard.
+let topLoadChain = Promise.resolve();
+
+function loadDirectory(path, parentEl, depth = 0) {
+  if (depth > 0) return _doLoadDirectory(path, parentEl, depth);
+  const next = topLoadChain
+    .catch(() => {})
+    .then(() => _doLoadDirectory(path, parentEl, 0));
+  topLoadChain = next;
+  return next;
+}
+
+async function _doLoadDirectory(path, parentEl, depth = 0) {
   try {
     // Show skeleton placeholder while loading (only for initial empty load)
     if (depth === 0 && parentEl.children.length === 0) {

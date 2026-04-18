@@ -226,7 +226,7 @@ async function createPane(parentEl, cwd) {
     fitAddon.fit();
     // Pass actual dimensions so the PTY starts at the right size — no resize race
     const result = await invoke("spawn_pty", {
-      cwd: cwd || getCurrentPath() || undefined,
+      cwd: cwd || undefined,
       rows: term.rows,
       cols: term.cols,
     });
@@ -310,18 +310,9 @@ async function splitPane() {
   tab.panes.push(secondPane);
   tab.activePane = 1;
 
-  // Split handle drag
-  let isSplitDragging = false;
-  handle.addEventListener("mousedown", (e) => {
-    isSplitDragging = true;
-    handle.classList.add("dragging");
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    e.preventDefault();
-  });
-
+  // Split handle drag — listeners are scoped to each drag session so repeated
+  // split/unsplit cycles don't accumulate orphaned document-level handlers.
   const onMouseMove = (e) => {
-    if (!isSplitDragging) return;
     const rect = tab.containerEl.getBoundingClientRect();
     const pct = ((e.clientX - rect.left) / rect.width) * 100;
     const clamped = Math.min(Math.max(pct, 20), 80);
@@ -330,17 +321,22 @@ async function splitPane() {
   };
 
   const onMouseUp = () => {
-    if (isSplitDragging) {
-      isSplitDragging = false;
-      handle.classList.remove("dragging");
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      fitAllPanes(tab);
-    }
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onMouseUp);
+    handle.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    fitAllPanes(tab);
   };
 
-  document.addEventListener("mousemove", onMouseMove);
-  document.addEventListener("mouseup", onMouseUp);
+  handle.addEventListener("mousedown", (e) => {
+    handle.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+    e.preventDefault();
+  });
 
   // Click to focus pane
   tab.panes[0].el.addEventListener("click", () => { tab.activePane = 0; });
@@ -903,28 +899,48 @@ listen("pty-exit", (event) => {
   paneMap.delete(tab_id);
   for (const [uiId, tab] of tabs) {
     if (tab.type !== "terminal") continue;
-    if (tab.panes.some((p) => p.ptyId === tab_id)) {
-      const exitedPane = tab.panes.find((p) => p.ptyId === tab_id);
-      if (exitedPane) exitedPane.ptyId = null;
-      // Route to correct close function based on which group owns the tab
-      if (tab._rightGroup) closeRightTab(uiId);
-      else closeTab(uiId);
+    const exitedPane = tab.panes.find((p) => p.ptyId === tab_id);
+    if (!exitedPane) continue;
+    exitedPane.ptyId = null;
+
+    // Split tab with a surviving sibling: collapse just the exited pane
+    // rather than closing the whole tab, which would kill the healthy shell
+    // after a confusing "running process" prompt.
+    const survivor = tab.panes.find((p) => p !== exitedPane && p.ptyId !== null);
+    if (tab.panes.length === 2 && survivor) {
+      exitedPane.term.dispose();
+      exitedPane.el.remove();
+      tab.panes = tab.panes.filter((p) => p !== exitedPane);
+      const handle = tab.containerEl.querySelector(".split-handle");
+      if (handle) handle.remove();
+      tab.containerEl.classList.remove("split");
+      tab.panes[0].el.style.width = "";
+      tab.activePane = 0;
+      fitAllPanes(tab, { immediate: true });
+      tab.panes[0].term.focus();
       break;
     }
+
+    // Otherwise (single-pane tab, or both panes exited): close the tab.
+    if (tab._rightGroup) closeRightTab(uiId);
+    else closeTab(uiId);
+    break;
   }
 });
 
 // Listen for filesystem changes — refresh file browser and git panel
 let fsRefreshScheduled = false;
 listen("fs-changed", (event) => {
-  const { path } = event.payload;
-  if (path !== getCurrentPath()) return;
+  const project = getActiveProject();
+  // Watcher is only started for the active project root, so a mismatch means
+  // this event is from a stale watcher the frontend no longer cares about.
+  if (!project || event.payload.path !== project.path) return;
   if (fsRefreshScheduled) return;
   fsRefreshScheduled = true;
   setTimeout(async () => {
     fsRefreshScheduled = false;
     refreshFileBrowser();
-    fetchGitStatus(getCurrentPath());
+    fetchGitStatus(project.path);
     refreshPanel(null, true);
 
     // Check open editor tabs for external file changes
@@ -1585,7 +1601,7 @@ async function createTabInRight() {
   }
 }
 
-function moveTabToRight(uiId) {
+async function moveTabToRight(uiId) {
   if (!isSplit) return;
   const tab = tabs.get(uiId);
   if (!tab) return;
@@ -1599,9 +1615,11 @@ function moveTabToRight(uiId) {
       // Switch left group — this hides the old active tab, shows the new one
       switchTab(leftTabs[leftTabs.length - 1]);
     } else {
-      // No other left tabs — just clear activeTabUiId so switchTab won't hide this tab later
+      // Last tab leaving the left group: mint a fresh terminal so the group
+      // doesn't end up with activeTabUiId === -1 and a dead `+` button.
       tab.containerEl.style.display = "none";
       activeTabUiId = -1;
+      await createTab();
     }
   } else {
     tab.containerEl.style.display = "none";
@@ -1710,40 +1728,39 @@ async function splitWorkspace() {
   document.getElementById("group-left").addEventListener("mousedown", () => setFocusedGroup("left"));
   rightGroup.addEventListener("mousedown", () => setFocusedGroup("right"));
 
-  // Split handle drag
-  let isDragging = false;
-  splitHandleEl.addEventListener("mousedown", (e) => {
-    isDragging = true;
-    splitHandleEl.classList.add("dragging");
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    e.preventDefault();
-  });
-  document.addEventListener("mousemove", (e) => {
-    if (!isDragging) return;
+  // Split handle drag — scope listeners to each drag session so repeated
+  // Cmd+\ toggles don't leave orphaned document-level handlers behind.
+  const onSplitMove = (e) => {
     const rect = wrapper.getBoundingClientRect();
     const pct = ((e.clientX - rect.left) / rect.width) * 100;
     const clamped = Math.min(Math.max(pct, 20), 80);
     document.getElementById("group-left").style.flex = `0 0 ${clamped}%`;
     rightGroup.style.flex = `0 0 ${100 - clamped}%`;
-  });
-  document.addEventListener("mouseup", () => {
-    if (isDragging) {
-      isDragging = false;
-      splitHandleEl.classList.remove("dragging");
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      // Refit both groups' active terminals — their container widths just
-      // changed via flex, but xterm's internal col/row count is still the
-      // pre-drag value. Without this, xterm's grid is CSS-stretched and
-      // characters render at wrong positions.
-      const leftTab = tabs.get(activeTabUiId);
-      if (leftTab?.type === "terminal") fitAllPanes(leftTab);
-      if (rightActiveTabUiId !== -1) {
-        const rightTab = tabs.get(rightActiveTabUiId);
-        if (rightTab?.type === "terminal") fitAllPanes(rightTab);
-      }
+  };
+  const onSplitUp = () => {
+    document.removeEventListener("mousemove", onSplitMove);
+    document.removeEventListener("mouseup", onSplitUp);
+    splitHandleEl.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    // Refit both groups' active terminals — their container widths just
+    // changed via flex, but xterm's internal col/row count is still the
+    // pre-drag value. Without this, xterm's grid is CSS-stretched and
+    // characters render at wrong positions.
+    const leftTab = tabs.get(activeTabUiId);
+    if (leftTab?.type === "terminal") fitAllPanes(leftTab);
+    if (rightActiveTabUiId !== -1) {
+      const rightTab = tabs.get(rightActiveTabUiId);
+      if (rightTab?.type === "terminal") fitAllPanes(rightTab);
     }
+  };
+  splitHandleEl.addEventListener("mousedown", (e) => {
+    splitHandleEl.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onSplitMove);
+    document.addEventListener("mouseup", onSplitUp);
+    e.preventDefault();
   });
 
   // Drag between groups is handled by custom mouse drag (startTabDrag)

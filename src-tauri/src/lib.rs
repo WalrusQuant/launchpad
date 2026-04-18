@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
@@ -32,8 +32,13 @@ struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
     fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
-    // PID of in-flight git network operation (push/pull/fetch/merge) — used by cancel_git_op
-    git_op_pid: Arc<Mutex<Option<u32>>>,
+    // In-flight git network operation (push/pull/fetch/merge). `(op_id, pid)`
+    // lets run_git_cancellable's cleanup avoid clearing a slot that a later
+    // operation has already claimed — critical if a cancel already took the
+    // previous slot and the next operation was spawned before we could clean
+    // up. op_id is a monotonically-increasing tag from `git_op_counter`.
+    git_op_pid: Arc<Mutex<Option<(u64, u32)>>>,
+    git_op_counter: Arc<AtomicU64>,
     // Canonicalized project path → Tauri window label. Used by focus_project_window
     // to focus an existing window instead of opening a duplicate. Stale entries are
     // cleaned lazily on focus attempt (when get_webview_window returns None).
@@ -200,6 +205,15 @@ fn start_pty_reader(tab_id: u32, state: State<AppState>, app: tauri::AppHandle) 
                             .expect("valid_up_to guarantees valid UTF-8");
                         let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
                         leftover = leftover[valid_up_to..].to_vec();
+                    } else if leftover.len() > 64 * 1024 {
+                        // A valid UTF-8 continuation is at most 3 bytes; if we
+                        // have 64KB of invalid bytes with no valid prefix, the
+                        // stream is corrupted (binary garbage, crashed shell,
+                        // wrong encoding). Flush as replacement characters so
+                        // the buffer can't grow without bound.
+                        let output = String::from_utf8_lossy(&leftover).into_owned();
+                        let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
+                        leftover.clear();
                     }
                 }
                 Err(_) => break,
@@ -563,13 +577,18 @@ fn checkout_branch_inner(repo: &Repository, branch_name: &str) -> Result<(), Str
         .ok_or("Invalid branch reference")?
         .to_string();
 
-    repo.set_head(&refname).map_err(|e| e.to_string())?;
+    // Resolve the target tree and attempt a safe checkout first. libgit2 will
+    // error if the operation would overwrite uncommitted changes — matching
+    // `git checkout <branch>` behavior. Only move HEAD after the working tree
+    // is successfully updated so a failure here doesn't leave HEAD pointing
+    // at a branch whose tree we never actually checked out.
+    let target_commit = branch.get().peel_to_commit().map_err(|e| e.to_string())?;
+    let target_tree = target_commit.tree().map_err(|e| e.to_string())?;
 
-    repo.checkout_head(Some(
-        git2::build::CheckoutBuilder::new()
-            .force(),
-    ))
-    .map_err(|e| e.to_string())?;
+    repo.checkout_tree(target_tree.as_object(), None)
+        .map_err(|e| e.to_string())?;
+
+    repo.set_head(&refname).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -1044,7 +1063,12 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
 
 // Runs a git command as a spawned process, storing its PID in AppState so
 // cancel_git_op can kill it. Returns stdout on success, stderr on failure.
-fn run_git_cancellable(args: &[&str], path: &str, pid_store: &Arc<Mutex<Option<u32>>>) -> Result<String, String> {
+fn run_git_cancellable(
+    args: &[&str],
+    path: &str,
+    pid_store: &Arc<Mutex<Option<(u64, u32)>>>,
+    counter: &Arc<AtomicU64>,
+) -> Result<String, String> {
     let child = std::process::Command::new("git")
         .args(args)
         .current_dir(path)
@@ -1053,9 +1077,24 @@ fn run_git_cancellable(args: &[&str], path: &str, pid_store: &Arc<Mutex<Option<u
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    *pid_store.lock().unwrap() = Some(child.id());
+    // Each run gets a unique op_id so the cleanup step below can tell whether
+    // the slot still belongs to us or has been claimed by a later operation.
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    *pid_store.lock().unwrap() = Some((op_id, child.id()));
+
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    *pid_store.lock().unwrap() = None;
+
+    // Only clear the slot if it still matches our op. A racing cancel_git_op
+    // may have already taken it, or a subsequent operation may already have
+    // replaced it — in either case leave it alone.
+    {
+        let mut guard = pid_store.lock().unwrap();
+        if let Some((current_id, _)) = *guard {
+            if current_id == op_id {
+                *guard = None;
+            }
+        }
+    }
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1069,7 +1108,8 @@ fn run_git_cancellable(args: &[&str], path: &str, pid_store: &Arc<Mutex<Option<u
 #[tauri::command]
 fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
     let pid_store = Arc::clone(&state.git_op_pid);
-    let result = run_git_cancellable(&["push"], &path, &pid_store);
+    let counter = Arc::clone(&state.git_op_counter);
+    let result = run_git_cancellable(&["push"], &path, &pid_store, &counter);
 
     if let Err(ref stderr) = result {
         if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
@@ -1079,7 +1119,7 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
                 .output()
                 .map_err(|e| e.to_string())?;
             let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-            return run_git_cancellable(&["push", "--set-upstream", "origin", &branch], &path, &pid_store);
+            return run_git_cancellable(&["push", "--set-upstream", "origin", &branch], &path, &pid_store, &counter);
         }
     }
     result
@@ -1087,17 +1127,27 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
 
 #[tauri::command]
 fn git_pull(path: String, state: State<AppState>) -> Result<String, String> {
-    run_git_cancellable(&["pull"], &path, &Arc::clone(&state.git_op_pid))
+    run_git_cancellable(
+        &["pull"],
+        &path,
+        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_counter),
+    )
 }
 
 #[tauri::command]
 fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
-    run_git_cancellable(&["fetch", "--all"], &path, &Arc::clone(&state.git_op_pid))
+    run_git_cancellable(
+        &["fetch", "--all"],
+        &path,
+        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_counter),
+    )
 }
 
 #[tauri::command]
 fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
-    if let Some(pid) = state.git_op_pid.lock().unwrap().take() {
+    if let Some((_op_id, pid)) = state.git_op_pid.lock().unwrap().take() {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .output();
@@ -1574,6 +1624,7 @@ pub fn run() {
         next_id: Arc::new(Mutex::new(0)),
         fs_watcher: Arc::new(Mutex::new(HashMap::new())),
         git_op_pid: Arc::new(Mutex::new(None)),
+        git_op_counter: Arc::new(AtomicU64::new(0)),
         project_windows: Arc::new(Mutex::new(HashMap::new())),
         projects_file_lock: Arc::new(Mutex::new(())),
     };
