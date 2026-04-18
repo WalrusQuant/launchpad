@@ -13,6 +13,7 @@ export const ACTIONS = [
   { id: "focusRightGroup",     label: "Focus right group",       default: "Cmd+Alt+ArrowRight" },
   { id: "moveTabToOtherGroup", label: "Move tab to other group", default: "Cmd+Shift+M" },
   { id: "gitPanel",            label: "Toggle git panel",        default: "Cmd+G" },
+  { id: "toggleSidebar",       label: "Toggle sidebar",          default: "Cmd+B" },
   { id: "quickOpen",           label: "Quick open file",         default: "Cmd+P" },
   { id: "projectFind",         label: "Find in project",         default: "Cmd+Shift+F" },
   { id: "findInEditor",        label: "Find in editor",          default: "Cmd+F" },

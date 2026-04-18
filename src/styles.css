@@ -351,6 +351,21 @@ html, body, #app {
   overflow: hidden;
 }
 
+#sidebar.collapsed {
+  width: 0 !important;
+  min-width: 0;
+  border-right: none;
+}
+
+#resize-handle.collapsed {
+  display: none;
+}
+
+#toggle-sidebar.active {
+  background: var(--surface-8);
+  color: var(--text-11);
+}
+
 #sidebar-header {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border-1);

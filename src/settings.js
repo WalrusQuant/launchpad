@@ -2,6 +2,7 @@ const { invoke } = window.__TAURI__.core;
 
 let settings = {
   sidebarWidth: 260,
+  sidebarCollapsed: false,
   appTheme: "auto", // "auto" | "dark" | "light"
 
   // Terminal

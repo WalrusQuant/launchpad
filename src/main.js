@@ -1192,6 +1192,27 @@ document.addEventListener("mouseup", () => {
   }
 });
 
+function setSidebarCollapsed(collapsed, { persist = true } = {}) {
+  sidebar.classList.toggle("collapsed", collapsed);
+  resizeHandle.classList.toggle("collapsed", collapsed);
+  const btn = document.getElementById("toggle-sidebar");
+  if (btn) btn.classList.toggle("active", collapsed);
+  if (persist) saveSetting("sidebarCollapsed", collapsed);
+  // Reflow terminals after width change settles
+  requestAnimationFrame(() => {
+    const tab = tabs.get(activeTabUiId);
+    if (tab?.type === "terminal") fitAllPanes(tab);
+    const rightTab = tabs.get(rightActiveTabUiId);
+    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+  });
+}
+
+function toggleSidebar() {
+  setSidebarCollapsed(!sidebar.classList.contains("collapsed"));
+}
+
+document.getElementById("toggle-sidebar").addEventListener("click", toggleSidebar);
+
 // Terminal drag-drop: drop file path into terminal
 terminalContainer.addEventListener("dragover", (e) => {
   e.preventDefault();
@@ -1360,6 +1381,11 @@ document.addEventListener("keydown", (e) => {
   if (keyMatches(e, "shortcutsModal")) {
     e.preventDefault();
     document.getElementById("shortcuts-modal").classList.toggle("shortcuts-visible");
+    return;
+  }
+  if (keyMatches(e, "toggleSidebar")) {
+    e.preventDefault();
+    toggleSidebar();
     return;
   }
   if (e.key === "Escape") {
@@ -2034,6 +2060,7 @@ async function enterWorkspace(project, settings) {
   if (settings.sidebarWidth) {
     sidebar.style.width = settings.sidebarWidth + "px";
   }
+  setSidebarCollapsed(!!settings.sidebarCollapsed, { persist: false });
 
   // Init file browser FIRST so getCurrentPath() is set before the terminal spawns
   await initFileBrowser(() => getActivePtyId(), (filePath) => createEditorTab(filePath), project.path);
