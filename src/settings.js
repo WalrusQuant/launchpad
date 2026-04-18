@@ -2,6 +2,7 @@ const { invoke } = window.__TAURI__.core;
 
 let settings = {
   sidebarWidth: 260,
+  appTheme: "auto", // "auto" | "dark" | "light"
 
   // Terminal
   termFontSize: 13,
@@ -13,6 +14,7 @@ let settings = {
   editorFontSize: 12,
   editorTabSize: 2,
   editorWordWrap: false,
+  editorVimMode: false,
   // Git
   gitPollInterval: 3,
   gitDefaultPrefix: "",

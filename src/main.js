@@ -5,11 +5,16 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling } from "./git.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
+import { initTheme, setTheme, getResolvedTheme, onThemeChange } from "./theme.js";
 import { initQuickOpen, show as showQuickOpen } from "./quickopen.js";
+import { initProjectSearch, showProjectSearch } from "./projectsearch.js";
+import { loadFileSettings, getOverrides, setOverride } from "./filesettings.js";
+import { matches as keyMatches } from "./keymap.js";
 import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
@@ -139,7 +144,7 @@ function updateDebugButton() {
   }
 }
 
-const terminalTheme = {
+const darkTerminalTheme = {
   background: "#1a1a1a",
   foreground: "#e0e0e0",
   cursor: "#e0e0e0",
@@ -163,12 +168,40 @@ const terminalTheme = {
   brightWhite: "#ffffff",
 };
 
+const lightTerminalTheme = {
+  background: "#fafafa",
+  foreground: "#383a42",
+  cursor: "#383a42",
+  cursorAccent: "#fafafa",
+  selectionBackground: "#d0d0d0",
+  black: "#383a42",
+  red: "#e45649",
+  green: "#50a14f",
+  yellow: "#c18401",
+  blue: "#4078f2",
+  magenta: "#a626a4",
+  cyan: "#0184bc",
+  white: "#a0a1a7",
+  brightBlack: "#696c77",
+  brightRed: "#e45649",
+  brightGreen: "#50a14f",
+  brightYellow: "#c18401",
+  brightBlue: "#4078f2",
+  brightMagenta: "#a626a4",
+  brightCyan: "#0184bc",
+  brightWhite: "#383a42",
+};
+
+function getTerminalTheme() {
+  return getResolvedTheme() === "light" ? lightTerminalTheme : darkTerminalTheme;
+}
+
 async function createPane(parentEl, cwd) {
   const s = getSettings();
   const term = new Terminal({
     fontFamily: s.termFontFamily,
     fontSize: s.termFontSize,
-    theme: terminalTheme,
+    theme: getTerminalTheme(),
     cursorBlink: s.termCursorBlink,
     cursorStyle: s.termCursorStyle,
     scrollback: s.termScrollback,
@@ -500,11 +533,13 @@ async function doCloseTab(uiId) {
 }
 
 // Editor tab management
-async function createEditorTab(filePath) {
+async function createEditorTab(filePath, options = {}) {
+  const { line, column } = options;
   // Deduplicate: if already open, switch to it
   for (const [uiId, tab] of tabs) {
     if (tab.type === "editor" && tab.filePath === filePath) {
       switchTab(uiId);
+      if (line) requestAnimationFrame(() => gotoLine(tab.editorView, line, column));
       return uiId;
     }
   }
@@ -565,30 +600,40 @@ async function createEditorTab(filePath) {
   };
 
   const editorSettings = getSettings();
-  const editorView = createEditor(editorContent, content, fileName, {
+  const overrides = getOverrides(filePath) || {};
+  const effectiveTabSize = overrides.tabSize ?? editorSettings.editorTabSize;
+  const effectiveWordWrap = overrides.wordWrap ?? editorSettings.editorWordWrap;
+
+  // Detect line endings from the raw content — preserve what the file already uses.
+  const lineEndings = overrides.lineEndings || (content.includes("\r\n") ? "CRLF" : "LF");
+
+  tab.tabSize = effectiveTabSize;
+  tab.wordWrap = effectiveWordWrap;
+  tab.lineEndings = lineEndings;
+
+  const updateStatus = () => renderEditorStatus(tab, statusBar);
+
+  const editorHandle = createEditor(editorContent, content, fileName, {
     onChange: (newContent) => {
       tab.modified = newContent !== tab.originalContent;
       renderTabBar();
-      // Update undo/redo in status bar
-      if (tab.editorView) {
-        const ud = undoDepth(tab.editorView.state);
-        const rd = redoDepth(tab.editorView.state);
-        const pos = tab.editorView.state.selection.main.head;
-        const ln = tab.editorView.state.doc.lineAt(pos);
-        statusBar.textContent = `Ln ${ln.number}, Col ${pos - ln.from + 1} · ${getLangName(fileName)}${ud || rd ? ` · Undo: ${ud} Redo: ${rd}` : ""}`;
-      }
+      updateStatus();
     },
     onCursorChange: (line, col) => {
-      const ud = tab.editorView ? undoDepth(tab.editorView.state) : 0;
-      const rd = tab.editorView ? redoDepth(tab.editorView.state) : 0;
-      statusBar.textContent = `Ln ${line}, Col ${col} · ${getLangName(fileName)}${ud || rd ? ` · Undo: ${ud} Redo: ${rd}` : ""}`;
+      tab.cursor = { line, col };
+      updateStatus();
     },
-    tabSize: editorSettings.editorTabSize,
-    wordWrap: editorSettings.editorWordWrap,
+    tabSize: effectiveTabSize,
+    wordWrap: effectiveWordWrap,
+    vimMode: editorSettings.editorVimMode,
+    theme: getResolvedTheme(),
   });
 
+  const editorView = editorHandle.view;
   tab.editorView = editorView;
+  tab.editorHandle = editorHandle;
   tabs.set(uiId, tab);
+  updateStatus();
 
   // Right-click context menu for editor
   editorContent.addEventListener("contextmenu", (e) => {
@@ -668,7 +713,100 @@ async function createEditorTab(filePath) {
 
   renderTabBar();
   switchTab(uiId);
+  if (line) requestAnimationFrame(() => gotoLine(editorView, line, column));
   return uiId;
+}
+
+const TAB_SIZE_CYCLE = [2, 4, 8];
+
+function renderEditorStatus(tab, statusBar) {
+  const view = tab.editorView;
+  const ud = view ? undoDepth(view.state) : 0;
+  const rd = view ? redoDepth(view.state) : 0;
+  const { line, col } = tab.cursor || { line: 1, col: 1 };
+
+  statusBar.innerHTML = "";
+
+  const pos = document.createElement("span");
+  pos.className = "esb-pos";
+  pos.textContent = `Ln ${line}, Col ${col}`;
+  statusBar.appendChild(pos);
+
+  const addSep = () => {
+    const s = document.createElement("span");
+    s.className = "esb-sep";
+    s.textContent = "·";
+    statusBar.appendChild(s);
+  };
+
+  addSep();
+  const lang = document.createElement("span");
+  lang.className = "esb-lang";
+  lang.textContent = getLangName(tab.fileName);
+  statusBar.appendChild(lang);
+
+  addSep();
+  const lineEnd = document.createElement("span");
+  lineEnd.className = "esb-item esb-click";
+  lineEnd.title = "Click to toggle line endings";
+  lineEnd.textContent = tab.lineEndings;
+  lineEnd.addEventListener("click", async () => {
+    tab.lineEndings = tab.lineEndings === "LF" ? "CRLF" : "LF";
+    await setOverride(tab.filePath, "lineEndings", tab.lineEndings);
+    renderEditorStatus(tab, statusBar);
+    tab.modified = true;
+    renderTabBar();
+  });
+  statusBar.appendChild(lineEnd);
+
+  addSep();
+  const tabSize = document.createElement("span");
+  tabSize.className = "esb-item esb-click";
+  tabSize.title = "Click to change tab size";
+  tabSize.textContent = `Tab ${tab.tabSize}`;
+  tabSize.addEventListener("click", async () => {
+    const idx = TAB_SIZE_CYCLE.indexOf(tab.tabSize);
+    const next = TAB_SIZE_CYCLE[(idx + 1) % TAB_SIZE_CYCLE.length];
+    tab.tabSize = next;
+    tab.editorHandle.setTabSize(next);
+    await setOverride(tab.filePath, "tabSize", next);
+    renderEditorStatus(tab, statusBar);
+  });
+  statusBar.appendChild(tabSize);
+
+  addSep();
+  const wrap = document.createElement("span");
+  wrap.className = "esb-item esb-click" + (tab.wordWrap ? " esb-active" : "");
+  wrap.title = "Click to toggle word wrap";
+  wrap.textContent = tab.wordWrap ? "Wrap" : "No Wrap";
+  wrap.addEventListener("click", async () => {
+    tab.wordWrap = !tab.wordWrap;
+    tab.editorHandle.setWordWrap(tab.wordWrap);
+    await setOverride(tab.filePath, "wordWrap", tab.wordWrap);
+    renderEditorStatus(tab, statusBar);
+  });
+  statusBar.appendChild(wrap);
+
+  if (ud || rd) {
+    addSep();
+    const hist = document.createElement("span");
+    hist.className = "esb-hist";
+    hist.textContent = `Undo: ${ud} Redo: ${rd}`;
+    statusBar.appendChild(hist);
+  }
+}
+
+function gotoLine(view, lineNum, col) {
+  if (!view) return;
+  const doc = view.state.doc;
+  const target = Math.max(1, Math.min(lineNum, doc.lines));
+  const lineInfo = doc.line(target);
+  const pos = lineInfo.from + Math.max(0, (col || 1) - 1);
+  view.dispatch({
+    selection: { anchor: pos },
+    effects: EditorView.scrollIntoView(pos, { y: "center" }),
+  });
+  view.focus();
 }
 
 async function saveEditorTab(uiId) {
@@ -676,9 +814,12 @@ async function saveEditorTab(uiId) {
   if (!tab || tab.type !== "editor") return;
 
   try {
-    const content = tab.editorView.state.doc.toString();
+    let content = tab.editorView.state.doc.toString();
+    if (tab.lineEndings === "CRLF") {
+      content = content.replace(/\r?\n/g, "\r\n");
+    }
     await invoke("write_file", { path: tab.filePath, content });
-    tab.originalContent = content;
+    tab.originalContent = tab.editorView.state.doc.toString();
     tab.modified = false;
     renderTabBar();
     // Flash the tab label green briefly to confirm save
@@ -750,6 +891,20 @@ function applySettingLive(key, value) {
 
   if (key === "gitPollInterval") {
     startGitPolling(getCurrentPath, value);
+  }
+
+  if (key === "appTheme") {
+    setTheme(value);
+  }
+}
+
+function refreshTerminalsForTheme() {
+  const nextTerm = getTerminalTheme();
+  for (const tab of tabs.values()) {
+    if (tab.type !== "terminal") continue;
+    for (const pane of tab.panes) {
+      pane.term.options.theme = nextTerm;
+    }
   }
 }
 
@@ -1123,42 +1278,47 @@ document.addEventListener("keydown", (e) => {
   const activeTab = tabs.get(activeTabUiId);
   const isEditorTab = activeTab?.type === "editor";
 
-  if (e.metaKey && e.shiftKey && (e.key === "N" || e.key === "n")) {
+  if (keyMatches(e, "newWindow")) {
     e.preventDefault();
     invoke("open_new_window", { path: null });
     return;
   }
-  if (e.metaKey && e.key === ",") {
+  if (keyMatches(e, "openSettings")) {
     e.preventDefault();
     openSettingsTab();
     return;
   }
-  if (e.metaKey && e.key === "s") {
+  if (keyMatches(e, "saveFile")) {
     e.preventDefault();
     if (isEditorTab) {
       saveEditorTab(activeTabUiId);
     }
     return;
   }
-  if (e.metaKey && e.key === "p") {
+  if (keyMatches(e, "quickOpen")) {
     e.preventDefault();
     showQuickOpen(getCurrentPath());
     return;
   }
-  // Cmd+F: let CodeMirror handle it for editor tabs, sidebar search for terminal tabs
-  if (e.metaKey && e.key === "f") {
+  if (keyMatches(e, "projectFind")) {
+    e.preventDefault();
+    showProjectSearch();
+    return;
+  }
+  // Find in editor: let CodeMirror handle it for editor tabs
+  if (keyMatches(e, "findInEditor")) {
     if (isEditorTab) {
       e.preventDefault();
       return;
     }
   }
-  if (e.metaKey && e.key === "h") {
+  if (keyMatches(e, "findReplace")) {
     if (isEditorTab) {
       e.preventDefault();
       return;
     }
   }
-  if (e.metaKey && e.key === "k") {
+  if (keyMatches(e, "clearTerminal")) {
     e.preventDefault();
     if (activeTab?.type === "terminal") {
       const pane = activeTab.panes[activeTab.activePane] || activeTab.panes[0];
@@ -1166,44 +1326,38 @@ document.addEventListener("keydown", (e) => {
       pane.term.focus();
     }
   }
-  if (e.metaKey && e.key === "t") {
+  if (keyMatches(e, "newTab")) {
     e.preventDefault();
     if (isSplit && focusedGroup === "right") createTabInRight();
     else createTab();
   }
-  if (e.metaKey && e.key === "w") {
+  if (keyMatches(e, "closeTab")) {
     e.preventDefault();
     if (isSplit && focusedGroup === "right") closeRightTab(rightActiveTabUiId);
     else closeTab(activeTabUiId);
   }
-  if (e.metaKey && e.key === "d") {
+  if (keyMatches(e, "splitPane")) {
     e.preventDefault();
     if (!isEditorTab) splitPane();
   }
-  // Cmd+\ — split/unsplit workspace
-  if (e.metaKey && e.key === "\\") {
+  if (keyMatches(e, "splitWorkspace")) {
     e.preventDefault();
     splitWorkspace();
   }
-  // Cmd+Option+Left/Right — switch focused group
-  if (e.metaKey && e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight") && isSplit) {
+  if (isSplit && (keyMatches(e, "focusLeftGroup") || keyMatches(e, "focusRightGroup"))) {
     e.preventDefault();
-    setFocusedGroup(focusedGroup === "left" ? "right" : "left");
+    setFocusedGroup(keyMatches(e, "focusLeftGroup") ? "left" : "right");
   }
-  // Cmd+Shift+M — move tab to other group
-  if (e.metaKey && e.shiftKey && e.key === "M" && isSplit) {
+  if (keyMatches(e, "moveTabToOtherGroup") && isSplit) {
     e.preventDefault();
     if (focusedGroup === "left") moveTabToRight(activeTabUiId);
     else moveTabToLeft(rightActiveTabUiId);
   }
-  // Cmd+Shift+X — drop a mark in the debug log (when capturing).
-  // Use this the moment you see a ghost character so I can find the event.
-  if (e.metaKey && e.shiftKey && (e.key === "X" || e.key === "x") && debugCaptureActive) {
+  if (keyMatches(e, "debugDump") && debugCaptureActive) {
     e.preventDefault();
     markDebug("USER_MARK");
   }
-  // Cmd+/ — toggle keyboard shortcuts modal
-  if (e.metaKey && e.key === "/") {
+  if (keyMatches(e, "shortcutsModal")) {
     e.preventDefault();
     document.getElementById("shortcuts-modal").classList.toggle("shortcuts-visible");
     return;
@@ -1829,6 +1983,9 @@ async function openProjectInWindow(project, settings) {
 // Boot
 async function boot() {
   const settings = await loadSettings();
+  initTheme(settings.appTheme);
+  onThemeChange(refreshTerminalsForTheme);
+  await loadFileSettings();
 
   // A window booting with ?folder= is a dedicated project window — enter it directly.
   const params = new URLSearchParams(window.location.search);
@@ -1895,6 +2052,7 @@ async function enterWorkspace(project, settings) {
   const projectPathFn = () => project.path;
   invoke("watch_directory", { path: project.path });
   initQuickOpen(projectPathFn, (fullPath) => createEditorTab(fullPath));
+  initProjectSearch(projectPathFn, (fullPath, opts) => createEditorTab(fullPath, opts));
   initGitPanel(projectPathFn, (filePath) => createEditorTab(filePath));
   fetchGitStatus(project.path);
   startGitPolling(projectPathFn, settings.gitPollInterval);

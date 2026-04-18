@@ -1,5 +1,6 @@
 import { showDiffPreview, refreshFileBrowser } from "./filebrowser.js";
 import { setPanelTransitioning } from "./main.js";
+import { matches as keyMatches } from "./keymap.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -42,7 +43,7 @@ export function initGitPanel(getPath, openFileCb) {
   toggleBtn.addEventListener("click", () => togglePanel());
 
   document.addEventListener("keydown", (e) => {
-    if (e.metaKey && e.key === "g") {
+    if (keyMatches(e, "gitPanel")) {
       e.preventDefault();
       togglePanel();
     }

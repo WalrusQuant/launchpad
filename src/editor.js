@@ -1,5 +1,5 @@
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, rectangularSelection, crosshairCursor } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, indentWithTab } from "@codemirror/commands";
 import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, foldGutter, indentOnInput } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
@@ -17,6 +17,7 @@ import { yaml } from "@codemirror/lang-yaml";
 import { StreamLanguage } from "@codemirror/language";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
+import { vim } from "@replit/codemirror-vim";
 
 const langMap = {
   js: javascript,
@@ -79,43 +80,46 @@ export function getLangName(fileName) {
   return langNames[ext] || "Plain Text";
 }
 
-// Custom theme tweaks to match our app
+// Custom theme tweaks to match our app — colors driven by CSS variables so
+// they flip with the app theme.
 const launchpadTheme = EditorView.theme({
   "&": {
-    backgroundColor: "#1e1e1e",
-    color: "#ccc",
+    backgroundColor: "var(--surface-4)",
+    color: "var(--text-8)",
     fontSize: "12px",
     height: "100%",
   },
   ".cm-content": {
     fontFamily: '"SF Mono", "Menlo", monospace',
     padding: "16px 0",
+    caretColor: "var(--text-11)",
   },
   ".cm-gutters": {
-    backgroundColor: "#1e1e1e",
-    color: "#555",
+    backgroundColor: "var(--surface-4)",
+    color: "var(--text-0)",
     border: "none",
     paddingLeft: "8px",
   },
   ".cm-activeLineGutter": {
-    backgroundColor: "#252525",
+    backgroundColor: "var(--surface-7)",
   },
   ".cm-activeLine": {
-    backgroundColor: "#252525",
+    backgroundColor: "var(--surface-7)",
   },
   "&.cm-focused .cm-cursor": {
-    borderLeftColor: "#e0e0e0",
+    borderLeftColor: "var(--text-11)",
   },
   "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-    backgroundColor: "#444 !important",
+    backgroundColor: "var(--border-3) !important",
   },
   ".cm-scroller": {
     overflow: "auto",
   },
   // Search panel styling
   ".cm-panels": {
-    backgroundColor: "#252525",
-    borderBottom: "1px solid #333",
+    backgroundColor: "var(--surface-7)",
+    color: "var(--text-8)",
+    borderBottom: "1px solid var(--border-1)",
   },
   ".cm-search": {
     fontSize: "12px",
@@ -127,28 +131,33 @@ const launchpadTheme = EditorView.theme({
   // Fold gutter
   ".cm-foldGutter .cm-gutterElement": {
     cursor: "pointer",
-    color: "#666",
+    color: "var(--text-1)",
   },
   // Autocomplete
   ".cm-tooltip-autocomplete": {
-    backgroundColor: "#252525",
-    border: "1px solid #444",
+    backgroundColor: "var(--surface-7)",
+    border: "1px solid var(--border-3)",
   },
   ".cm-tooltip-autocomplete ul li": {
-    color: "#ccc",
+    color: "var(--text-8)",
   },
   ".cm-tooltip-autocomplete ul li[aria-selected]": {
-    backgroundColor: "#333",
-    color: "#fff",
+    backgroundColor: "var(--border-1)",
+    color: "var(--text-12)",
   },
 });
 
 /**
  * Create a CodeMirror editor instance.
- * Returns the EditorView — caller owns its lifecycle.
+ * Returns { view, setTabSize, setWordWrap } — caller owns the view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme } = {}) {
+  const isLight = theme === "light";
+  const tabSizeCompartment = new Compartment();
+  const wrapCompartment = new Compartment();
+
   const extensions = [
+    ...(vimMode ? [vim()] : []),
     lineNumbers(),
     highlightActiveLine(),
     highlightActiveLineGutter(),
@@ -162,13 +171,14 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     rectangularSelection(),
     crosshairCursor(),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    oneDark,
+    ...(isLight ? [] : [oneDark]),
     launchpadTheme,
     keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
-    EditorState.tabSize.of(tabSize || 2),
-    ...(wordWrap ? [EditorView.lineWrapping] : []),
+    EditorState.allowMultipleSelections.of(true),
+    tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
+    wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());
@@ -181,11 +191,21 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     }),
   ];
 
-  return new EditorView({
+  const view = new EditorView({
     state: EditorState.create({
       doc: content,
       extensions,
     }),
     parent: parentEl,
   });
+
+  return {
+    view,
+    setTabSize(n) {
+      view.dispatch({ effects: tabSizeCompartment.reconfigure(EditorState.tabSize.of(n)) });
+    },
+    setWordWrap(on) {
+      view.dispatch({ effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []) });
+    },
+  };
 }

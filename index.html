@@ -29,6 +29,7 @@
                 <span class="sc-key">⌘P</span><span class="sc-desc">Quick open file</span>
                 <span class="sc-key">⌘G</span><span class="sc-desc">Git panel</span>
                 <span class="sc-key">⌘F</span><span class="sc-desc">Find / search</span>
+                <span class="sc-key">⌘⇧F</span><span class="sc-desc">Find in project</span>
                 <span class="sc-key">⌘H</span><span class="sc-desc">Find & replace</span>
                 <span class="sc-key">⌘S</span><span class="sc-desc">Save file</span>
                 <span class="sc-key">⌘,</span><span class="sc-desc">Settings</span>
@@ -83,6 +84,20 @@
         <div id="quick-open-results">
           <div class="qo-hint">Type to search files...</div>
         </div>
+      </div>
+    </div>
+    <!-- Project-wide find overlay -->
+    <div id="project-search" role="dialog" aria-label="Find in project">
+      <div id="project-search-dialog">
+        <div id="project-search-header">
+          <input id="project-search-input" type="text" placeholder="Find in project..." autocomplete="off" />
+          <div id="project-search-opts">
+            <button id="ps-case" class="ps-opt" title="Case sensitive" aria-pressed="false">Aa</button>
+            <button id="ps-regex" class="ps-opt" title="Regex" aria-pressed="false">.*</button>
+          </div>
+        </div>
+        <div id="project-search-status" class="ps-hint">Type to search…</div>
+        <div id="project-search-results"></div>
       </div>
     </div>
     <!-- File editor/preview overlay -->

@@ -1,3 +1,5 @@
+import { ACTIONS, getBinding, setBinding, getDefault, chordFromEvent } from "./keymap.js";
+
 /**
  * Settings panel UI — renders a form with sections for all app settings.
  * Changes fire immediately via the onSettingChange callback.
@@ -12,6 +14,15 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
 
     <div class="settings-section">
       <h3 class="settings-section-title">General</h3>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-appTheme">Theme</label>
+        <select class="settings-select" id="set-appTheme">
+          <option value="auto" ${settings.appTheme === "auto" ? "selected" : ""}>System</option>
+          <option value="dark" ${settings.appTheme === "dark" ? "selected" : ""}>Dark</option>
+          <option value="light" ${settings.appTheme === "light" ? "selected" : ""}>Light</option>
+        </select>
+      </div>
 
       <div class="settings-row">
         <label class="settings-label" for="set-sidebarWidth">Sidebar Width</label>
@@ -99,6 +110,14 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
           <span class="settings-toggle-slider"></span>
         </label>
       </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-editorVimMode">Vim Mode</label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="set-editorVimMode" ${settings.editorVimMode ? "checked" : ""} />
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -126,14 +145,21 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       </div>
     </div>
 
+    <div class="settings-section">
+      <h3 class="settings-section-title">Keybindings</h3>
+      <div id="keybindings-list"></div>
+    </div>
+
     <div class="settings-footer">
       Settings are saved automatically. Config stored at <code>~/.launchpad/config.json</code>
     </div>
   `;
 
   containerEl.appendChild(content);
+  renderKeybindings(content.querySelector("#keybindings-list"));
 
   // Wire up all inputs
+  wireInput("appTheme", "change", (v) => v);
   wireInput("sidebarWidth", "input", (v) => parseInt(v) || 260);
   wireInput("termFontSize", "input", (v) => parseInt(v) || 13);
   wireInput("termFontFamily", "change", (v) => v);
@@ -143,6 +169,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   wireInput("editorFontSize", "input", (v) => parseInt(v) || 12);
   wireInput("editorTabSize", "change", (v) => parseInt(v) || 2);
   wireCheckbox("editorWordWrap");
+  wireCheckbox("editorVimMode");
   wireInput("gitPollInterval", "input", (v) => parseInt(v) || 3);
   wireInput("gitDefaultPrefix", "change", (v) => v);
 
@@ -160,6 +187,67 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
     el.addEventListener("change", () => {
       onSettingChange(key, el.checked);
     });
+  }
+}
+
+function renderKeybindings(listEl) {
+  listEl.innerHTML = "";
+  for (const action of ACTIONS) {
+    const row = document.createElement("div");
+    row.className = "settings-row kb-row";
+
+    const label = document.createElement("label");
+    label.className = "settings-label";
+    label.textContent = action.label;
+    row.appendChild(label);
+
+    const right = document.createElement("div");
+    right.className = "kb-right";
+
+    const input = document.createElement("input");
+    input.className = "settings-input kb-input";
+    input.type = "text";
+    input.readOnly = true;
+    input.value = getBinding(action.id);
+    input.placeholder = "Click then press keys";
+    input.title = "Click, then press the new chord. Esc to cancel.";
+
+    input.addEventListener("focus", () => {
+      input.classList.add("kb-capturing");
+      input.value = "Press keys…";
+    });
+    input.addEventListener("blur", () => {
+      input.classList.remove("kb-capturing");
+      input.value = getBinding(action.id);
+    });
+    input.addEventListener("keydown", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        input.blur();
+        return;
+      }
+      const chord = chordFromEvent(e);
+      if (!chord) return;
+      await setBinding(action.id, chord);
+      input.value = chord;
+      input.blur();
+    });
+
+    const reset = document.createElement("button");
+    reset.className = "settings-input-sm kb-reset";
+    reset.type = "button";
+    reset.textContent = "Reset";
+    reset.title = `Default: ${getDefault(action.id)}`;
+    reset.addEventListener("click", async () => {
+      await setBinding(action.id, getDefault(action.id));
+      input.value = getBinding(action.id);
+    });
+
+    right.appendChild(input);
+    right.appendChild(reset);
+    row.appendChild(right);
+    listEl.appendChild(row);
   }
 }
 

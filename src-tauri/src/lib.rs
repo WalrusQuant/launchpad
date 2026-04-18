@@ -624,6 +624,35 @@ fn save_settings(data: String) -> Result<(), String> {
     Ok(())
 }
 
+fn file_settings_path() -> std::path::PathBuf {
+    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
+    home.join(".launchpad").join("file-settings.json")
+}
+
+#[tauri::command]
+fn load_file_settings() -> Result<String, String> {
+    let path = file_settings_path();
+    if path.exists() {
+        fs::read_to_string(&path).map_err(|e| e.to_string())
+    } else {
+        Ok("{}".to_string())
+    }
+}
+
+#[tauri::command]
+fn save_file_settings(data: String) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("Invalid JSON: {}", e))?;
+    let normalized = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| format!("JSON serialization error: {}", e))?;
+    let path = file_settings_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // Projects
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct Project {
@@ -827,6 +856,133 @@ fn search_files(root: String, query: String, max_results: Option<usize>) -> Resu
 
     walk(root_path, root_path, &query_lower, &mut results, limit, 0);
     results.sort_by(|a, b| a.len().cmp(&b.len()));
+    Ok(results)
+}
+
+#[derive(Serialize)]
+struct SearchHit {
+    file: String,         // relative path from root
+    line: u32,            // 1-indexed
+    column: u32,          // 1-indexed column of match start (char index)
+    match_length: u32,
+    line_content: String, // full line, truncated to 500 chars
+}
+
+// Project-wide content search. Walks the tree applying the same skip rules as
+// search_files, reads text files under a size cap, and reports matches.
+#[tauri::command]
+fn search_in_files(
+    root: String,
+    query: String,
+    case_sensitive: bool,
+    is_regex: bool,
+    max_results: Option<usize>,
+) -> Result<Vec<SearchHit>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = max_results.unwrap_or(500);
+    let root_path = std::path::Path::new(&root);
+
+    // Compile pattern once.
+    let pattern_src = if is_regex {
+        query.clone()
+    } else {
+        regex::escape(&query)
+    };
+    let pattern = regex::RegexBuilder::new(&pattern_src)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| format!("Invalid pattern: {}", e))?;
+
+    let mut results: Vec<SearchHit> = Vec::new();
+
+    fn walk(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        pattern: &regex::Regex,
+        results: &mut Vec<SearchHit>,
+        limit: usize,
+        depth: usize,
+    ) {
+        if depth > 12 || results.len() >= limit {
+            return;
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            if results.len() >= limit {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == "__pycache__"
+                || name == "dist"
+                || name == "build"
+            {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, pattern, results, limit, depth + 1);
+                continue;
+            }
+            // File size cap: skip anything over 2 MB to keep latency bounded.
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() > 2 * 1024 * 1024 {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            // Binary detection: null byte in the first 512 bytes.
+            if bytes.iter().take(512).any(|b| *b == 0) {
+                continue;
+            }
+            let content = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            for (line_idx, line) in content.lines().enumerate() {
+                if results.len() >= limit {
+                    return;
+                }
+                if let Some(m) = pattern.find(line) {
+                    // Count chars up to byte offset for 1-indexed column.
+                    let prefix = &line[..m.start()];
+                    let column = prefix.chars().count() as u32 + 1;
+                    let match_length = line[m.start()..m.end()].chars().count() as u32;
+                    let line_content = if line.len() > 500 {
+                        let mut end = 500;
+                        while !line.is_char_boundary(end) && end > 0 {
+                            end -= 1;
+                        }
+                        format!("{}…", &line[..end])
+                    } else {
+                        line.to_string()
+                    };
+                    results.push(SearchHit {
+                        file: rel.clone(),
+                        line: (line_idx as u32) + 1,
+                        column,
+                        match_length,
+                        line_content,
+                    });
+                }
+            }
+        }
+    }
+
+    walk(root_path, root_path, &pattern, &mut results, limit, 0);
     Ok(results)
 }
 
@@ -1650,12 +1806,15 @@ pub fn run() {
             create_branch,
             load_settings,
             save_settings,
+            load_file_settings,
+            save_file_settings,
             load_projects,
             add_project,
             remove_project,
             rename_project,
             touch_project,
             search_files,
+            search_in_files,
             pick_directory,
             reveal_in_finder,
             read_file_preview,
