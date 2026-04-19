@@ -81,7 +81,7 @@ struct FileEntry {
 }
 
 #[tauri::command]
-fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResult, String> {
+fn spawn_pty(cwd: Option<String>, project_path: Option<String>, rows: Option<u16>, cols: Option<u16>, state: State<AppState>, app: tauri::AppHandle) -> Result<SpawnResult, String> {
     let mut next_id = state.next_id.lock().map_err(|e| e.to_string())?;
     let tab_id = *next_id;
     *next_id += 1;
@@ -112,6 +112,15 @@ fn spawn_pty(cwd: Option<String>, rows: Option<u16>, cols: Option<u16>, state: S
     // character" ghosts (Shingle bubble fragments, status bar remnants).
     for (key, value) in std::env::vars() {
         cmd.env(&key, &value);
+    }
+    // Project-scoped env vars (from ~/.launchpad/project-env.json). Applied
+    // AFTER parent env so per-project values override the user's shell env,
+    // but BEFORE the TERM / TERM_PROGRAM overrides below so a user can't
+    // accidentally break terminal capability detection by naming a var TERM.
+    if let Some(p) = project_path.as_deref() {
+        for (k, v) in load_env_for_project(p) {
+            cmd.env(&k, &v);
+        }
     }
     // Override / set the terminal-identifying vars that iTerm and Terminal.app set.
     cmd.env("TERM", "xterm-256color");
@@ -761,7 +770,11 @@ fn remove_project(path: String, state: State<AppState>) -> Result<(), String> {
     let target = normalize_project_path(&path);
     let mut projects = read_projects_file()?;
     projects.retain(|p| normalize_project_path(&p.path) != target);
-    write_projects_file(&projects)
+    write_projects_file(&projects)?;
+    // Best-effort: drop stored env vars for this project too. Deleting a project
+    // is an explicit act; leaving the secrets behind would be a privacy leak.
+    let _ = forget_project_env(path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -808,6 +821,116 @@ fn touch_project(
     {
         p.last_opened = last_opened;
         write_projects_file(&projects)?;
+    }
+    Ok(())
+}
+
+// ─── Per-project environment variables ───────────────────────────────────────
+// Stored at ~/.launchpad/project-env.json, keyed by canonicalized project path.
+// Injected into every PTY spawned for the active project (see spawn_pty).
+// File is written atomically and chmod'd to 0o600 so other users can't read it.
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct ProjectEnvVar {
+    key: String,
+    value: String,
+    secret: bool,
+}
+
+type ProjectEnvStore = std::collections::BTreeMap<String, Vec<ProjectEnvVar>>;
+
+fn project_env_path() -> std::path::PathBuf {
+    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
+    home.join(".launchpad").join("project-env.json")
+}
+
+fn read_project_env_file() -> Result<ProjectEnvStore, String> {
+    let path = project_env_path();
+    if !path.exists() {
+        return Ok(ProjectEnvStore::new());
+    }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if data.trim().is_empty() {
+        return Ok(ProjectEnvStore::new());
+    }
+    serde_json::from_str::<ProjectEnvStore>(&data)
+        .map_err(|e| format!("Invalid project-env.json: {}", e))
+}
+
+fn write_project_env_file(store: &ProjectEnvStore) -> Result<(), String> {
+    let path = project_env_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(store)
+        .map_err(|e| format!("JSON serialization error: {}", e))?;
+    // Atomic write: temp + rename so a crash can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    // Restrict to owner read/write — this file holds user secrets.
+    let perms = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Best-effort lookup of env vars for a given project path. Swallows all errors
+// and returns an empty vec — a broken env file must never break terminal spawn.
+fn load_env_for_project(path: &str) -> Vec<(String, String)> {
+    let Ok(store) = read_project_env_file() else { return Vec::new(); };
+    let key = normalize_project_path(path);
+    store
+        .get(&key)
+        .map(|vars| vars.iter().map(|v| (v.key.clone(), v.value.clone())).collect())
+        .unwrap_or_default()
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    // POSIX env var name: [A-Za-z_][A-Za-z0-9_]*
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[tauri::command]
+fn load_project_env_vars(path: String) -> Result<Vec<ProjectEnvVar>, String> {
+    let store = read_project_env_file()?;
+    let key = normalize_project_path(&path);
+    Ok(store.get(&key).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn save_project_env_vars(path: String, vars: Vec<ProjectEnvVar>) -> Result<(), String> {
+    for v in &vars {
+        if !is_valid_env_key(&v.key) {
+            return Err(format!(
+                "Invalid env var name: {:?} (must match [A-Za-z_][A-Za-z0-9_]*)",
+                v.key
+            ));
+        }
+    }
+    let key = normalize_project_path(&path);
+    let mut store = read_project_env_file().unwrap_or_default();
+    if vars.is_empty() {
+        store.remove(&key);
+    } else {
+        store.insert(key, vars);
+    }
+    write_project_env_file(&store)
+}
+
+#[tauri::command]
+fn forget_project_env(path: String) -> Result<(), String> {
+    let key = normalize_project_path(&path);
+    let mut store = match read_project_env_file() {
+        Ok(s) => s,
+        // Missing / unparseable file → nothing to forget. Don't propagate.
+        Err(_) => return Ok(()),
+    };
+    if store.remove(&key).is_some() {
+        write_project_env_file(&store)?;
     }
     Ok(())
 }
@@ -1813,6 +1936,9 @@ pub fn run() {
             remove_project,
             rename_project,
             touch_project,
+            load_project_env_vars,
+            save_project_env_vars,
+            forget_project_env,
             search_files,
             search_in_files,
             pick_directory,

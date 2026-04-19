@@ -1,4 +1,7 @@
 import { ACTIONS, getBinding, setBinding, getDefault, chordFromEvent } from "./keymap.js";
+import { getActiveProject } from "./projects.js";
+
+const { invoke } = window.__TAURI__.core;
 
 /**
  * Settings panel UI — renders a form with sections for all app settings.
@@ -145,6 +148,22 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       </div>
     </div>
 
+    <div class="settings-section" id="env-section" ${getActiveProject() ? "" : "hidden"}>
+      <h3 class="settings-section-title">
+        Environment
+        <span class="settings-section-sub" id="env-project-name"></span>
+      </h3>
+      <div class="settings-env-help">
+        Per-project environment variables. Injected into every new terminal for this project.
+      </div>
+      <div class="settings-env-note">
+        <span class="settings-env-note-icon">ⓘ</span>
+        <span>After adding or changing a variable, <strong>open a new terminal</strong> for your agent to see it. Existing terminals and any agents already running in them keep their original environment.</span>
+      </div>
+      <div id="env-var-list" class="env-var-list"></div>
+      <button type="button" class="settings-btn env-add-btn" id="env-add-btn">+ Add variable</button>
+    </div>
+
     <div class="settings-section">
       <h3 class="settings-section-title">Keybindings</h3>
       <div id="keybindings-list"></div>
@@ -157,6 +176,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
 
   containerEl.appendChild(content);
   renderKeybindings(content.querySelector("#keybindings-list"));
+  renderProjectEnv(content);
 
   // Wire up all inputs
   wireInput("appTheme", "change", (v) => v);
@@ -257,4 +277,162 @@ function isSelected(current, match) {
 
 function escapeAttr(str) {
   return str.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ─── Per-project environment variables ───────────────────────────────────────
+// Loads vars for the active project from ~/.launchpad/project-env.json, renders
+// editable rows, and saves the full list on every change (debounced).
+// Keys are validated client-side against POSIX env var rules; the Rust side
+// re-validates on save so the JSON file can never contain bad keys.
+
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+async function renderProjectEnv(content) {
+  const section = content.querySelector("#env-section");
+  const listEl = content.querySelector("#env-var-list");
+  const addBtn = content.querySelector("#env-add-btn");
+  const nameEl = content.querySelector("#env-project-name");
+  if (!section || !listEl || !addBtn) return;
+
+  const project = getActiveProject();
+  if (!project) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  nameEl.textContent = `— ${project.name}`;
+
+  // Local row state — source of truth while the panel is open.
+  // Flushed to disk on every mutation, debounced.
+  let rows = [];
+  try {
+    rows = await invoke("load_project_env_vars", { path: project.path });
+  } catch (e) {
+    console.warn("load_project_env_vars failed:", e);
+    rows = [];
+  }
+
+  let saveTimer = null;
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 300);
+  }
+  async function save() {
+    saveTimer = null;
+    // Skip rows with invalid or empty keys — UI already shows errors; we never
+    // silently write bad data, but we also don't block saves of valid rows
+    // because the user may be mid-edit on one row.
+    const clean = rows.filter((r) => r.key && ENV_KEY_RE.test(r.key));
+    try {
+      await invoke("save_project_env_vars", { path: project.path, vars: clean });
+    } catch (e) {
+      console.warn("save_project_env_vars failed:", e);
+    }
+  }
+
+  function render() {
+    listEl.innerHTML = "";
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "env-empty";
+      empty.textContent = "No variables set for this project.";
+      listEl.appendChild(empty);
+      return;
+    }
+    rows.forEach((row, idx) => {
+      const rowEl = document.createElement("div");
+      rowEl.className = "env-var-row";
+
+      const keyInput = document.createElement("input");
+      keyInput.type = "text";
+      keyInput.className = "settings-input env-key";
+      keyInput.placeholder = "KEY";
+      keyInput.value = row.key;
+      keyInput.spellcheck = false;
+      keyInput.autocomplete = "off";
+      keyInput.autocapitalize = "off";
+      if (row.key && !ENV_KEY_RE.test(row.key)) {
+        keyInput.classList.add("env-invalid");
+        keyInput.title = "Env var names must start with a letter or underscore, followed by letters, digits, or underscores.";
+      }
+      keyInput.addEventListener("input", () => {
+        row.key = keyInput.value;
+        if (row.key && !ENV_KEY_RE.test(row.key)) {
+          keyInput.classList.add("env-invalid");
+          keyInput.title = "Env var names must start with a letter or underscore, followed by letters, digits, or underscores.";
+        } else {
+          keyInput.classList.remove("env-invalid");
+          keyInput.title = "";
+        }
+        scheduleSave();
+      });
+
+      const valueInput = document.createElement("input");
+      valueInput.type = row.secret && !row._revealed ? "password" : "text";
+      valueInput.className = "settings-input env-value";
+      valueInput.placeholder = "value";
+      valueInput.value = row.value;
+      valueInput.spellcheck = false;
+      valueInput.autocomplete = "off";
+      valueInput.autocapitalize = "off";
+      valueInput.addEventListener("input", () => {
+        row.value = valueInput.value;
+        scheduleSave();
+      });
+
+      const revealBtn = document.createElement("button");
+      revealBtn.type = "button";
+      revealBtn.className = "env-reveal";
+      revealBtn.title = row._revealed ? "Hide value" : "Reveal value";
+      revealBtn.textContent = row._revealed ? "🙈" : "👁";
+      revealBtn.disabled = !row.secret;
+      revealBtn.addEventListener("click", () => {
+        row._revealed = !row._revealed;
+        render();
+      });
+
+      const secretLabel = document.createElement("label");
+      secretLabel.className = "env-secret-toggle";
+      secretLabel.title = "Treat this value as a secret — masked in the UI by default.";
+      const secretBox = document.createElement("input");
+      secretBox.type = "checkbox";
+      secretBox.checked = !!row.secret;
+      secretBox.addEventListener("change", () => {
+        row.secret = secretBox.checked;
+        if (!row.secret) row._revealed = false;
+        render();
+        scheduleSave();
+      });
+      const secretText = document.createElement("span");
+      secretText.textContent = "Secret";
+      secretLabel.appendChild(secretBox);
+      secretLabel.appendChild(secretText);
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "env-delete";
+      deleteBtn.title = "Delete this variable";
+      deleteBtn.textContent = "✕";
+      deleteBtn.addEventListener("click", () => {
+        rows.splice(idx, 1);
+        render();
+        scheduleSave();
+      });
+
+      rowEl.appendChild(keyInput);
+      rowEl.appendChild(valueInput);
+      rowEl.appendChild(revealBtn);
+      rowEl.appendChild(secretLabel);
+      rowEl.appendChild(deleteBtn);
+      listEl.appendChild(rowEl);
+    });
+  }
+
+  addBtn.addEventListener("click", () => {
+    rows.push({ key: "", value: "", secret: false });
+    render();
+    // Don't save yet — empty key is invalid. Wait for user to type.
+  });
+
+  render();
 }

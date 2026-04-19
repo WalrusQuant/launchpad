@@ -82,6 +82,14 @@ specs/                  # Design specs (project model, agent model, etc.)
 - **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Written atomically via temp-file + rename. Path canonicalization dedupes equivalent paths. See `specs/project-model-spec.md`.
 - **No framework**: Vanilla JS with direct DOM manipulation. Keeps the bundle small and fast.
 
+### Per-Project Environment
+- **Stored at `~/.launchpad/project-env.json`**, keyed by canonicalized project path, chmod `0o600` (owner read/write only) so other users on the box can't read stored secrets. Atomic write (temp + rename). Each entry is an array of `{ key, value, secret }`.
+- **Injection site**: `spawn_pty` in `lib.rs` applies these vars AFTER the parent-env inherit loop and BEFORE the `TERM` / `COLORTERM` / `TERM_PROGRAM` / `LANG` overrides. That order lets a project override `PATH` or `ANTHROPIC_API_KEY`, but prevents a stray `TERM=garbage` entry from breaking terminal capability detection.
+- **Scope**: every PTY spawned for the active project (tab, split pane, right-group tab) gets the project's env. Existing terminals don't retroactively update — OS-level reality, surfaced in the UI copy as "Applies to new terminals."
+- **Lookup**: `load_env_for_project(path)` canonicalizes `path` the same way the projects file does, so two different strings for the same dir dedupe cleanly.
+- **Cleanup**: `remove_project` best-effort-calls `forget_project_env` so deleted projects don't leave orphaned secrets behind. Re-adding the project starts with an empty env set.
+- **No keychain**: v1 stores values in the local JSON with `0o600`. Fine for single-user macOS. Revisit if a shared-machine or cross-device-sync story appears.
+
 ## Commands
 
 ### Development
@@ -125,7 +133,7 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 ## Tauri Commands (Rust → JS IPC)
 
 ### PTY
-- `spawn_pty(cwd?, rows?, cols?)` — spawn a new PTY, returns `{ tab_id }`. Does NOT start reading output yet.
+- `spawn_pty(cwd?, project_path?, rows?, cols?)` — spawn a new PTY, returns `{ tab_id }`. Does NOT start reading output yet. If `project_path` is given, env vars stored for that project in `~/.launchpad/project-env.json` are injected into the child.
 - `start_pty_reader(tab_id)` — start the output reader thread (call AFTER registering pane in `paneMap`)
 - `write_to_pty(tab_id, data)` — write input to a PTY
 - `resize_pty(tab_id, rows, cols)` — resize a PTY (skips redundant resizes)
@@ -179,6 +187,11 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - `register_project_window(path, label)` — called from `enterWorkspace` to claim the current window for a project; any prior entry for the same label is removed
 - `unregister_project_window(path)` — called from "← Projects" teardown before reloading so a stale registration doesn't fool `focus_project_window`
 - `open_new_window(path?)` — creates a new Tauri window. With `path`: URL `?folder=<path>`, title = folder name. Without: URL `/`, title "Launchpad", boots into picker. Registration now happens on the frontend side (in `enterWorkspace`), so this command is the same for both cases.
+
+### Project Environment
+- `load_project_env_vars(path)` — returns `Vec<{ key, value, secret }>` stored for the canonicalized `path`, or `[]` if none.
+- `save_project_env_vars(path, vars)` — validates each key against POSIX rules (`[A-Za-z_][A-Za-z0-9_]*`), writes `~/.launchpad/project-env.json` atomically with `0o600`. Empty `vars` removes the entry.
+- `forget_project_env(path)` — drops the entry for `path`. Called automatically from `remove_project`; exposed as a command for completeness. Missing / unparseable file succeeds silently.
 
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`

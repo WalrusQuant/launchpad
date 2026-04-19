@@ -257,9 +257,14 @@ async function createPane(parentEl, cwd) {
       console.warn("WebGL renderer not available, using default");
     }
     fitAddon.fit();
-    // Pass actual dimensions so the PTY starts at the right size — no resize race
+    // Pass actual dimensions so the PTY starts at the right size — no resize race.
+    // projectPath is the key Rust uses to look up per-project env vars (see
+    // load_env_for_project in lib.rs). At every call site today cwd IS the
+    // project path — the file browser never changes the PTY's cwd, so reusing
+    // the same value is correct.
     const result = await invoke("spawn_pty", {
       cwd: cwd || undefined,
+      projectPath: cwd || undefined,
       rows: term.rows,
       cols: term.cols,
     });
