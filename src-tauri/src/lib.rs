@@ -311,23 +311,36 @@ fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let mut files: Vec<FileEntry> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            let metadata = entry.metadata().ok()?;
-            let name = entry.file_name().into_string().ok()?;
+            // Use to_string_lossy so non-UTF-8 filenames (rare on macOS but
+            // possible) still show up with replacement characters rather
+            // than disappearing from the listing entirely.
+            let name = entry.file_name().to_string_lossy().to_string();
             let is_hidden = name.starts_with('.');
+            // Don't drop the entry if metadata fails (permission denied,
+            // or TOCTOU where the file was removed between read_dir and
+            // metadata). Fall through to sensible defaults so the user
+            // still sees what's there.
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = metadata
-                .modified()
-                .ok()
+                .as_ref()
+                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
+            let mode = metadata
+                .as_ref()
+                .map(|m| m.permissions().mode())
+                .unwrap_or(0);
 
             Some(FileEntry {
                 name,
                 path: entry.path().to_string_lossy().to_string(),
-                is_dir: metadata.is_dir(),
+                is_dir,
                 is_hidden,
-                size: metadata.len(),
+                size,
                 modified,
-                mode: metadata.permissions().mode(),
+                mode,
             })
         })
         .collect();
@@ -958,7 +971,12 @@ fn search_files(root: String, query: String, max_results: Option<usize>) -> Resu
             Ok(e) => e,
             Err(_) => return,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        // Sort siblings so walk order is deterministic. fs::read_dir's order
+        // is filesystem-dependent; with a result limit, a non-deterministic
+        // walk makes "which 20 files appear first" vary run-to-run.
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
             if results.len() >= limit {
                 return;
             }
@@ -1035,7 +1053,11 @@ fn search_in_files(
             Ok(e) => e,
             Err(_) => return,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        // Deterministic walk (same reason as search_files): keeps the set
+        // of matches visited before hitting `limit` stable across runs.
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
             if results.len() >= limit {
                 return;
             }
