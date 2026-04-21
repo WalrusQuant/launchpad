@@ -22,6 +22,11 @@ import { showPicker, hidePicker } from "./projectpicker.js";
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// Cached home directory for path-shortening in breadcrumbs. Set once at
+// boot from get_home_dir (see boot()), not hardcoded — supports corporate
+// macOS setups with email-style usernames, Docker mounts, and Linux.
+let homeDir = "";
+
 // Floating toast for app-level errors (file-open failures, rename/delete
 // errors, etc.) that aren't bound to a specific panel. Lazy-creates the
 // container on first use; auto-dismisses after 4s. type is "error" | "info".
@@ -563,7 +568,11 @@ async function doCloseTab(uiId) {
 // rename.
 function renderBreadcrumb(breadcrumbEl, filePath) {
   breadcrumbEl.replaceChildren();
-  const homePath = filePath.replace(/^\/Users\/[^/]+/, "~");
+  // Replace the resolved home dir with "~" instead of assuming
+  // /Users/<name> at depth 2 (fails on corporate setups / Docker / Linux).
+  const homePath = homeDir && filePath.startsWith(homeDir)
+    ? "~" + filePath.slice(homeDir.length)
+    : filePath;
   const parts = homePath.split("/");
   parts.forEach((part, i) => {
     if (i > 0) {
@@ -959,7 +968,9 @@ function renderTabBar() {
     if (tab._rightGroup) continue; // skip tabs in the right split group
     const isActive = uiId === activeTabUiId;
     const tabEl = document.createElement("div");
-    tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
+    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
+    if (staleClass) tabEl.title = "File no longer exists on disk";
     tabEl.dataset.tabId = uiId;
     tabEl.setAttribute("role", "tab");
     tabEl.setAttribute("aria-selected", isActive ? "true" : "false");
@@ -1127,6 +1138,7 @@ listen("pty-exit", (event) => {
 
 // Listen for filesystem changes — refresh file browser and git panel
 let fsRefreshScheduled = false;
+let fsRefreshDirty = false; // coalesces events that arrive during in-flight work
 let watchedProjectPath = null; // canonical path returned by watch_directory
 listen("fs-changed", (event) => {
   const project = getActiveProject();
@@ -1135,7 +1147,12 @@ listen("fs-changed", (event) => {
   // Compare against the canonical path watch_directory returned — symlinked
   // project roots make event.payload.path differ from project.path.
   if (!project || !watchedProjectPath || event.payload.path !== watchedProjectPath) return;
-  if (fsRefreshScheduled) return;
+  if (fsRefreshScheduled) {
+    // An event arrived while we're mid-work. Don't drop it — set a dirty
+    // flag and the IIFE will re-run the loop once the current pass ends.
+    fsRefreshDirty = true;
+    return;
+  }
   fsRefreshScheduled = true;
   // The Rust debouncer already coalesces bursts at 300 ms; the old
   // frontend 500 ms setTimeout stacked on top of that produced ~800 ms of
@@ -1143,12 +1160,14 @@ listen("fs-changed", (event) => {
   // so await on the tab-reload loop still works).
   (async () => {
     try {
-      refreshFileBrowser();
-      fetchGitStatus(project.path);
-      refreshPanel(null, true);
+      do {
+        fsRefreshDirty = false;
+        refreshFileBrowser();
+        fetchGitStatus(project.path);
+        refreshPanel(null, true);
 
-      // Check open editor tabs for external file changes
-      for (const [uiId, tab] of tabs) {
+        // Check open editor tabs for external file changes
+        for (const [uiId, tab] of tabs) {
         if (tab.type !== "editor") continue;
         try {
           const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
@@ -1193,7 +1212,8 @@ listen("fs-changed", (event) => {
             console.error("Reload failed for", tab.filePath, err);
           }
         }
-      }
+        }
+      } while (fsRefreshDirty);
     } finally {
       fsRefreshScheduled = false;
     }
@@ -1676,7 +1696,11 @@ document.getElementById("back-to-projects").addEventListener("click", async () =
   const project = getActiveProject();
   if (project) {
     await unregisterProjectWindow(project.path).catch(() => {});
-    invoke("unwatch_directory", { path: project.path }).catch(() => {});
+    // Use the canonical form returned by watch_directory so the HashMap
+    // entry actually gets removed — the raw project.path can differ
+    // (symlink-resolved) and miss the key. Falls back to project.path
+    // when watch_directory failed at init.
+    invoke("unwatch_directory", { path: watchedProjectPath || project.path }).catch(() => {});
   }
 
   // Full reload resets all module state and triggers boot() → picker.
@@ -1724,7 +1748,9 @@ function renderRightTabBar() {
     if (!tab) continue;
     const isActive = uiId === rightActiveTabUiId;
     const tabEl = document.createElement("div");
-    tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
+    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
+    if (staleClass) tabEl.title = "File no longer exists on disk";
 
     const icon = document.createElement("span");
     icon.className = "tab-icon";
@@ -2109,6 +2135,13 @@ async function boot() {
   initTheme(settings.appTheme);
   onThemeChange(refreshTerminalsForTheme);
   await loadFileSettings();
+  // Resolve home dir once for breadcrumb path-shortening. Errors fall
+  // through to empty string, which makes renderBreadcrumb a no-op.
+  try {
+    homeDir = await invoke("get_home_dir");
+  } catch (_) {
+    homeDir = "";
+  }
 
   // A window booting with ?folder= is a dedicated project window — enter it directly.
   const params = new URLSearchParams(window.location.search);

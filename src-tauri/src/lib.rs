@@ -1183,8 +1183,10 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, S
     // Binary heuristic: real text files rarely contain ANY null bytes, but
     // tolerate a small ratio so source files with null-in-string-literal
     // don't get rejected. UTF-16-like content will have ~50% nulls, far
-    // above the 1% threshold.
-    if !data.is_empty() {
+    // above the 1% threshold. Only apply once we have enough bytes to
+    // make the ratio meaningful — a 20-byte file with one null otherwise
+    // looks like "5% null" and would be wrongly rejected.
+    if data.len() > 64 {
         let null_count = data.iter().filter(|&&b| b == 0).count();
         if null_count * 100 > data.len() {
             return Err("Binary file — cannot display".into());
@@ -1198,12 +1200,24 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, S
 // then rename onto the destination. A crash / kill / ENOSPC mid-write
 // leaves the old file intact; a successful rename replaces it in one step.
 // Preserves the existing file's mode when overwriting.
+//
+// Temp name uses PID + a process-monotonic counter so two concurrent
+// writes from different windows (Tauri runs all windows in one process)
+// can't collide on the same temp path and corrupt each other.
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     let file_name = dest
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("launchpad-write");
-    let tmp = dest.with_file_name(format!(".{}.lp-tmp-{}", file_name, std::process::id()));
+    let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = dest.with_file_name(format!(
+        ".{}.lp-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        counter
+    ));
 
     let preserved_mode = fs::metadata(dest).ok().map(|m| m.permissions().mode());
 
@@ -1213,8 +1227,11 @@ fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
         drop(f);
+        // Mode preservation is best-effort — failing here (e.g. on a
+        // mount where chmod is denied) should not abort the whole write
+        // and lose the user's data.
         if let Some(mode) = preserved_mode {
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
         }
         fs::rename(&tmp, dest)
     })();

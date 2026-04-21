@@ -2818,7 +2818,10 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  z-index: 1000;
+  /* Above modal overlays (z-index 1000) so a toast fired during a
+     confirm dialog is still visible. Below drag ghost (9999) and
+     context menus (10000). */
+  z-index: 1100;
   pointer-events: none;
   max-width: 420px;
 }
@@ -2847,6 +2850,14 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: rgba(90, 200, 250, 0.12);
   border-color: #5ac8fa;
   color: #7fd5fb;
+}
+
+/* Editor tab whose underlying file was deleted on disk — user sees the
+   toast once but the tab itself also gets a persistent visual marker. */
+.tab.tab-stale .tab-label {
+  color: #ff8d85;
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 141, 133, 0.5);
 }
 
 /* Scrollbar styling */
