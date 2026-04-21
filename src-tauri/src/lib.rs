@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 
@@ -32,12 +32,12 @@ struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
     fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
-    // In-flight git network operation (push/pull/fetch/merge). `(op_id, pid)`
-    // lets run_git_cancellable's cleanup avoid clearing a slot that a later
-    // operation has already claimed — critical if a cancel already took the
-    // previous slot and the next operation was spawned before we could clean
-    // up. op_id is a monotonically-increasing tag from `git_op_counter`.
-    git_op_pid: Arc<Mutex<Option<(u64, u32)>>>,
+    // In-flight git network operation (push/pull/fetch). The slot is reserved
+    // BEFORE spawn so a cancel arriving in the window between spawn() and
+    // PID-record is still observed and applied. `op_id` (from git_op_counter)
+    // tags each op so cleanup can tell whether the slot still belongs to us
+    // or has been claimed by a later operation.
+    git_op_pid: Arc<Mutex<Option<GitOpSlot>>>,
     git_op_counter: Arc<AtomicU64>,
     // Canonicalized project path → Tauri window label. Used by focus_project_window
     // to focus an existing window instead of opening a duplicate. Stale entries are
@@ -1340,36 +1340,130 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string()[..7].to_string())
 }
 
+struct GitOpSlot {
+    op_id: u64,
+    pid: Option<u32>,
+    cancelled: bool,
+}
+
+// SSH_AUTH_SOCK resolved once per process. Tauri .app bundles launched from
+// Finder/Dock don't inherit SSH_AUTH_SOCK from the user's login shell, so SSH
+// git remotes fail with "Permission denied (publickey)". On macOS we fall
+// back to `launchctl getenv` which returns the per-user value the system
+// ssh-agent advertises.
+static SSH_AUTH_SOCK_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+fn resolve_ssh_auth_sock() -> Option<String> {
+    SSH_AUTH_SOCK_CACHE
+        .get_or_init(|| {
+            if let Ok(v) = std::env::var("SSH_AUTH_SOCK") {
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(out) = std::process::Command::new("launchctl")
+                    .args(["getenv", "SSH_AUTH_SOCK"])
+                    .output()
+                {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+// Apply the standard env every spawned `git` Command should carry:
+// - GIT_TERMINAL_PROMPT=0 / GIT_ASKPASS=echo: disable interactive credential
+//   prompts that would block forever in a GUI bundle with no TTY. Auth errors
+//   now return immediately instead of hanging.
+// - SSH_AUTH_SOCK: forwarded via resolve_ssh_auth_sock() so SSH remotes work
+//   when the .app is launched from Finder/Dock.
+fn apply_git_env(cmd: &mut std::process::Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_ASKPASS", "echo");
+    if let Some(sock) = resolve_ssh_auth_sock() {
+        cmd.env("SSH_AUTH_SOCK", sock);
+    }
+}
+
 // Runs a git command as a spawned process, storing its PID in AppState so
 // cancel_git_op can kill it. Returns stdout on success, stderr on failure.
 fn run_git_cancellable(
     args: &[&str],
     path: &str,
-    pid_store: &Arc<Mutex<Option<(u64, u32)>>>,
+    pid_store: &Arc<Mutex<Option<GitOpSlot>>>,
     counter: &Arc<AtomicU64>,
 ) -> Result<String, String> {
-    let child = std::process::Command::new("git")
+    // Reserve the slot BEFORE spawn. If cancel arrives in the window between
+    // spawn() and PID-record, it can now set `cancelled=true` on our slot,
+    // which we observe after spawn and act on by killing the just-spawned
+    // child. Without this reservation, cancel reads None and the op runs to
+    // completion uncancelled.
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    *pid_store.lock().unwrap() = Some(GitOpSlot {
+        op_id,
+        pid: None,
+        cancelled: false,
+    });
+
+    let mut command = std::process::Command::new("git");
+    command
         .args(args)
         .current_dir(path)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .stderr(std::process::Stdio::piped());
+    apply_git_env(&mut command);
 
-    // Each run gets a unique op_id so the cleanup step below can tell whether
-    // the slot still belongs to us or has been claimed by a later operation.
-    let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    *pid_store.lock().unwrap() = Some((op_id, child.id()));
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // Spawn failed — clear our reservation if it's still ours.
+            let mut guard = pid_store.lock().unwrap();
+            if let Some(ref s) = *guard {
+                if s.op_id == op_id {
+                    *guard = None;
+                }
+            }
+            return Err(e.to_string());
+        }
+    };
+
+    let pid = child.id();
+
+    // Record PID and detect whether cancel beat us to the spawn.
+    let kill_now = {
+        let mut guard = pid_store.lock().unwrap();
+        match guard.as_mut() {
+            Some(s) if s.op_id == op_id => {
+                s.pid = Some(pid);
+                s.cancelled
+            }
+            // Slot was claimed by a later op (concurrent push/pull from two
+            // clicks). Treat as not-ours; the other op owns cancellation now.
+            _ => false,
+        }
+    };
+    if kill_now {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+    }
 
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
     // Only clear the slot if it still matches our op. A racing cancel_git_op
-    // may have already taken it, or a subsequent operation may already have
-    // replaced it — in either case leave it alone.
+    // may have already observed and cleared it, or a subsequent operation
+    // may already have replaced it — in either case leave it alone.
     {
         let mut guard = pid_store.lock().unwrap();
-        if let Some((current_id, _)) = *guard {
-            if current_id == op_id {
+        if let Some(ref s) = *guard {
+            if s.op_id == op_id {
                 *guard = None;
             }
         }
@@ -1392,11 +1486,12 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
 
     if let Err(ref stderr) = result {
         if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
-            let branch_output = std::process::Command::new("git")
+            let mut branch_cmd = std::process::Command::new("git");
+            branch_cmd
                 .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .current_dir(&path)
-                .output()
-                .map_err(|e| e.to_string())?;
+                .current_dir(&path);
+            apply_git_env(&mut branch_cmd);
+            let branch_output = branch_cmd.output().map_err(|e| e.to_string())?;
             let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
             return run_git_cancellable(&["push", "--set-upstream", "origin", &branch], &path, &pid_store, &counter);
         }
@@ -1426,10 +1521,19 @@ fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
 
 #[tauri::command]
 fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
-    if let Some((_op_id, pid)) = state.git_op_pid.lock().unwrap().take() {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
+    let mut guard = state.git_op_pid.lock().unwrap();
+    if let Some(slot) = guard.as_mut() {
+        // Mark cancelled so run_git_cancellable can kill the child even if
+        // we got here during the spawn window (PID not yet recorded).
+        slot.cancelled = true;
+        if let Some(pid) = slot.pid {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output();
+        }
+        // Don't clear the slot here — run_git_cancellable's cleanup owns that
+        // and only clears if the op_id still matches, so a stale cancel can't
+        // accidentally wipe a newer op's registration.
     }
     Ok(())
 }
@@ -1440,11 +1544,12 @@ fn git_merge_branch(path: String, branch_name: String) -> Result<String, String>
     if !branch_name.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c)) {
         return Err("Invalid branch name".into());
     }
-    let output = std::process::Command::new("git")
+    let mut merge_cmd = std::process::Command::new("git");
+    merge_cmd
         .args(["merge", &branch_name])
-        .current_dir(&path)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .current_dir(&path);
+    apply_git_env(&mut merge_cmd);
+    let output = merge_cmd.output().map_err(|e| e.to_string())?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
@@ -1454,19 +1559,19 @@ fn git_merge_branch(path: String, branch_name: String) -> Result<String, String>
 
 #[tauri::command]
 fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
-    let status = std::process::Command::new("git")
+    let mut checkout = std::process::Command::new("git");
+    checkout
         .args(["checkout", "--ours", "--", &file_path])
-        .current_dir(&path)
-        .status()
-        .map_err(|e| e.to_string())?;
+        .current_dir(&path);
+    apply_git_env(&mut checkout);
+    let status = checkout.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("Failed to checkout --ours".into());
     }
-    let status = std::process::Command::new("git")
-        .args(["add", "--", &file_path])
-        .current_dir(&path)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut add = std::process::Command::new("git");
+    add.args(["add", "--", &file_path]).current_dir(&path);
+    apply_git_env(&mut add);
+    let status = add.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("Failed to stage resolved file".into());
     }
@@ -1475,19 +1580,19 @@ fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
-    let status = std::process::Command::new("git")
+    let mut checkout = std::process::Command::new("git");
+    checkout
         .args(["checkout", "--theirs", "--", &file_path])
-        .current_dir(&path)
-        .status()
-        .map_err(|e| e.to_string())?;
+        .current_dir(&path);
+    apply_git_env(&mut checkout);
+    let status = checkout.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("Failed to checkout --theirs".into());
     }
-    let status = std::process::Command::new("git")
-        .args(["add", "--", &file_path])
-        .current_dir(&path)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut add = std::process::Command::new("git");
+    add.args(["add", "--", &file_path]).current_dir(&path);
+    apply_git_env(&mut add);
+    let status = add.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("Failed to stage resolved file".into());
     }
