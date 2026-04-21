@@ -558,6 +558,27 @@ async function doCloseTab(uiId) {
   }
 }
 
+// Build (or rebuild) a breadcrumb element's contents for a file path. Used
+// both when creating an editor tab and when updating after an external
+// rename.
+function renderBreadcrumb(breadcrumbEl, filePath) {
+  breadcrumbEl.replaceChildren();
+  const homePath = filePath.replace(/^\/Users\/[^/]+/, "~");
+  const parts = homePath.split("/");
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "breadcrumb-separator";
+      sep.textContent = "›";
+      breadcrumbEl.appendChild(sep);
+    }
+    const span = document.createElement("span");
+    span.className = i === parts.length - 1 ? "breadcrumb-file" : "";
+    span.textContent = part;
+    breadcrumbEl.appendChild(span);
+  });
+}
+
 // Editor tab management
 async function createEditorTab(filePath, options = {}) {
   const { line, column } = options;
@@ -592,20 +613,7 @@ async function createEditorTab(filePath, options = {}) {
   // Breadcrumb
   const breadcrumb = document.createElement("div");
   breadcrumb.className = "editor-breadcrumb";
-  const homePath = filePath.replace(/^\/Users\/[^/]+/, "~");
-  const parts = homePath.split("/");
-  parts.forEach((part, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "breadcrumb-separator";
-      sep.textContent = "›";
-      breadcrumb.appendChild(sep);
-    }
-    const span = document.createElement("span");
-    span.className = i === parts.length - 1 ? "breadcrumb-file" : "";
-    span.textContent = part;
-    breadcrumb.appendChild(span);
-  });
+  renderBreadcrumb(breadcrumb, filePath);
   containerEl.appendChild(breadcrumb);
 
   // Editor content area
@@ -1140,6 +1148,10 @@ listen("fs-changed", (event) => {
       if (tab.type !== "editor") continue;
       try {
         const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
+        if (tab.stale) {
+          tab.stale = false;
+          renderTabBar();
+        }
         const editorContent = tab.editorView.state.doc.toString();
         if (diskContent === editorContent) continue;
         if (!tab.modified) {
@@ -1162,9 +1174,50 @@ listen("fs-changed", (event) => {
             }
           );
         }
-      } catch (_) {}
+      } catch (err) {
+        // Distinguish "file no longer exists" (common after a rebase/reset)
+        // from transient read errors. Deleted files get a one-time toast
+        // and a stale flag on the tab so the user sees the state change
+        // instead of silently keeping a tab tied to a vanished path.
+        const errStr = String(err);
+        const missing = errStr.includes("No such file") || errStr.includes("not found");
+        if (missing && !tab.stale) {
+          tab.stale = true;
+          showToast(`${tab.fileName} was deleted on disk`, "error");
+          renderTabBar();
+        } else if (!missing) {
+          console.error("Reload failed for", tab.filePath, err);
+        }
+      }
     }
   }, 500);
+});
+
+// When a file or directory is renamed through the file-browser context
+// menu, update any open editor tab pointing at the old path (or a child
+// of it, if a directory was renamed) so Cmd+S doesn't silently create a
+// ghost file at the stale location.
+window.addEventListener("launchpad:path-renamed", (e) => {
+  const { oldPath, newPath, isDir } = e.detail || {};
+  if (!oldPath || !newPath) return;
+  let anyUpdated = false;
+  for (const [, tab] of tabs) {
+    if (tab.type !== "editor") continue;
+    let updatedPath = null;
+    if (tab.filePath === oldPath) {
+      updatedPath = newPath;
+    } else if (isDir && tab.filePath.startsWith(oldPath + "/")) {
+      updatedPath = newPath + tab.filePath.slice(oldPath.length);
+    }
+    if (updatedPath) {
+      tab.filePath = updatedPath;
+      tab.fileName = updatedPath.split("/").pop();
+      const bc = tab.containerEl.querySelector(".editor-breadcrumb");
+      if (bc) renderBreadcrumb(bc, updatedPath);
+      anyUpdated = true;
+    }
+  }
+  if (anyUpdated) renderTabBar();
 });
 
 // Resize observer

@@ -306,8 +306,19 @@ function showContextMenu(x, y, entry) {
         }
         committed = true;
         const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/"));
-        invoke("rename_path", { oldPath: entry.path, newPath: parentDir + "/" + newName })
-          .then(() => refreshFileBrowser())
+        const newPath = parentDir + "/" + newName;
+        invoke("rename_path", { oldPath: entry.path, newPath })
+          .then(() => {
+            // Announce to any interested module (main.js updates open
+            // editor tabs pointing at the old path, so Cmd+S doesn't
+            // silently write to the stale filename).
+            window.dispatchEvent(
+              new CustomEvent("launchpad:path-renamed", {
+                detail: { oldPath: entry.path, newPath, isDir: entry.is_dir },
+              })
+            );
+            refreshFileBrowser();
+          })
           .catch((err) => {
             committed = false;
             alert("Failed to rename: " + err);
