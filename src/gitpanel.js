@@ -4,14 +4,29 @@ import { matches as keyMatches } from "./keymap.js";
 
 const { invoke } = window.__TAURI__.core;
 
-// Wraps invoke with a timeout to prevent indefinite hangs on network operations
-function invokeWithTimeout(command, args, timeoutMs = 30000) {
-  return Promise.race([
-    invoke(command, args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Operation timed out")), timeoutMs)
-    ),
-  ]);
+// Wraps invoke with a timeout to prevent indefinite hangs on network
+// operations. Tauri IPC has no cancellation — Promise.race rejecting does
+// NOT stop the Rust side, so on timeout we explicitly call cancel_git_op
+// to kill the git child process and free its PID slot. Without this, every
+// timeout leaks a git process and occupies the single-slot pid_store,
+// making subsequent ops uncancellable.
+async function invokeWithTimeout(command, args, timeoutMs = 30000) {
+  let timedOut = false;
+  let timerId;
+  const timer = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      timedOut = true;
+      reject(new Error("Operation timed out"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([invoke(command, args), timer]);
+  } finally {
+    clearTimeout(timerId);
+    if (timedOut) {
+      try { await invoke("cancel_git_op"); } catch (_) {}
+    }
+  }
 }
 
 // ─── Module-level state ────────────────────────────────────────────────────────
@@ -908,14 +923,21 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     btn.textContent = labelBusy;
     // Show cancel button for network operations
     let cancelBtn = null;
+    let cancelled = false;
     if (["git_fetch", "git_pull", "git_push"].includes(command)) {
       cancelBtn = document.createElement("button");
       cancelBtn.className = "gp-cancel-btn";
       cancelBtn.textContent = "Cancel";
       cancelBtn.addEventListener("click", async (ce) => {
         ce.stopPropagation();
-        await invoke("cancel_git_op");
-        showGitFeedback("Operation cancelled", "error");
+        // Set the flag synchronously so the outer catch knows the failure
+        // was user-initiated, even if the main op rejects before cancel
+        // returns. Disable the button + swap label so repeated clicks are
+        // ignored and the user sees progress.
+        cancelled = true;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "Cancelling…";
+        try { await invoke("cancel_git_op"); } catch (_) {}
       });
       btn.parentElement.insertBefore(cancelBtn, btn.nextSibling);
     }
@@ -925,7 +947,11 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
-      showGitFeedback(`${msgError}: ${err}`, "error");
+      if (cancelled) {
+        showGitFeedback("Operation cancelled", "error");
+      } else {
+        showGitFeedback(`${msgError}: ${err}`, "error");
+      }
     } finally {
       btn.disabled = false;
       btn.textContent = labelDefault;
