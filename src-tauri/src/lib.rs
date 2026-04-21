@@ -1392,26 +1392,18 @@ fn apply_git_env(cmd: &mut std::process::Command) {
     }
 }
 
-// Runs a git command as a spawned process, storing its PID in AppState so
-// cancel_git_op can kill it. Returns stdout on success, stderr on failure.
-fn run_git_cancellable(
+// Spawn a git child under an already-reserved slot (caller owns the
+// reservation and the final cleanup). Records the PID on the slot, honors a
+// cancel that arrived during the spawn window by killing immediately, and
+// on return clears the PID on the slot so a subsequent call under the same
+// reservation gets a fresh pid field and can't accidentally target the
+// wrong child. The cancelled flag persists across calls on the same slot.
+fn spawn_git_under_slot(
     args: &[&str],
     path: &str,
     pid_store: &Arc<Mutex<Option<GitOpSlot>>>,
-    counter: &Arc<AtomicU64>,
+    op_id: u64,
 ) -> Result<String, String> {
-    // Reserve the slot BEFORE spawn. If cancel arrives in the window between
-    // spawn() and PID-record, it can now set `cancelled=true` on our slot,
-    // which we observe after spawn and act on by killing the just-spawned
-    // child. Without this reservation, cancel reads None and the op runs to
-    // completion uncancelled.
-    let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    *pid_store.lock().unwrap() = Some(GitOpSlot {
-        op_id,
-        pid: None,
-        cancelled: false,
-    });
-
     let mut command = std::process::Command::new("git");
     command
         .args(args)
@@ -1420,23 +1412,9 @@ fn run_git_cancellable(
         .stderr(std::process::Stdio::piped());
     apply_git_env(&mut command);
 
-    let child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            // Spawn failed — clear our reservation if it's still ours.
-            let mut guard = pid_store.lock().unwrap();
-            if let Some(ref s) = *guard {
-                if s.op_id == op_id {
-                    *guard = None;
-                }
-            }
-            return Err(e.to_string());
-        }
-    };
-
+    let child = command.spawn().map_err(|e| e.to_string())?;
     let pid = child.id();
 
-    // Record PID and detect whether cancel beat us to the spawn.
     let kill_now = {
         let mut guard = pid_store.lock().unwrap();
         match guard.as_mut() {
@@ -1457,14 +1435,14 @@ fn run_git_cancellable(
 
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
-    // Only clear the slot if it still matches our op. A racing cancel_git_op
-    // may have already observed and cleared it, or a subsequent operation
-    // may already have replaced it — in either case leave it alone.
+    // Clear PID on the slot — but NOT the slot itself. The caller may run
+    // another spawn under the same reservation (git_push's auto-upstream
+    // retry does this), and we want the shared `cancelled` flag to persist.
     {
         let mut guard = pid_store.lock().unwrap();
-        if let Some(ref s) = *guard {
+        if let Some(s) = guard.as_mut() {
             if s.op_id == op_id {
-                *guard = None;
+                s.pid = None;
             }
         }
     }
@@ -1478,24 +1456,100 @@ fn run_git_cancellable(
     }
 }
 
+// Reserve a slot, spawn a single git command, clean up. For multi-step ops
+// (e.g. push-then-retry-with-upstream) that need a cancel to span the full
+// sequence, reserve a slot manually and call spawn_git_under_slot directly.
+fn run_git_cancellable(
+    args: &[&str],
+    path: &str,
+    pid_store: &Arc<Mutex<Option<GitOpSlot>>>,
+    counter: &Arc<AtomicU64>,
+) -> Result<String, String> {
+    // Reserve the slot BEFORE spawn. If cancel arrives in the window between
+    // spawn() and PID-record, it sets `cancelled=true` on our slot, which
+    // spawn_git_under_slot observes and acts on by killing the child.
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    *pid_store.lock().unwrap() = Some(GitOpSlot {
+        op_id,
+        pid: None,
+        cancelled: false,
+    });
+
+    let result = spawn_git_under_slot(args, path, pid_store, op_id);
+
+    // Only clear the slot if it still matches our op. A subsequent operation
+    // may already have replaced it — in that case leave it alone.
+    {
+        let mut guard = pid_store.lock().unwrap();
+        if let Some(ref s) = *guard {
+            if s.op_id == op_id {
+                *guard = None;
+            }
+        }
+    }
+
+    result
+}
+
 #[tauri::command]
 fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
     let pid_store = Arc::clone(&state.git_op_pid);
     let counter = Arc::clone(&state.git_op_counter);
-    let result = run_git_cancellable(&["push"], &path, &pid_store, &counter);
 
-    if let Err(ref stderr) = result {
-        if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
-            let mut branch_cmd = std::process::Command::new("git");
-            branch_cmd
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .current_dir(&path);
-            apply_git_env(&mut branch_cmd);
-            let branch_output = branch_cmd.output().map_err(|e| e.to_string())?;
-            let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-            return run_git_cancellable(&["push", "--set-upstream", "origin", &branch], &path, &pid_store, &counter);
+    // Reserve ONE slot that spans both the initial push and the optional
+    // auto-upstream retry. A cancel arriving in the window between the two
+    // attempts would otherwise find an empty pid_store and be lost — with
+    // one shared reservation, the cancelled flag persists and the retry's
+    // child is killed as soon as it's spawned.
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    *pid_store.lock().unwrap() = Some(GitOpSlot {
+        op_id,
+        pid: None,
+        cancelled: false,
+    });
+
+    let result = (|| -> Result<String, String> {
+        match spawn_git_under_slot(&["push"], &path, &pid_store, op_id) {
+            Ok(out) => Ok(out),
+            Err(stderr) => {
+                if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
+                    let mut branch_cmd = std::process::Command::new("git");
+                    branch_cmd
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(&path);
+                    apply_git_env(&mut branch_cmd);
+                    let branch = branch_cmd
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    if branch.is_empty() {
+                        return Err(
+                            "Could not determine current branch for upstream push".to_string(),
+                        );
+                    }
+                    spawn_git_under_slot(
+                        &["push", "--set-upstream", "origin", &branch],
+                        &path,
+                        &pid_store,
+                        op_id,
+                    )
+                } else {
+                    Err(stderr)
+                }
+            }
+        }
+    })();
+
+    // Release the reservation.
+    {
+        let mut guard = pid_store.lock().unwrap();
+        if let Some(ref s) = *guard {
+            if s.op_id == op_id {
+                *guard = None;
+            }
         }
     }
+
     result
 }
 
@@ -1539,22 +1593,24 @@ fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn git_merge_branch(path: String, branch_name: String) -> Result<String, String> {
+fn git_merge_branch(
+    path: String,
+    branch_name: String,
+    state: State<AppState>,
+) -> Result<String, String> {
     // Validate branch name to prevent option injection
     if !branch_name.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c)) {
         return Err("Invalid branch name".into());
     }
-    let mut merge_cmd = std::process::Command::new("git");
-    merge_cmd
-        .args(["merge", &branch_name])
-        .current_dir(&path);
-    apply_git_env(&mut merge_cmd);
-    let output = merge_cmd.output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    // Merge can block on network I/O if the user's git config pulls on merge
+    // or the operation touches a remote tracking ref. Route it through
+    // run_git_cancellable so cancel_git_op can kill it.
+    run_git_cancellable(
+        &["merge", &branch_name],
+        &path,
+        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_counter),
+    )
 }
 
 #[tauri::command]
