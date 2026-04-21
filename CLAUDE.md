@@ -56,9 +56,13 @@ specs/                  # Design specs (project model, agent model, etc.)
 ### File Browser
 - **Root locked to project**: `setRoot()` guards against any path outside `projectRoot`. Nav-up ↑ is capped at the project root (no-op when already there). Go-home ⌂ jumps back to the project root.
 - **No terminal disruption**: The file browser holds no concept of the terminal's cwd. Browsing subfolders never writes anything to a PTY — CLI agents (Claude, Aider, etc.) are safe from accidental `cd`.
-- **CRUD operations**: Right-click context menu supports new file, new folder, rename, delete, and reveal in Finder. Uses `create_file`, `create_directory`, `rename_path`, `delete_path`, and `reveal_in_finder` commands.
+- **CRUD operations**: Right-click context menu supports new file, new folder, rename, delete, and reveal in Finder. Uses `create_file`, `create_directory`, `rename_path`, `delete_path`, and `reveal_in_finder` commands. `delete_path` takes an optional `project_root` arg and refuses to delete outside it (cheap defense-in-depth on top of the UI-level root guard).
+- **Rename propagation**: A rename via the context menu dispatches a `launchpad:path-renamed` CustomEvent that `main.js` listens for. Any open editor tab whose `filePath` matches the old path (or is a descendant of a renamed directory) gets its `filePath`, `fileName`, and breadcrumb updated in place — so Cmd+S doesn't silently write to the stale filename.
+- **External rename via inode**: Unix `rename(2)` preserves inode, so `createEditorTab` captures `tab.inode` via `get_file_inode` at open time. If the fs-changed reload of a tab's file fails with "No such file", the frontend calls `find_path_by_inode(project_root, tab.inode)` — a bounded project-tree walk (same skip rules as `search_files`). On match, the tab is relocated AND its content reread (so git rename-and-edit doesn't leave the editor on stale text). On no match, the tab is flagged `stale` (strikethrough label + one-time toast).
 - **Off-DOM tree building**: The file tree is built in a detached DOM fragment and swapped in a single operation to prevent flicker when expanding folders.
-- **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the project root recursively. Started once in `enterWorkspace()`. Emits `fs-changed` Tauri events that trigger `refreshFileBrowser()` and git status updates. Frontend throttles to 500ms.
+- **Refresh coalescing**: `refreshFileBrowser` tracks a `refreshDirty` flag — calls that arrive while a load is in-flight set the flag instead of being dropped, and the load re-runs once when it finishes. Bursty fs-changed events (e.g., from `git pull`) can't leave the tree stale.
+- **Entry tolerance**: `read_directory` falls through to sensible defaults when `metadata()` fails (permission denied, TOCTOU delete), so the listing isn't silently truncated; non-UTF-8 filenames surface with replacement chars via `to_string_lossy`.
+- **Live filesystem watcher**: Uses the `notify` crate (FSEvents on macOS) with 300ms debounce to watch the project root recursively. Started once in `enterWorkspace()`. `watch_directory` canonicalizes its path, emits `fs-changed` events against that canonical form, and returns it — the frontend stores the returned canonical path as `watchedProjectPath` and uses it for event-path comparison, so a project opened via a symlink alias (e.g. macOS `/var` → `/private/var`) doesn't drop every event.
 
 ### Terminal
 - **Multi-PTY with deferred reader**: Each terminal tab/pane spawns its own PTY via `portable-pty`. The reader thread is NOT started during `spawn_pty` — instead, the frontend calls `start_pty_reader` AFTER registering the pane in `paneMap`, preventing a race where early output gets dropped.
@@ -72,18 +76,28 @@ specs/                  # Design specs (project model, agent model, etc.)
 - **Features**: Bracket matching, close brackets, fold gutter, indent on input, autocompletion, lint gutter, highlight selection matches, rectangular selection, crosshair cursor.
 - **Supported languages**: JS, TS, JSX, TSX, Python, Rust, HTML, CSS, JSON, Markdown, SCSS, TOML, YAML, Shell.
 - **Context menu**: Right-click in editor shows Cut, Copy, Paste, Select All with disabled states based on selection/clipboard.
+- **External-change handling**: The `fs-changed` listener walks open editor tabs and calls `read_file_preview` on each. Unchanged → skip; changed + not-dirty → silent reload; changed + dirty → confirm dialog. Missing → first try inode relocation (see File Browser), then flag the tab `stale` with a toast if unresolved. Errors are caught per-tab so one bad file doesn't abort the whole pass.
+- **Tab shape**: editor tabs carry `{ type: "editor", containerEl, filePath, fileName, inode, editorView, originalContent, modified, stale }`. `stale` adds a `.tab-stale` CSS class (red strikethrough) so the visual marker persists after the one-time toast fades.
+- **File-open error surfacing**: `createEditorTab` catches `read_file_preview` errors (binary, UTF-16, permission, missing) and shows the Rust error string via `showToast`. Previously this was a silent `return null` — user clicked, nothing happened, no feedback.
 
 ### Git
-- **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, fetch, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers. Network ops are cancellable via `cancel_git_op` which kills the spawned process by PID.
+- **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, fetch, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers. Network ops are cancellable via `cancel_git_op`.
+- **Spawned git env hardening** (`apply_git_env` in `lib.rs`): every spawned `git` Command sets `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=echo` so HTTPS remotes without a working credential helper fail fast with an auth error instead of blocking forever on a stdin pipe that has no TTY. `SSH_AUTH_SOCK` is forwarded via `resolve_ssh_auth_sock()`, which falls back to `launchctl getenv SSH_AUTH_SOCK` on macOS when the `.app` was launched from Finder/Dock (GUI-launched bundles don't inherit it from the login shell). Negative lookups are cached for only 60s so late-registered agents recover without an app restart.
+- **Cancel semantics** (`GitOpSlot` in `AppState`): the in-flight slot is `{ op_id, pid: Option<u32>, cancelled: bool }`, **reserved before `spawn()`** so a cancel arriving in the window between spawn and PID-record still sets `cancelled=true`. `spawn_git_under_slot` observes the flag after spawn and kills the just-created child. Kill uses `kill -9` (SIGKILL) because a git process deep in a stalled TCP `recv()` often ignores SIGTERM — the exact scenario Cancel is for. `cancel_git_op` sets the flag and kills if a PID is recorded; it does NOT clear the slot (`run_git_cancellable`'s cleanup owns that and gates on op_id match).
+- **Shared reservation across retry**: `git_push` holds ONE slot across the initial push AND the optional `--set-upstream` retry, so a cancel arriving between the two attempts still applies. Upstream presence is determined via libgit2 (`git_upstream_status`) before the spawn — stderr-substring matching was locale-fragile.
+- **Merge is cancellable**: `git_merge_branch` routes through `run_git_cancellable`. The JS call site sets `inFlightOp` around the invoke so the 3s git-panel poll can't re-render the toolbar mid-merge.
 - **Git status dual entries**: `get_git_status` emits separate entries for staged (`index_new`, `index_modified`, `index_deleted`) and unstaged (`new`, `modified`, `deleted`) changes. A file can appear in both lists.
+- **Status tree coloring** (`git.js`): `applyGitColors` anchors on the project root (`currentGitRoot`) — strips it from each `.file-entry`'s absolute path and does an exact match against the git-relative status map, with a fallback for ancestor-directory rollup. Previously used `endsWith` which misattributed status between same-named files in sibling trees.
+- **Discard handles untracked**: `git_discard_file` detects `wt_new` and deletes from disk (including the `GIT_ENOTFOUND` fallback for files inside untracked directories, where libgit2's `status_file` can't see the child). `checkout_head` alone would silently no-op.
 
 ### Settings & State
 - **Live settings**: Settings changes apply immediately to all open terminals/editors. Stored as JSON at `~/.launchpad/config.json`.
-- **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Written atomically via temp-file + rename. Path canonicalization dedupes equivalent paths. See `specs/project-model-spec.md`.
+- **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Path canonicalization dedupes equivalent paths. See `specs/project-model-spec.md`.
+- **Atomic writes**: `atomic_write(dest, data)` in `lib.rs` is the shared helper for every user-facing write (user code via `write_file`, settings via `save_settings`/`save_file_settings`, projects via `write_projects_file`, project-env via `write_project_env_file`). Writes to `.<name>.lp-tmp-<pid>-<counter>` (PID + `AtomicU64` counter to avoid collisions between concurrent same-dest writes from multiple windows in the same process), `fsync`, preserves existing mode, then `rename`. A crash / kill / ENOSPC mid-write leaves the old file intact. `atomic_write_with_mode(dest, data, Some(mode))` is used for secrets files so the chmod happens on the temp BEFORE rename (no 0o644 window on first-write for `project-env.json`).
 - **No framework**: Vanilla JS with direct DOM manipulation. Keeps the bundle small and fast.
 
 ### Per-Project Environment
-- **Stored at `~/.launchpad/project-env.json`**, keyed by canonicalized project path, chmod `0o600` (owner read/write only) so other users on the box can't read stored secrets. Atomic write (temp + rename). Each entry is an array of `{ key, value, secret }`.
+- **Stored at `~/.launchpad/project-env.json`**, keyed by canonicalized project path, chmod `0o600` (owner read/write only) so other users on the box can't read stored secrets. Writes go through `atomic_write_with_mode(path, body, Some(0o600))` so the 0o600 is applied to the temp file BEFORE rename — no window where the file exists on disk at the default umask 0o644. Each entry is an array of `{ key, value, secret }`.
 - **Injection site**: `spawn_pty` in `lib.rs` applies these vars AFTER the parent-env inherit loop and BEFORE the `TERM` / `COLORTERM` / `TERM_PROGRAM` / `LANG` overrides. That order lets a project override `PATH` or `ANTHROPIC_API_KEY`, but prevents a stray `TERM=garbage` entry from breaking terminal capability detection.
 - **Scope**: every PTY spawned for the active project (tab, split pane, right-group tab) gets the project's env. Existing terminals don't retroactively update — OS-level reality, surfaced in the UI copy as "Applies to new terminals."
 - **Lookup**: `load_env_for_project(path)` canonicalizes `path` the same way the projects file does, so two different strings for the same dir dedupe cleanly.
@@ -142,16 +156,19 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - `write_debug_log(content)` — write debug capture to `~/.launchpad/debug.log`
 
 ### Filesystem
-- `read_directory(path)` — list directory contents (sorted: dirs first, then alpha)
-- `search_files(root, query, max_results?)` — fuzzy file search (skips hidden dirs, node_modules, target, etc.)
-- `read_file_preview(path, max_bytes?)` — read file content (default 8KB limit, binary detection)
-- `write_file(path, content)` — write file to disk (10MB limit)
+- `read_directory(path)` — list directory contents (sorted: dirs first, then alpha). Tolerant: entries whose `metadata()` fails fall through to defaults instead of being dropped.
+- `search_files(root, query, max_results?)` — fuzzy file search (skips hidden dirs, node_modules, target, etc.). Siblings sorted before recursing so walk order is deterministic.
+- `search_in_files(root, query, case_sensitive, is_regex, max_results?)` — project-wide content search with the same skip rules.
+- `read_file_preview(path, max_bytes?)` — streams up to `max_bytes` via `File::take` (no full-file slurp). Binary heuristic: rejects files with a UTF-16 BOM with an actionable message; otherwise rejects when null bytes exceed 1% of the prefix (with a 64-byte minimum so tiny files with a single null aren't wrongly flagged).
+- `write_file(path, content)` — write file to disk (10MB limit). Uses `atomic_write`.
 - `create_file(path)` — create new empty file (errors if exists)
 - `create_directory(path)` — create directory (recursive)
-- `delete_path(path)` — delete file or directory recursively
+- `delete_path(path, project_root?)` — delete file or directory recursively. When `project_root` is supplied, refuses deletions outside it (canonicalize + `starts_with` check). The context-menu caller always passes it.
 - `rename_path(old_path, new_path)` — rename/move file or directory
-- `watch_directory(path)` — start recursive filesystem watcher, emits `fs-changed` events
-- `unwatch_directory(path)` — stop watching a directory
+- `get_file_inode(path) -> u64` — inode number of the file at `path`. Captured at editor-open time so external renames can be followed (Unix rename preserves inode).
+- `find_path_by_inode(root, inode) -> Option<String>` — walks the project tree (same skip rules as `search_files`, depth limit 12) looking for a file with the given inode. Returns the first match. Used to relocate editor tabs after Finder/mv/git renames.
+- `watch_directory(path) -> String` — canonicalizes `path`, starts recursive filesystem watcher on the canonical form, and **returns the canonical path**. Frontend stores this for fs-changed event comparison (so symlink aliases don't drop events). Emits `fs-changed` events against the canonical path.
+- `unwatch_directory(path)` — stop watching a directory. Tries both raw and canonical forms.
 - `pick_directory()` — native macOS folder picker via osascript
 - `reveal_in_finder(path)` — reveal file/folder in Finder
 - `get_home_dir()` — returns user's home directory path
@@ -166,9 +183,9 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - `git_stage_file(path, file_path)` / `git_unstage_file(path, file_path)` / `git_stage_all(path)` / `git_unstage_all(path)`
 - `git_discard_file(path, file_path)` — discard unstaged changes
 - `git_commit(path, message)` — create commit, returns short OID
-- `git_push(path)` — push (auto-sets upstream if needed)
-- `git_pull(path)` / `git_fetch(path)` / `git_merge_branch(path, branch_name)`
-- `cancel_git_op()` — kill in-flight network git operation by PID
+- `git_push(path)` — upstream presence determined via libgit2 before spawn; no-upstream branches use `push --set-upstream origin <branch>` under the same cancellable slot as the initial push.
+- `git_pull(path)` / `git_fetch(path)` / `git_merge_branch(path, branch_name)` — all routed through `run_git_cancellable`. Merge includes option-injection validation on `branch_name`.
+- `cancel_git_op()` — sets `cancelled=true` on the current `GitOpSlot` and `kill -9`s the recorded PID (if any). If called during the spawn window (PID not yet recorded), the flag is observed by `spawn_git_under_slot` after spawn and the just-created child is killed.
 - `git_stash_save(path)` / `git_stash_pop(path)` / `git_stash_list(path)` / `git_stash_apply(path, index)` / `git_stash_drop(path, index)`
 - `get_file_diff(path, file_path, staged?)` — structured file diff with hunks and line numbers
 - `get_commit_details(path, oid)` — commit detail with changed files and line stats
@@ -214,8 +231,14 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 The git panel (`gitpanel.js`) rebuilds its innerHTML on every refresh but uses a snapshot comparison (`JSON.stringify`) to skip redundant re-renders during 3-second polling. Module-level state (`expandedCommitOid`) persists across re-renders.
 
 Key patterns:
-- `refreshPanel(path, force)` — fetches status, branches, commits, remote URL in parallel
+- `refreshPanel(path, force, preloadedStatus?)` — fetches branches, commits, remote URL, stashes in parallel. Accepts a preloaded `status` so the poll path fetches `get_git_status` once (in `git.js:fetchGitStatus`) instead of twice per cycle. On project switch (new `path`), clears `commitDetailCache` and `expandedCommitOid`.
 - `renderPanel()` — builds all HTML via string concatenation, then wires event handlers via `querySelectorAll`
+- `inFlightOp` guard: `refreshPanel` early-returns on the polled path when a network op is running, so toolbar re-renders can't destroy the active button's click-handler and remove the Cancel button. The forced refresh at op-end clears the flag first so it still re-renders.
+- `invokeWithTimeout(command, args, timeoutMs)` — 30s default. On timeout, calls `cancel_git_op` so the orphaned git child is killed and the PID slot is freed (Tauri IPC has no cancellation, so without this the Rust side keeps running after `Promise.race` rejects).
+- `commitDetailCache` — OIDs are immutable, so detail responses cache indefinitely. Expanded commits render inline from cache on re-render (no double-fetch, no loading flicker). Cleared on project switch.
 - `showConfirmPopup()` — positioned popup for destructive actions (discard, delete branch)
-- `showGitFeedback()` — temporary toast for success/error messages
-- GitHub URL parsing handles both SSH and HTTPS remote formats
+- `showGitFeedback()` — temporary toast inside the git panel for success/error messages (panel-scoped)
+- GitHub URL parsing accepts alias hosts of the form `git@github.com-<suffix>:...` (common `~/.ssh/config` multi-account setup). Anchored on the literal `github.com` to reject spoofed hosts like `git@not-github.com` and `git@github.com.evil`.
+
+## Toast Notifications
+`main.js` exports `showToast(message, type)` for app-level errors and info events not scoped to a specific panel (file-open failures, external-rename notifications, deleted-on-disk warnings). Lazy-creates a fixed-position container at bottom-right (`z-index: 1100` so it sits above modal overlays at 1000), auto-dismisses after 4s. Types are `"error"` and `"info"`. The git panel keeps its own `showGitFeedback` for panel-scoped messages.

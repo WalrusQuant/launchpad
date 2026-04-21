@@ -109,7 +109,8 @@ Open with Cmd+G. A visual git workflow designed so you never have to remember gi
 - **Stash management** — save, pop, apply, and drop stashes
 - **Git cheatsheet** — hit `?` for a plain-English explanation of git concepts
 - **Auto-push with upstream** — first push to a new branch automatically sets up tracking
-- **Cancellable network ops** — push, pull, fetch, merge can be cancelled mid-operation
+- **Cancellable network ops** — push, pull, fetch, merge can be cancelled mid-operation, even on a stalled TCP connection
+- **HTTPS-safe defaults** — no interactive credential prompts (they'd hang forever in a GUI app with no TTY); SSH agent socket forwarded even when launched from Finder
 - **Ahead/behind indicators** — see how your branch compares to remote at a glance
 
 ### File Browser
@@ -119,6 +120,7 @@ Open with Cmd+G. A visual git workflow designed so you never have to remember gi
 - **Root-locked** — nav-up `↑` caps at the project root (can't escape above it), go-home `⌂` jumps back to the root from any depth
 - **CRUD operations** — right-click to create new files/folders, rename, delete, and reveal in Finder
 - **Live filesystem watcher** — files created, modified, or deleted from the terminal or externally appear instantly in the tree (no manual refresh needed)
+- **Follows external renames** — rename a file in Finder or via `mv` and the open editor tab follows it automatically (Unix inode match); deleted files get a stale-tab marker so Cmd+S can't silently write to a vanished path
 - **Off-DOM tree building** — folder expansion is flicker-free thanks to detached DOM fragment rendering
 - Click to open in editor, double-click folder to navigate
 - Drag files to terminal to paste the path
