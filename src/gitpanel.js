@@ -35,6 +35,12 @@ let currentPath = "";
 let lastSnapshot = null;
 let expandedCommitOid = null;
 let openFileInEditor = null;
+// True while a network git op (push/pull/fetch) is in flight. Polling
+// refreshPanel calls skip their renderPanel step while this is set so the
+// toolbar DOM — including the Cancel button and the busy-state on the
+// active button — isn't destroyed out from under the user. The final
+// forced refresh at op-end (force=true) is always allowed through.
+let inFlightOp = false;
 
 // ─── Status icon mapping ───────────────────────────────────────────────────────
 const STATUS_ICONS = {
@@ -89,6 +95,11 @@ export function togglePanel() {
 export async function refreshPanel(path, force = false) {
   if (path) currentPath = path;
   if (!panelVisible) return;
+  // Skip the whole refresh while a network op is running. Re-rendering the
+  // toolbar mid-push destroys the button the click-handler is attached to
+  // and removes the Cancel button, letting a second click launch a
+  // concurrent op that steals the pid_store slot.
+  if (inFlightOp && !force) return;
 
   const panel = document.getElementById("git-panel");
   const header = panel.querySelector(".gp-header");
@@ -924,7 +935,9 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     // Show cancel button for network operations
     let cancelBtn = null;
     let cancelled = false;
-    if (["git_fetch", "git_pull", "git_push"].includes(command)) {
+    const isNetworkOp = ["git_fetch", "git_pull", "git_push"].includes(command);
+    if (isNetworkOp) {
+      inFlightOp = true;
       cancelBtn = document.createElement("button");
       cancelBtn.className = "gp-cancel-btn";
       cancelBtn.textContent = "Cancel";
@@ -943,16 +956,21 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     }
     try {
       await invokeWithTimeout(command, { path: currentPath });
+      // Clear the in-flight flag BEFORE the forced refresh so renderPanel
+      // is allowed through and the toolbar returns to its fresh state.
+      if (isNetworkOp) inFlightOp = false;
       showGitFeedback(msgSuccess, "success");
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
+      if (isNetworkOp) inFlightOp = false;
       if (cancelled) {
         showGitFeedback("Operation cancelled", "error");
       } else {
         showGitFeedback(`${msgError}: ${err}`, "error");
       }
     } finally {
+      if (isNetworkOp) inFlightOp = false;
       btn.disabled = false;
       btn.textContent = labelDefault;
       if (cancelBtn) cancelBtn.remove();
