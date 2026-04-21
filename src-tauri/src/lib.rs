@@ -311,23 +311,36 @@ fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let mut files: Vec<FileEntry> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            let metadata = entry.metadata().ok()?;
-            let name = entry.file_name().into_string().ok()?;
+            // Use to_string_lossy so non-UTF-8 filenames (rare on macOS but
+            // possible) still show up with replacement characters rather
+            // than disappearing from the listing entirely.
+            let name = entry.file_name().to_string_lossy().to_string();
             let is_hidden = name.starts_with('.');
+            // Don't drop the entry if metadata fails (permission denied,
+            // or TOCTOU where the file was removed between read_dir and
+            // metadata). Fall through to sensible defaults so the user
+            // still sees what's there.
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = metadata
-                .modified()
-                .ok()
+                .as_ref()
+                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
+            let mode = metadata
+                .as_ref()
+                .map(|m| m.permissions().mode())
+                .unwrap_or(0);
 
             Some(FileEntry {
                 name,
                 path: entry.path().to_string_lossy().to_string(),
-                is_dir: metadata.is_dir(),
+                is_dir,
                 is_hidden,
-                size: metadata.len(),
+                size,
                 modified,
-                mode: metadata.permissions().mode(),
+                mode,
             })
         })
         .collect();
@@ -629,7 +642,7 @@ fn save_settings(data: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -658,7 +671,7 @@ fn save_file_settings(data: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -958,7 +971,12 @@ fn search_files(root: String, query: String, max_results: Option<usize>) -> Resu
             Ok(e) => e,
             Err(_) => return,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        // Sort siblings so walk order is deterministic. fs::read_dir's order
+        // is filesystem-dependent; with a result limit, a non-deterministic
+        // walk makes "which 20 files appear first" vary run-to-run.
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
             if results.len() >= limit {
                 return;
             }
@@ -1035,7 +1053,11 @@ fn search_in_files(
             Ok(e) => e,
             Err(_) => return,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        // Deterministic walk (same reason as search_files): keeps the set
+        // of matches visited before hitting `limit` stable across runs.
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
             if results.len() >= limit {
                 return;
             }
@@ -1139,13 +1161,85 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
 #[tauri::command]
 fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, String> {
     let limit = max_bytes.unwrap_or(8192);
-    let data = fs::read(&path).map_err(|e| e.to_string())?;
-    let truncated = &data[..data.len().min(limit)];
-    // Binary detection: null bytes in the first 8KB indicate a binary file
-    if truncated.contains(&0) {
-        return Err("Binary file \u{2014} cannot display".to_string());
+
+    // Stream only up to `limit` bytes so a 50 MB file opened for a 512 KB
+    // preview doesn't allocate 50 MB transiently.
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut data = Vec::with_capacity(limit.min(64 * 1024));
+    use std::io::Read;
+    file.take(limit as u64)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+
+    // UTF-16 BOM: surface a specific, actionable message instead of a
+    // generic "binary" refusal. UTF-16 ASCII-dominant text used to trip
+    // the old null-byte check as a false positive.
+    if data.len() >= 2
+        && (data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]))
+    {
+        return Err("UTF-16 file — re-save as UTF-8 to edit".into());
     }
-    Ok(String::from_utf8_lossy(truncated).to_string())
+
+    // Binary heuristic: real text files rarely contain ANY null bytes, but
+    // tolerate a small ratio so source files with null-in-string-literal
+    // don't get rejected. UTF-16-like content will have ~50% nulls, far
+    // above the 1% threshold. Only apply once we have enough bytes to
+    // make the ratio meaningful — a 20-byte file with one null otherwise
+    // looks like "5% null" and would be wrongly rejected.
+    if data.len() > 64 {
+        let null_count = data.iter().filter(|&&b| b == 0).count();
+        if null_count * 100 > data.len() {
+            return Err("Binary file — cannot display".into());
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&data).to_string())
+}
+
+// Write `data` to `dest` atomically: write to a sibling temp file, fsync,
+// then rename onto the destination. A crash / kill / ENOSPC mid-write
+// leaves the old file intact; a successful rename replaces it in one step.
+// Preserves the existing file's mode when overwriting.
+//
+// Temp name uses PID + a process-monotonic counter so two concurrent
+// writes from different windows (Tauri runs all windows in one process)
+// can't collide on the same temp path and corrupt each other.
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("launchpad-write");
+    let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = dest.with_file_name(format!(
+        ".{}.lp-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        counter
+    ));
+
+    let preserved_mode = fs::metadata(dest).ok().map(|m| m.permissions().mode());
+
+    let result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        // Mode preservation is best-effort — failing here (e.g. on a
+        // mount where chmod is denied) should not abort the whole write
+        // and lose the user's data.
+        if let Some(mode) = preserved_mode {
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
+        }
+        fs::rename(&tmp, dest)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[tauri::command]
@@ -1154,7 +1248,7 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     if content.len() > 10 * 1024 * 1024 {
         return Err("File content exceeds 10MB limit".into());
     }
-    fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(std::path::Path::new(&path), content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1172,7 +1266,18 @@ fn create_directory(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_path(path: String) -> Result<(), String> {
+fn delete_path(path: String, project_root: Option<String>) -> Result<(), String> {
+    // When a project_root is supplied, refuse deletions outside it. The
+    // context menu is the only caller today and always passes this, so in
+    // practice nothing unguarded reaches remove_dir_all. Cheap defense
+    // against a future caller handing an arbitrary path.
+    if let Some(root) = project_root {
+        let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
+        let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+        if !target.starts_with(&root_canon) {
+            return Err("Refusing to delete path outside project root".into());
+        }
+    }
     let p = std::path::Path::new(&path);
     if p.is_dir() {
         std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
@@ -1964,8 +2069,22 @@ fn get_home_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
-    let watch_path = path.clone();
+fn watch_directory(
+    path: String,
+    state: State<AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    // Canonicalize so the stored key and the emitted event path are stable
+    // regardless of symlink vs real-path or trailing-slash variations the
+    // caller happened to pass in. Returns the canonical form so the
+    // frontend can store it and compare fs-changed events against the
+    // exact same string.
+    let canonical = fs::canonicalize(&path)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    let emit_path = canonical.clone();
     let handle = app.clone();
 
     let mut debouncer = new_debouncer(
@@ -1973,7 +2092,12 @@ fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) 
         move |events: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             if let Ok(events) = events {
                 if !events.is_empty() {
-                    let _ = handle.emit("fs-changed", FsChanged { path: watch_path.clone() });
+                    let _ = handle.emit(
+                        "fs-changed",
+                        FsChanged {
+                            path: emit_path.clone(),
+                        },
+                    );
                 }
             }
         },
@@ -1983,21 +2107,31 @@ fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) 
     debouncer
         .watcher()
         .watch(
-            std::path::Path::new(&path),
+            std::path::Path::new(&canonical),
             notify::RecursiveMode::Recursive,
         )
         .map_err(|e| e.to_string())?;
 
     // Insert into the map, replacing any existing watcher for this path (dropping it stops the previous watch)
-    let mut guard = state.fs_watcher.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
-    guard.remove(&path);
-    guard.insert(path, debouncer);
-    Ok(())
+    let mut guard = state
+        .fs_watcher
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
+    guard.remove(&canonical);
+    guard.insert(canonical.clone(), debouncer);
+    Ok(canonical)
 }
 
 #[tauri::command]
 fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String> {
-    state.fs_watcher.lock().map_err(|e| e.to_string())?.remove(&path);
+    // Try both the raw path and its canonical form — callers may hold
+    // either (watch_directory returns the canonical version, but a teardown
+    // path built from the original project.path may still use the raw one).
+    let mut guard = state.fs_watcher.lock().map_err(|e| e.to_string())?;
+    guard.remove(&path);
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        guard.remove(&canonical.to_string_lossy().to_string());
+    }
     Ok(())
 }
 

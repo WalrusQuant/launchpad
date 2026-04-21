@@ -22,6 +22,32 @@ import { showPicker, hidePicker } from "./projectpicker.js";
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// Cached home directory for path-shortening in breadcrumbs. Set once at
+// boot from get_home_dir (see boot()), not hardcoded — supports corporate
+// macOS setups with email-style usernames, Docker mounts, and Linux.
+let homeDir = "";
+
+// Floating toast for app-level errors (file-open failures, rename/delete
+// errors, etc.) that aren't bound to a specific panel. Lazy-creates the
+// container on first use; auto-dismisses after 4s. type is "error" | "info".
+export function showToast(message, type = "error") {
+  let container = document.getElementById("app-toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "app-toast-container";
+    container.className = "app-toast-container";
+    document.body.appendChild(container);
+  }
+  const el = document.createElement("div");
+  el.className = `app-toast app-toast-${type}`;
+  el.textContent = message;
+  container.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("app-toast-leaving");
+    setTimeout(() => el.remove(), 200);
+  }, 4000);
+}
+
 // Tab management
 // Terminal tab: { type: "terminal", panes: [pane, pane?], containerEl, name, activePane: 0|1 }
 // Editor tab:   { type: "editor", containerEl, filePath, fileName, editorView, originalContent, modified }
@@ -537,6 +563,31 @@ async function doCloseTab(uiId) {
   }
 }
 
+// Build (or rebuild) a breadcrumb element's contents for a file path. Used
+// both when creating an editor tab and when updating after an external
+// rename.
+function renderBreadcrumb(breadcrumbEl, filePath) {
+  breadcrumbEl.replaceChildren();
+  // Replace the resolved home dir with "~" instead of assuming
+  // /Users/<name> at depth 2 (fails on corporate setups / Docker / Linux).
+  const homePath = homeDir && filePath.startsWith(homeDir)
+    ? "~" + filePath.slice(homeDir.length)
+    : filePath;
+  const parts = homePath.split("/");
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "breadcrumb-separator";
+      sep.textContent = "›";
+      breadcrumbEl.appendChild(sep);
+    }
+    const span = document.createElement("span");
+    span.className = i === parts.length - 1 ? "breadcrumb-file" : "";
+    span.textContent = part;
+    breadcrumbEl.appendChild(span);
+  });
+}
+
 // Editor tab management
 async function createEditorTab(filePath, options = {}) {
   const { line, column } = options;
@@ -555,6 +606,10 @@ async function createEditorTab(filePath, options = {}) {
     content = await invoke("read_file_preview", { path: filePath, maxBytes: 512000 });
   } catch (err) {
     console.error("Failed to read file:", err);
+    // Previously this was a silent no-op: user clicks a file, nothing
+    // opens, no feedback. Surface the Rust error (binary detection,
+    // permission denied, missing path) via a toast.
+    showToast(`Could not open ${fileName}: ${err}`, "error");
     return null;
   }
 
@@ -567,20 +622,7 @@ async function createEditorTab(filePath, options = {}) {
   // Breadcrumb
   const breadcrumb = document.createElement("div");
   breadcrumb.className = "editor-breadcrumb";
-  const homePath = filePath.replace(/^\/Users\/[^/]+/, "~");
-  const parts = homePath.split("/");
-  parts.forEach((part, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "breadcrumb-separator";
-      sep.textContent = "›";
-      breadcrumb.appendChild(sep);
-    }
-    const span = document.createElement("span");
-    span.className = i === parts.length - 1 ? "breadcrumb-file" : "";
-    span.textContent = part;
-    breadcrumb.appendChild(span);
-  });
+  renderBreadcrumb(breadcrumb, filePath);
   containerEl.appendChild(breadcrumb);
 
   // Editor content area
@@ -926,7 +968,9 @@ function renderTabBar() {
     if (tab._rightGroup) continue; // skip tabs in the right split group
     const isActive = uiId === activeTabUiId;
     const tabEl = document.createElement("div");
-    tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
+    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
+    if (staleClass) tabEl.title = "File no longer exists on disk";
     tabEl.dataset.tabId = uiId;
     tabEl.setAttribute("role", "tab");
     tabEl.setAttribute("aria-selected", isActive ? "true" : "false");
@@ -1094,49 +1138,113 @@ listen("pty-exit", (event) => {
 
 // Listen for filesystem changes — refresh file browser and git panel
 let fsRefreshScheduled = false;
+let fsRefreshDirty = false; // coalesces events that arrive during in-flight work
+let watchedProjectPath = null; // canonical path returned by watch_directory
 listen("fs-changed", (event) => {
   const project = getActiveProject();
   // Watcher is only started for the active project root, so a mismatch means
   // this event is from a stale watcher the frontend no longer cares about.
-  if (!project || event.payload.path !== project.path) return;
-  if (fsRefreshScheduled) return;
+  // Compare against the canonical path watch_directory returned — symlinked
+  // project roots make event.payload.path differ from project.path.
+  if (!project || !watchedProjectPath || event.payload.path !== watchedProjectPath) return;
+  if (fsRefreshScheduled) {
+    // An event arrived while we're mid-work. Don't drop it — set a dirty
+    // flag and the IIFE will re-run the loop once the current pass ends.
+    fsRefreshDirty = true;
+    return;
+  }
   fsRefreshScheduled = true;
-  setTimeout(async () => {
-    fsRefreshScheduled = false;
-    refreshFileBrowser();
-    fetchGitStatus(project.path);
-    refreshPanel(null, true);
+  // The Rust debouncer already coalesces bursts at 300 ms; the old
+  // frontend 500 ms setTimeout stacked on top of that produced ~800 ms of
+  // post-change lag for no benefit. Run immediately (inside an async IIFE
+  // so await on the tab-reload loop still works).
+  (async () => {
+    try {
+      do {
+        fsRefreshDirty = false;
+        refreshFileBrowser();
+        fetchGitStatus(project.path);
+        refreshPanel(null, true);
 
-    // Check open editor tabs for external file changes
-    for (const [uiId, tab] of tabs) {
-      if (tab.type !== "editor") continue;
-      try {
-        const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
-        const editorContent = tab.editorView.state.doc.toString();
-        if (diskContent === editorContent) continue;
-        if (!tab.modified) {
-          // No local edits — silently reload
-          tab.editorView.dispatch({
-            changes: { from: 0, to: editorContent.length, insert: diskContent },
-          });
-          tab.originalContent = diskContent;
-        } else {
-          // User has unsaved changes — prompt
-          showConfirmDialog(
-            `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
-            () => {
-              tab.editorView.dispatch({
-                changes: { from: 0, to: tab.editorView.state.doc.length, insert: diskContent },
-              });
-              tab.originalContent = diskContent;
-              tab.modified = false;
-              renderTabBar();
-            }
-          );
+        // Check open editor tabs for external file changes
+        for (const [uiId, tab] of tabs) {
+        if (tab.type !== "editor") continue;
+        try {
+          const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
+          if (tab.stale) {
+            tab.stale = false;
+            renderTabBar();
+          }
+          const editorContent = tab.editorView.state.doc.toString();
+          if (diskContent === editorContent) continue;
+          if (!tab.modified) {
+            // No local edits — silently reload
+            tab.editorView.dispatch({
+              changes: { from: 0, to: editorContent.length, insert: diskContent },
+            });
+            tab.originalContent = diskContent;
+          } else {
+            // User has unsaved changes — prompt
+            showConfirmDialog(
+              `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
+              () => {
+                tab.editorView.dispatch({
+                  changes: { from: 0, to: tab.editorView.state.doc.length, insert: diskContent },
+                });
+                tab.originalContent = diskContent;
+                tab.modified = false;
+                renderTabBar();
+              }
+            );
+          }
+        } catch (err) {
+          // Distinguish "file no longer exists" (common after a rebase/reset)
+          // from transient read errors. Deleted files get a one-time toast
+          // and a stale flag on the tab so the user sees the state change
+          // instead of silently keeping a tab tied to a vanished path.
+          const errStr = String(err);
+          const missing = errStr.includes("No such file") || errStr.includes("not found");
+          if (missing && !tab.stale) {
+            tab.stale = true;
+            showToast(`${tab.fileName} was deleted on disk`, "error");
+            renderTabBar();
+          } else if (!missing) {
+            console.error("Reload failed for", tab.filePath, err);
+          }
         }
-      } catch (_) {}
+        }
+      } while (fsRefreshDirty);
+    } finally {
+      fsRefreshScheduled = false;
     }
-  }, 500);
+  })();
+});
+
+// When a file or directory is renamed through the file-browser context
+// menu, update any open editor tab pointing at the old path (or a child
+// of it, if a directory was renamed) so Cmd+S doesn't silently create a
+// ghost file at the stale location.
+window.addEventListener("launchpad:path-renamed", (e) => {
+  const { oldPath, newPath, isDir } = e.detail || {};
+  if (!oldPath || !newPath) return;
+  let anyUpdated = false;
+  for (const [, tab] of tabs) {
+    if (tab.type !== "editor") continue;
+    let updatedPath = null;
+    if (tab.filePath === oldPath) {
+      updatedPath = newPath;
+    } else if (isDir && tab.filePath.startsWith(oldPath + "/")) {
+      updatedPath = newPath + tab.filePath.slice(oldPath.length);
+    }
+    if (updatedPath) {
+      tab.filePath = updatedPath;
+      tab.fileName = updatedPath.split("/").pop();
+      const bc = tab.containerEl.querySelector(".editor-breadcrumb");
+      if (bc) renderBreadcrumb(bc, updatedPath);
+      anyUpdated = true;
+    }
+  }
+  if (anyUpdated) renderTabBar();
 });
 
 // Resize observer
@@ -1588,7 +1696,11 @@ document.getElementById("back-to-projects").addEventListener("click", async () =
   const project = getActiveProject();
   if (project) {
     await unregisterProjectWindow(project.path).catch(() => {});
-    invoke("unwatch_directory", { path: project.path }).catch(() => {});
+    // Use the canonical form returned by watch_directory so the HashMap
+    // entry actually gets removed — the raw project.path can differ
+    // (symlink-resolved) and miss the key. Falls back to project.path
+    // when watch_directory failed at init.
+    invoke("unwatch_directory", { path: watchedProjectPath || project.path }).catch(() => {});
   }
 
   // Full reload resets all module state and triggers boot() → picker.
@@ -1636,7 +1748,9 @@ function renderRightTabBar() {
     if (!tab) continue;
     const isActive = uiId === rightActiveTabUiId;
     const tabEl = document.createElement("div");
-    tabEl.className = `tab ${isActive ? "tab-active" : ""}`;
+    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
+    if (staleClass) tabEl.title = "File no longer exists on disk";
 
     const icon = document.createElement("span");
     icon.className = "tab-icon";
@@ -2021,6 +2135,13 @@ async function boot() {
   initTheme(settings.appTheme);
   onThemeChange(refreshTerminalsForTheme);
   await loadFileSettings();
+  // Resolve home dir once for breadcrumb path-shortening. Errors fall
+  // through to empty string, which makes renderBreadcrumb a no-op.
+  try {
+    homeDir = await invoke("get_home_dir");
+  } catch (_) {
+    homeDir = "";
+  }
 
   // A window booting with ?folder= is a dedicated project window — enter it directly.
   const params = new URLSearchParams(window.location.search);
@@ -2086,7 +2207,16 @@ async function enterWorkspace(project, settings) {
 
   // Everything project-scoped pins to project.path — no re-pointing on sub-folder navigation.
   const projectPathFn = () => project.path;
-  invoke("watch_directory", { path: project.path });
+  // watch_directory canonicalizes (resolves symlinks, normalizes trailing
+  // slashes) and returns the canonical form. Store that for fs-changed
+  // comparison so events emitted against the canonical path match even
+  // when project.path was opened via a symlink alias.
+  try {
+    watchedProjectPath = await invoke("watch_directory", { path: project.path });
+  } catch (err) {
+    console.error("watch_directory failed:", err);
+    watchedProjectPath = project.path;
+  }
   initQuickOpen(projectPathFn, (fullPath) => createEditorTab(fullPath));
   initProjectSearch(projectPathFn, (fullPath, opts) => createEditorTab(fullPath, opts));
   initGitPanel(projectPathFn, (filePath) => createEditorTab(filePath));

@@ -108,7 +108,11 @@ async function search(query) {
 }
 
 function selectResult(relativePath) {
-  const fullPath = currentRoot + "/" + relativePath;
+  // Strip any trailing slash on currentRoot before joining so we don't
+  // produce "root//relative" (which macOS resolves fine, but the
+  // resulting string won't match an open tab's filePath for dedup).
+  const root = currentRoot.replace(/\/+$/, "");
+  const fullPath = root + "/" + relativePath;
   if (onSelectCallback) onSelectCallback(fullPath, relativePath);
   hide();
 }

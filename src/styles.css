@@ -2810,6 +2810,56 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   100% { opacity: 0; }
 }
 
+/* App-level toast notifications (file-open errors, rename/delete failures) */
+.app-toast-container {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Above modal overlays (z-index 1000) so a toast fired during a
+     confirm dialog is still visible. Below drag ghost (9999) and
+     context menus (10000). */
+  z-index: 1100;
+  pointer-events: none;
+  max-width: 420px;
+}
+
+.app-toast {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+  border-radius: 4px;
+  border: 1px solid;
+  backdrop-filter: blur(10px);
+  pointer-events: auto;
+  opacity: 1;
+  transition: opacity 0.2s ease;
+}
+
+.app-toast-leaving { opacity: 0; }
+
+.app-toast-error {
+  background: rgba(255, 95, 86, 0.12);
+  border-color: #ff5f56;
+  color: #ff8d85;
+}
+
+.app-toast-info {
+  background: rgba(90, 200, 250, 0.12);
+  border-color: #5ac8fa;
+  color: #7fd5fb;
+}
+
+/* Editor tab whose underlying file was deleted on disk — user sees the
+   toast once but the tab itself also gets a persistent visual marker. */
+.tab.tab-stale .tab-label {
+  color: #ff8d85;
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 141, 133, 0.5);
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

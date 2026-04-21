@@ -3,6 +3,7 @@ import { pushEscape, popEscape } from "./main.js";
 
 let currentPath = "";
 let projectRoot = ""; // set by initFileBrowser; navigation is capped at or within this
+let homeDir = ""; // user home, resolved once at init for shortenPath/`~` replacement
 let showHidden = false;
 let expandedDirs = new Set();
 let getActiveTabId = null; // set by main.js
@@ -65,9 +66,12 @@ function formatSize(bytes) {
 }
 
 function shortenPath(path) {
-  const home = path.split("/").slice(0, 3).join("/");
-  if (path.startsWith(home)) {
-    return "~" + path.slice(home.length);
+  // Use the actual home dir resolved via get_home_dir at init. Previously
+  // we assumed /Users/<name> at depth 2, which works on vanilla macOS
+  // but not for "/Users/first.last@company" setups, Docker-mounted paths,
+  // or Linux /home/user.
+  if (homeDir && path.startsWith(homeDir)) {
+    return "~" + path.slice(homeDir.length);
   }
   return path;
 }
@@ -306,8 +310,19 @@ function showContextMenu(x, y, entry) {
         }
         committed = true;
         const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/"));
-        invoke("rename_path", { oldPath: entry.path, newPath: parentDir + "/" + newName })
-          .then(() => refreshFileBrowser())
+        const newPath = parentDir + "/" + newName;
+        invoke("rename_path", { oldPath: entry.path, newPath })
+          .then(() => {
+            // Announce to any interested module (main.js updates open
+            // editor tabs pointing at the old path, so Cmd+S doesn't
+            // silently write to the stale filename).
+            window.dispatchEvent(
+              new CustomEvent("launchpad:path-renamed", {
+                detail: { oldPath: entry.path, newPath, isDir: entry.is_dir },
+              })
+            );
+            refreshFileBrowser();
+          })
           .catch((err) => {
             committed = false;
             alert("Failed to rename: " + err);
@@ -329,7 +344,7 @@ function showContextMenu(x, y, entry) {
     action: () => {
       const kind = entry.is_dir ? "folder" : "file";
       if (!window.confirm(`Delete ${kind} "${entry.name}"? This cannot be undone.`)) return;
-      invoke("delete_path", { path: entry.path })
+      invoke("delete_path", { path: entry.path, projectRoot })
         .then(() => refreshFileBrowser())
         .catch((err) => alert("Failed to delete: " + err));
     },
@@ -479,6 +494,7 @@ export async function initFileBrowser(activeTabIdGetter, openFileCb, projectRoot
 
   try {
     const home = await invoke("get_home_dir");
+    homeDir = home;
     projectRoot = projectRootPath || home;
     await setRoot(projectRoot);
   } catch (err) {
@@ -554,13 +570,26 @@ export function openFileByPath(fullPath) {
   }
 }
 
+// Coalesce concurrent refresh requests: if a second call arrives while the
+// first is in flight, don't drop it — set a dirty flag and re-run once
+// after the current load finishes. A rapid `git pull` can emit several
+// fs-changed events within one load cycle; dropping them used to leave
+// the tree stale with no scheduled catch-up.
 let refreshInFlight = false;
+let refreshDirty = false;
 export async function refreshFileBrowser() {
-  if (!currentPath || refreshInFlight) return;
+  if (!currentPath) return;
+  if (refreshInFlight) {
+    refreshDirty = true;
+    return;
+  }
   refreshInFlight = true;
   try {
     const tree = document.getElementById("file-tree");
-    await loadDirectory(currentPath, tree);
+    do {
+      refreshDirty = false;
+      await loadDirectory(currentPath, tree);
+    } while (refreshDirty);
   } finally {
     refreshInFlight = false;
   }
