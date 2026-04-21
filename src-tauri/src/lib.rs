@@ -709,10 +709,7 @@ fn write_projects_file(projects: &[Project]) -> Result<(), String> {
     }
     let body = serde_json::to_string_pretty(projects)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    // Atomic write: temp + rename so a crash can't corrupt the file.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -876,13 +873,12 @@ fn write_project_env_file(store: &ProjectEnvStore) -> Result<(), String> {
     }
     let body = serde_json::to_string_pretty(store)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    // Atomic write: temp + rename so a crash can't corrupt the file.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    // Restrict to owner read/write — this file holds user secrets.
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+    // Restrict to owner read/write — this file holds user secrets. On
+    // overwrite, atomic_write already preserves the existing 0o600, but
+    // first-write needs this explicit chmod.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
