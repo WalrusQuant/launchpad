@@ -1491,10 +1491,31 @@ fn run_git_cancellable(
     result
 }
 
+// Returns (has_upstream, current_branch_name). Determined via libgit2 so
+// we don't depend on parsing localized stderr text from git(1).
+fn git_upstream_status(path: &str) -> (bool, Option<String>) {
+    let Ok(repo) = Repository::discover(path) else {
+        return (false, None);
+    };
+    let Ok(head) = repo.head() else {
+        return (false, None);
+    };
+    let Some(branch_name) = head.shorthand().map(str::to_string) else {
+        return (false, None);
+    };
+    let Ok(branch) = repo.find_branch(&branch_name, BranchType::Local) else {
+        return (false, Some(branch_name));
+    };
+    let has = branch.upstream().is_ok();
+    (has, Some(branch_name))
+}
+
 #[tauri::command]
 fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
     let pid_store = Arc::clone(&state.git_op_pid);
     let counter = Arc::clone(&state.git_op_counter);
+
+    let (has_upstream, branch) = git_upstream_status(&path);
 
     // Reserve ONE slot that spans both the initial push and the optional
     // auto-upstream retry. A cancel arriving in the window between the two
@@ -1508,37 +1529,19 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
         cancelled: false,
     });
 
-    let result = (|| -> Result<String, String> {
-        match spawn_git_under_slot(&["push"], &path, &pid_store, op_id) {
-            Ok(out) => Ok(out),
-            Err(stderr) => {
-                if stderr.contains("no upstream branch") || stderr.contains("has no upstream") {
-                    let mut branch_cmd = std::process::Command::new("git");
-                    branch_cmd
-                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                        .current_dir(&path);
-                    apply_git_env(&mut branch_cmd);
-                    let branch = branch_cmd
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_default();
-                    if branch.is_empty() {
-                        return Err(
-                            "Could not determine current branch for upstream push".to_string(),
-                        );
-                    }
-                    spawn_git_under_slot(
-                        &["push", "--set-upstream", "origin", &branch],
-                        &path,
-                        &pid_store,
-                        op_id,
-                    )
-                } else {
-                    Err(stderr)
-                }
-            }
+    let result = if has_upstream {
+        spawn_git_under_slot(&["push"], &path, &pid_store, op_id)
+    } else {
+        match branch {
+            Some(b) if !b.is_empty() => spawn_git_under_slot(
+                &["push", "--set-upstream", "origin", &b],
+                &path,
+                &pid_store,
+                op_id,
+            ),
+            _ => Err("Could not determine current branch for upstream push".to_string()),
         }
-    })();
+    };
 
     // Release the reservation.
     {

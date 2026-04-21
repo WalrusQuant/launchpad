@@ -55,12 +55,13 @@ function applyGitColors() {
 export function startGitPolling(getPath, intervalSeconds) {
   if (gitPollInterval) clearInterval(gitPollInterval);
   const ms = (intervalSeconds || 3) * 1000;
-  gitPollInterval = setInterval(() => {
+  gitPollInterval = setInterval(async () => {
     const path = getPath();
-    if (path) {
-      fetchGitStatus(path);
-      refreshPanel(path);
-    }
+    if (!path) return;
+    // Fetch once per tick and hand the result to refreshPanel so the panel
+    // doesn't invoke get_git_status a second time.
+    const status = await fetchGitStatus(path);
+    refreshPanel(path, false, status);
   }, ms);
 }
 

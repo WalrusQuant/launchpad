@@ -41,6 +41,10 @@ let openFileInEditor = null;
 // active button — isn't destroyed out from under the user. The final
 // forced refresh at op-end (force=true) is always allowed through.
 let inFlightOp = false;
+// Commit OIDs are immutable, so details for a given OID never change.
+// Cache them to avoid a second invoke on every forced re-render — and to
+// render the expanded section fully instead of a loading flicker.
+const commitDetailCache = new Map();
 
 // ─── Status icon mapping ───────────────────────────────────────────────────────
 const STATUS_ICONS = {
@@ -92,7 +96,7 @@ export function togglePanel() {
   }
 }
 
-export async function refreshPanel(path, force = false) {
+export async function refreshPanel(path, force = false, preloadedStatus = null) {
   if (path) currentPath = path;
   if (!panelVisible) return;
   // Skip the whole refresh while a network op is running. Re-rendering the
@@ -106,7 +110,11 @@ export async function refreshPanel(path, force = false) {
   if (header) header.classList.add("gp-refreshing");
 
   try {
-    const status = await invoke("get_git_status", { path: currentPath });
+    // Reuse a status fetched by the polling side (git.js:fetchGitStatus)
+    // when available, so each poll tick does one get_git_status call, not
+    // two. Callers that don't have a pre-fetched status pass null and we
+    // fetch on their behalf.
+    const status = preloadedStatus ?? (await invoke("get_git_status", { path: currentPath }));
 
     if (!status.is_repo) {
       panel.innerHTML = `
@@ -164,13 +172,31 @@ function formatRelativeTime(unixSeconds) {
 
 function parseGitHubUrl(remoteUrl) {
   if (!remoteUrl) return null;
-  // SSH: git@github.com:user/repo.git
-  const sshMatch = remoteUrl.match(/git@github\.com[:/](.+?)(?:\.git)?$/);
+  // SSH: git@github.com:user/repo.git — also accept hostnames containing
+  // "github.com" so multi-account ~/.ssh/config aliases (e.g.
+  // git@github.com-work:user/repo.git) still resolve to the github.com repo.
+  const sshMatch = remoteUrl.match(/git@[\w.-]*github\.com[\w.-]*[:/](.+?)(?:\.git)?$/);
   if (sshMatch) return `https://github.com/${sshMatch[1]}`;
   // HTTPS: https://github.com/user/repo.git
   const httpsMatch = remoteUrl.match(/https?:\/\/github\.com\/(.+?)(?:\.git)?$/);
   if (httpsMatch) return `https://github.com/${httpsMatch[1]}`;
   return null;
+}
+
+function commitDetailBodyHtml(detail) {
+  const filesHtml = detail.files
+    .map((f) => {
+      const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
+      const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
+      return `<div class="gp-detail-file">
+        <span class="gp-detail-path">${escapeHtml(f.path)}</span>
+        <span class="gp-detail-stats">${addStr}${delStr}</span>
+      </div>`;
+    })
+    .join("");
+  return `
+    <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
+    <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
 }
 
 function showGitFeedback(message, type) {
@@ -529,7 +555,15 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
         <span class="gp-commit-date">${date}</span>
       </div>`;
     if (isExpanded) {
-      commitsHtml += `<div class="gp-commit-detail gp-commit-detail-loading" data-oid="${escapeHtml(c.oid)}"><span class="gp-detail-loading">Loading…</span></div>`;
+      // If we've already fetched this commit's details, render them inline
+      // and skip the loading placeholder — prevents a second fetch on every
+      // forced re-render and avoids the flicker.
+      const cached = commitDetailCache.get(c.oid);
+      if (cached) {
+        commitsHtml += `<div class="gp-commit-detail" data-oid="${escapeHtml(c.oid)}">${commitDetailBodyHtml(cached)}</div>`;
+      } else {
+        commitsHtml += `<div class="gp-commit-detail gp-commit-detail-loading" data-oid="${escapeHtml(c.oid)}"><span class="gp-detail-loading">Loading…</span></div>`;
+      }
     }
   });
 
@@ -867,54 +901,40 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       expandedCommitOid = oid;
       el.classList.add("gp-commit-expanded");
 
-      // Insert loading placeholder
       const detailEl = document.createElement("div");
       detailEl.className = "gp-commit-detail";
       detailEl.dataset.oid = oid;
-      detailEl.innerHTML = `<span class="gp-detail-loading">Loading…</span>`;
       el.after(detailEl);
+
+      const cached = commitDetailCache.get(oid);
+      if (cached) {
+        detailEl.innerHTML = commitDetailBodyHtml(cached);
+        return;
+      }
+      detailEl.innerHTML = `<span class="gp-detail-loading">Loading…</span>`;
 
       try {
         const detail = await invoke("get_commit_details", { path: currentPath, oid });
-        const filesHtml = detail.files
-          .map((f) => {
-            const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
-            const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
-            return `<div class="gp-detail-file">
-              <span class="gp-detail-path">${escapeHtml(f.path)}</span>
-              <span class="gp-detail-stats">${addStr}${delStr}</span>
-            </div>`;
-          })
-          .join("");
-        detailEl.innerHTML = `
-          <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
-          <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
+        commitDetailCache.set(oid, detail);
+        detailEl.innerHTML = commitDetailBodyHtml(detail);
       } catch (err) {
         detailEl.innerHTML = `<span class="gp-detail-error">Failed to load: ${escapeHtml(String(err))}</span>`;
       }
     });
   });
 
-  // If there's an expanded commit and it rendered with a loading placeholder, fetch it
+  // Fetch commit details only when the rendered placeholder is a cache miss.
+  // With the detail cache, forced re-renders of an already-expanded commit
+  // render the final HTML inline and this block is a no-op — previously both
+  // a cached render path and this post-render fetch could race on force=true.
   if (expandedCommitOid) {
     const loadingEl = panel.querySelector(`.gp-commit-detail-loading[data-oid="${expandedCommitOid}"]`);
     if (loadingEl) {
       invoke("get_commit_details", { path: currentPath, oid: expandedCommitOid })
         .then((detail) => {
-          const filesHtml = detail.files
-            .map((f) => {
-              const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
-              const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
-              return `<div class="gp-detail-file">
-                <span class="gp-detail-path">${escapeHtml(f.path)}</span>
-                <span class="gp-detail-stats">${addStr}${delStr}</span>
-              </div>`;
-            })
-            .join("");
+          commitDetailCache.set(expandedCommitOid, detail);
           loadingEl.classList.remove("gp-commit-detail-loading");
-          loadingEl.innerHTML = `
-            <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
-            <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
+          loadingEl.innerHTML = commitDetailBodyHtml(detail);
         })
         .catch((err) => {
           loadingEl.classList.remove("gp-commit-detail-loading");
