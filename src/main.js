@@ -50,7 +50,7 @@ export function showToast(message, type = "error") {
 
 // Tab management
 // Terminal tab: { type: "terminal", panes: [pane, pane?], containerEl, name, activePane: 0|1 }
-// Editor tab:   { type: "editor", containerEl, filePath, fileName, editorView, originalContent, modified }
+// Editor tab:   { type: "editor", containerEl, filePath, fileName, inode, editorView, originalContent, modified, stale }
 // Each pane: { ptyId, term, fitAddon, el }
 const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
@@ -1218,6 +1218,7 @@ listen("fs-changed", (event) => {
           const missing = errStr.includes("No such file") || errStr.includes("not found");
           if (missing) {
             let relocated = false;
+            let relocatedContent = null;
             if (tab.inode != null) {
               try {
                 const found = await invoke("find_path_by_inode", {
@@ -1225,6 +1226,12 @@ listen("fs-changed", (event) => {
                   inode: tab.inode,
                 });
                 if (found && found !== tab.filePath) {
+                  // Read the new-path content BEFORE updating the tab so
+                  // git rename-and-edit operations (rename + content
+                  // change in one commit) don't leave the editor on
+                  // stale text. A read failure here degrades to the
+                  // stale-flag path below.
+                  relocatedContent = await invoke("read_file_preview", { path: found, maxBytes: 10485760 });
                   const oldName = tab.fileName;
                   tab.filePath = found;
                   tab.fileName = found.split("/").pop();
@@ -1236,6 +1243,32 @@ listen("fs-changed", (event) => {
                   relocated = true;
                 }
               } catch (_) {}
+            }
+            if (relocated && relocatedContent != null) {
+              // Apply the new content the same way the main reload path
+              // does: silent reload when the tab isn't dirty, confirm
+              // dialog when the user has unsaved edits.
+              const editorContent = tab.editorView.state.doc.toString();
+              if (relocatedContent !== editorContent) {
+                if (!tab.modified) {
+                  tab.editorView.dispatch({
+                    changes: { from: 0, to: editorContent.length, insert: relocatedContent },
+                  });
+                  tab.originalContent = relocatedContent;
+                } else {
+                  showConfirmDialog(
+                    `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
+                    () => {
+                      tab.editorView.dispatch({
+                        changes: { from: 0, to: tab.editorView.state.doc.length, insert: relocatedContent },
+                      });
+                      tab.originalContent = relocatedContent;
+                      tab.modified = false;
+                      renderTabBar();
+                    }
+                  );
+                }
+              }
             }
             if (!relocated && !tab.stale) {
               tab.stale = true;
