@@ -50,7 +50,7 @@ export function showToast(message, type = "error") {
 
 // Tab management
 // Terminal tab: { type: "terminal", panes: [pane, pane?], containerEl, name, activePane: 0|1 }
-// Editor tab:   { type: "editor", containerEl, filePath, fileName, editorView, originalContent, modified }
+// Editor tab:   { type: "editor", containerEl, filePath, fileName, inode, editorView, originalContent, modified, stale }
 // Each pane: { ptyId, term, fitAddon, el }
 const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
@@ -612,6 +612,15 @@ async function createEditorTab(filePath, options = {}) {
     showToast(`Could not open ${fileName}: ${err}`, "error");
     return null;
   }
+  // Capture inode so we can follow an external rename. Unix rename
+  // preserves inode, so searching the project tree for this number
+  // later lets us relocate the tab to the file's new path.
+  // Best-effort: a failure here just disables the rename-detection
+  // feature for this tab, not the open itself.
+  let inode = null;
+  try {
+    inode = await invoke("get_file_inode", { path: filePath });
+  } catch (_) {}
 
   const uiId = nextUiTabId++;
 
@@ -641,6 +650,7 @@ async function createEditorTab(filePath, options = {}) {
     containerEl,
     filePath,
     fileName,
+    inode,
     editorView: null,
     originalContent: content,
     modified: false,
@@ -1198,17 +1208,74 @@ listen("fs-changed", (event) => {
             );
           }
         } catch (err) {
-          // Distinguish "file no longer exists" (common after a rebase/reset)
-          // from transient read errors. Deleted files get a one-time toast
-          // and a stale flag on the tab so the user sees the state change
-          // instead of silently keeping a tab tied to a vanished path.
+          // Distinguish "file no longer exists" from transient read
+          // errors. On missing, first try to follow an external rename
+          // via inode match — Finder / mv / git rename preserves the
+          // inode, so if the same inode turns up elsewhere in the
+          // project tree we can relocate the tab transparently. Only
+          // falls back to the stale flag when no match is found.
           const errStr = String(err);
           const missing = errStr.includes("No such file") || errStr.includes("not found");
-          if (missing && !tab.stale) {
-            tab.stale = true;
-            showToast(`${tab.fileName} was deleted on disk`, "error");
-            renderTabBar();
-          } else if (!missing) {
+          if (missing) {
+            let relocated = false;
+            let relocatedContent = null;
+            if (tab.inode != null) {
+              try {
+                const found = await invoke("find_path_by_inode", {
+                  root: project.path,
+                  inode: tab.inode,
+                });
+                if (found && found !== tab.filePath) {
+                  // Read the new-path content BEFORE updating the tab so
+                  // git rename-and-edit operations (rename + content
+                  // change in one commit) don't leave the editor on
+                  // stale text. A read failure here degrades to the
+                  // stale-flag path below.
+                  relocatedContent = await invoke("read_file_preview", { path: found, maxBytes: 10485760 });
+                  const oldName = tab.fileName;
+                  tab.filePath = found;
+                  tab.fileName = found.split("/").pop();
+                  const bc = tab.containerEl.querySelector(".editor-breadcrumb");
+                  if (bc) renderBreadcrumb(bc, found);
+                  if (tab.stale) tab.stale = false;
+                  showToast(`${oldName} was renamed → ${tab.fileName}`, "info");
+                  renderTabBar();
+                  relocated = true;
+                }
+              } catch (_) {}
+            }
+            if (relocated && relocatedContent != null) {
+              // Apply the new content the same way the main reload path
+              // does: silent reload when the tab isn't dirty, confirm
+              // dialog when the user has unsaved edits.
+              const editorContent = tab.editorView.state.doc.toString();
+              if (relocatedContent !== editorContent) {
+                if (!tab.modified) {
+                  tab.editorView.dispatch({
+                    changes: { from: 0, to: editorContent.length, insert: relocatedContent },
+                  });
+                  tab.originalContent = relocatedContent;
+                } else {
+                  showConfirmDialog(
+                    `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
+                    () => {
+                      tab.editorView.dispatch({
+                        changes: { from: 0, to: tab.editorView.state.doc.length, insert: relocatedContent },
+                      });
+                      tab.originalContent = relocatedContent;
+                      tab.modified = false;
+                      renderTabBar();
+                    }
+                  );
+                }
+              }
+            }
+            if (!relocated && !tab.stale) {
+              tab.stale = true;
+              showToast(`${tab.fileName} was deleted on disk`, "error");
+              renderTabBar();
+            }
+          } else {
             console.error("Reload failed for", tab.filePath, err);
           }
         }

@@ -709,10 +709,7 @@ fn write_projects_file(projects: &[Project]) -> Result<(), String> {
     }
     let body = serde_json::to_string_pretty(projects)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    // Atomic write: temp + rename so a crash can't corrupt the file.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -876,13 +873,11 @@ fn write_project_env_file(store: &ProjectEnvStore) -> Result<(), String> {
     }
     let body = serde_json::to_string_pretty(store)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    // Atomic write: temp + rename so a crash can't corrupt the file.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    // Restrict to owner read/write — this file holds user secrets.
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    // 0o600 applied to the temp file BEFORE rename so there is no
+    // window where this file (which holds user secrets) exists at the
+    // default umask 0o644.
+    atomic_write_with_mode(&path, body.as_bytes(), Some(0o600))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1207,6 +1202,19 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, S
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_mode(dest, data, None)
+}
+
+// Like atomic_write, but forces a specific mode on the temp file BEFORE
+// rename. Use this when the destination's permissions are security-
+// relevant (e.g. project-env.json at 0o600): if we rename first and
+// chmod after, the file briefly exists at the default umask (0o644)
+// and a concurrent reader on a shared machine could snapshot secrets.
+fn atomic_write_with_mode(
+    dest: &std::path::Path,
+    data: &[u8],
+    explicit_mode: Option<u32>,
+) -> std::io::Result<()> {
     let file_name = dest
         .file_name()
         .and_then(|n| n.to_str())
@@ -1219,7 +1227,10 @@ fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         counter
     ));
 
+    // Explicit mode wins over preserved (for a new secret file we want
+    // 0o600 even if the previous file — if any — was 0o644).
     let preserved_mode = fs::metadata(dest).ok().map(|m| m.permissions().mode());
+    let effective_mode = explicit_mode.or(preserved_mode);
 
     let result = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
@@ -1227,10 +1238,12 @@ fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
         drop(f);
-        // Mode preservation is best-effort — failing here (e.g. on a
-        // mount where chmod is denied) should not abort the whole write
-        // and lose the user's data.
-        if let Some(mode) = preserved_mode {
+        // Mode setting is best-effort — failing here (e.g. on a mount
+        // where chmod is denied) should not abort the whole write and
+        // lose the user's data. For security-relevant modes, the worst
+        // case falls back to the default umask rather than exposing a
+        // 0o644 window between rename and a subsequent chmod.
+        if let Some(mode) = effective_mode {
             let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
         }
         fs::rename(&tmp, dest)
@@ -1289,6 +1302,74 @@ fn delete_path(path: String, project_root: Option<String>) -> Result<(), String>
 #[tauri::command]
 fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
     std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())
+}
+
+// Inode of the file at `path`. Used to relocate editor tabs whose file
+// was renamed externally (Finder, `mv`, git operations). Unix rename
+// preserves the inode, so capturing it at open time lets us search for
+// the same file under its new name when the original path disappears.
+#[tauri::command]
+fn get_file_inode(path: String) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(&path).map(|m| m.ino()).map_err(|e| e.to_string())
+}
+
+// Walk the project tree looking for a file whose inode matches `inode`.
+// Returns the first match. Applies the same skip rules as search_files
+// (hidden dirs, node_modules, target, etc.) so a rename outside the
+// interesting tree doesn't cost us a giant walk.
+#[tauri::command]
+fn find_path_by_inode(root: String, inode: u64) -> Result<Option<String>, String> {
+    fn walk(
+        dir: &std::path::Path,
+        inode: u64,
+        found: &mut Option<String>,
+        depth: usize,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        // Bounds match search_files. Project root is depth 0, so this
+        // stops before descending into depth 13 (i.e. walks up to 12
+        // levels below the root).
+        if found.is_some() || depth > 12 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
+            if found.is_some() {
+                return;
+            }
+            // Avoid an allocation per entry — name is only used for the
+            // skip-list check, and Cow<str> compares cleanly.
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.')
+                || name_str == "node_modules"
+                || name_str == "target"
+                || name_str == "__pycache__"
+                || name_str == "dist"
+                || name_str == "build"
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                walk(&entry.path(), inode, found, depth + 1);
+            } else if metadata.ino() == inode {
+                *found = Some(entry.path().to_string_lossy().into_owned());
+                return;
+            }
+        }
+    }
+
+    let mut found = None;
+    walk(std::path::Path::new(&root), inode, &mut found, 0);
+    Ok(found)
 }
 
 #[derive(Clone, Serialize)]
@@ -2297,6 +2378,8 @@ pub fn run() {
             create_directory,
             delete_path,
             rename_path,
+            get_file_inode,
+            find_path_by_inode,
             get_file_diff,
             git_stage_all,
             git_stage_file,
