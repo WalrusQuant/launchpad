@@ -1000,6 +1000,7 @@ async function showDiff(filePath, staged = false) {
     showDiffPreview(filePath, html);
   } catch (err) {
     console.error("Diff error:", err);
+    showGitFeedback(`Could not open diff: ${err}`, "error");
   }
 }
 

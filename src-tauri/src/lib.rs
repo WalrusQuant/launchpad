@@ -1698,6 +1698,25 @@ fn git_unstage_all(path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+
+    // Untracked files aren't touched by checkout_head, so discarding one
+    // would silently do nothing. Detect that case and delete from disk.
+    let status = repo
+        .status_file(std::path::Path::new(&file_path))
+        .map_err(|e| e.to_string())?;
+
+    if status.is_wt_new() {
+        let workdir = repo.workdir().ok_or("Repository has no workdir")?;
+        let abs = workdir.join(&file_path);
+        let meta = fs::metadata(&abs).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(&abs).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.path(&file_path).force();
     repo.checkout_head(Some(&mut checkout))
