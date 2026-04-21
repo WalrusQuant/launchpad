@@ -4,14 +4,29 @@ import { matches as keyMatches } from "./keymap.js";
 
 const { invoke } = window.__TAURI__.core;
 
-// Wraps invoke with a timeout to prevent indefinite hangs on network operations
-function invokeWithTimeout(command, args, timeoutMs = 30000) {
-  return Promise.race([
-    invoke(command, args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Operation timed out")), timeoutMs)
-    ),
-  ]);
+// Wraps invoke with a timeout to prevent indefinite hangs on network
+// operations. Tauri IPC has no cancellation — Promise.race rejecting does
+// NOT stop the Rust side, so on timeout we explicitly call cancel_git_op
+// to kill the git child process and free its PID slot. Without this, every
+// timeout leaks a git process and occupies the single-slot pid_store,
+// making subsequent ops uncancellable.
+async function invokeWithTimeout(command, args, timeoutMs = 30000) {
+  let timedOut = false;
+  let timerId;
+  const timer = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      timedOut = true;
+      reject(new Error("Operation timed out"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([invoke(command, args), timer]);
+  } finally {
+    clearTimeout(timerId);
+    if (timedOut) {
+      try { await invoke("cancel_git_op"); } catch (_) {}
+    }
+  }
 }
 
 // ─── Module-level state ────────────────────────────────────────────────────────
@@ -20,6 +35,16 @@ let currentPath = "";
 let lastSnapshot = null;
 let expandedCommitOid = null;
 let openFileInEditor = null;
+// True while a network git op (push/pull/fetch) is in flight. Polling
+// refreshPanel calls skip their renderPanel step while this is set so the
+// toolbar DOM — including the Cancel button and the busy-state on the
+// active button — isn't destroyed out from under the user. The final
+// forced refresh at op-end (force=true) is always allowed through.
+let inFlightOp = false;
+// Commit OIDs are immutable, so details for a given OID never change.
+// Cache them to avoid a second invoke on every forced re-render — and to
+// render the expanded section fully instead of a loading flicker.
+const commitDetailCache = new Map();
 
 // ─── Status icon mapping ───────────────────────────────────────────────────────
 const STATUS_ICONS = {
@@ -71,16 +96,33 @@ export function togglePanel() {
   }
 }
 
-export async function refreshPanel(path, force = false) {
+export async function refreshPanel(path, force = false, preloadedStatus = null) {
+  // Project switch: wipe commit-detail cache and collapse any expanded
+  // commit so stale entries from the previous repo don't bleed across.
+  // (OID collisions between projects are vanishingly unlikely but possible
+  // with shallow clones / forks; and the cache otherwise grows unbounded.)
+  if (path && path !== currentPath) {
+    commitDetailCache.clear();
+    expandedCommitOid = null;
+  }
   if (path) currentPath = path;
   if (!panelVisible) return;
+  // Skip the whole refresh while a network op is running. Re-rendering the
+  // toolbar mid-push destroys the button the click-handler is attached to
+  // and removes the Cancel button, letting a second click launch a
+  // concurrent op that steals the pid_store slot.
+  if (inFlightOp && !force) return;
 
   const panel = document.getElementById("git-panel");
   const header = panel.querySelector(".gp-header");
   if (header) header.classList.add("gp-refreshing");
 
   try {
-    const status = await invoke("get_git_status", { path: currentPath });
+    // Reuse a status fetched by the polling side (git.js:fetchGitStatus)
+    // when available, so each poll tick does one get_git_status call, not
+    // two. Callers that don't have a pre-fetched status pass null and we
+    // fetch on their behalf.
+    const status = preloadedStatus ?? (await invoke("get_git_status", { path: currentPath }));
 
     if (!status.is_repo) {
       panel.innerHTML = `
@@ -138,13 +180,33 @@ function formatRelativeTime(unixSeconds) {
 
 function parseGitHubUrl(remoteUrl) {
   if (!remoteUrl) return null;
-  // SSH: git@github.com:user/repo.git
-  const sshMatch = remoteUrl.match(/git@github\.com[:/](.+?)(?:\.git)?$/);
+  // SSH: anchor on the literal "github.com" with an optional alias suffix
+  // that starts with "-" (the SSH config convention: github.com-work,
+  // github.com-personal, etc.). Refuses spoofed hosts like
+  // not-github.com or github.com.evil by not allowing an arbitrary
+  // prefix or a "." boundary into the suffix.
+  const sshMatch = remoteUrl.match(/git@github\.com(?:-[\w.-]+)?[:/](.+?)(?:\.git)?$/);
   if (sshMatch) return `https://github.com/${sshMatch[1]}`;
   // HTTPS: https://github.com/user/repo.git
   const httpsMatch = remoteUrl.match(/https?:\/\/github\.com\/(.+?)(?:\.git)?$/);
   if (httpsMatch) return `https://github.com/${httpsMatch[1]}`;
   return null;
+}
+
+function commitDetailBodyHtml(detail) {
+  const filesHtml = detail.files
+    .map((f) => {
+      const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
+      const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
+      return `<div class="gp-detail-file">
+        <span class="gp-detail-path">${escapeHtml(f.path)}</span>
+        <span class="gp-detail-stats">${addStr}${delStr}</span>
+      </div>`;
+    })
+    .join("");
+  return `
+    <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
+    <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
 }
 
 function showGitFeedback(message, type) {
@@ -503,7 +565,15 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
         <span class="gp-commit-date">${date}</span>
       </div>`;
     if (isExpanded) {
-      commitsHtml += `<div class="gp-commit-detail gp-commit-detail-loading" data-oid="${escapeHtml(c.oid)}"><span class="gp-detail-loading">Loading…</span></div>`;
+      // If we've already fetched this commit's details, render them inline
+      // and skip the loading placeholder — prevents a second fetch on every
+      // forced re-render and avoids the flicker.
+      const cached = commitDetailCache.get(c.oid);
+      if (cached) {
+        commitsHtml += `<div class="gp-commit-detail" data-oid="${escapeHtml(c.oid)}">${commitDetailBodyHtml(cached)}</div>`;
+      } else {
+        commitsHtml += `<div class="gp-commit-detail gp-commit-detail-loading" data-oid="${escapeHtml(c.oid)}"><span class="gp-detail-loading">Loading…</span></div>`;
+      }
     }
   });
 
@@ -785,13 +855,23 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       e.stopPropagation();
       const branchName = btn.dataset.branch;
       showConfirmPopup(btn, `Merge "${branchName}" into current branch?`, async () => {
+        // Merge can touch network refs (if the user's config pulls on
+        // merge), so it's routed through run_git_cancellable on the Rust
+        // side. Set inFlightOp while the invoke is pending so the 3s
+        // polling refresh doesn't re-render the panel mid-merge and
+        // destroy the confirmation / feedback state.
+        inFlightOp = true;
         try {
-          await invoke("git_merge_branch", { path: currentPath, branchName });
+          await invokeWithTimeout("git_merge_branch", { path: currentPath, branchName });
+          inFlightOp = false;
           showGitFeedback(`Merged ${branchName}`, "success");
           await refreshPanel(null, true);
           refreshFileBrowser();
         } catch (err) {
+          inFlightOp = false;
           showGitFeedback(`Merge failed: ${err}`, "error");
+        } finally {
+          inFlightOp = false;
         }
       });
     });
@@ -841,54 +921,40 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       expandedCommitOid = oid;
       el.classList.add("gp-commit-expanded");
 
-      // Insert loading placeholder
       const detailEl = document.createElement("div");
       detailEl.className = "gp-commit-detail";
       detailEl.dataset.oid = oid;
-      detailEl.innerHTML = `<span class="gp-detail-loading">Loading…</span>`;
       el.after(detailEl);
+
+      const cached = commitDetailCache.get(oid);
+      if (cached) {
+        detailEl.innerHTML = commitDetailBodyHtml(cached);
+        return;
+      }
+      detailEl.innerHTML = `<span class="gp-detail-loading">Loading…</span>`;
 
       try {
         const detail = await invoke("get_commit_details", { path: currentPath, oid });
-        const filesHtml = detail.files
-          .map((f) => {
-            const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
-            const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
-            return `<div class="gp-detail-file">
-              <span class="gp-detail-path">${escapeHtml(f.path)}</span>
-              <span class="gp-detail-stats">${addStr}${delStr}</span>
-            </div>`;
-          })
-          .join("");
-        detailEl.innerHTML = `
-          <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
-          <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
+        commitDetailCache.set(oid, detail);
+        detailEl.innerHTML = commitDetailBodyHtml(detail);
       } catch (err) {
         detailEl.innerHTML = `<span class="gp-detail-error">Failed to load: ${escapeHtml(String(err))}</span>`;
       }
     });
   });
 
-  // If there's an expanded commit and it rendered with a loading placeholder, fetch it
+  // Fetch commit details only when the rendered placeholder is a cache miss.
+  // With the detail cache, forced re-renders of an already-expanded commit
+  // render the final HTML inline and this block is a no-op — previously both
+  // a cached render path and this post-render fetch could race on force=true.
   if (expandedCommitOid) {
     const loadingEl = panel.querySelector(`.gp-commit-detail-loading[data-oid="${expandedCommitOid}"]`);
     if (loadingEl) {
       invoke("get_commit_details", { path: currentPath, oid: expandedCommitOid })
         .then((detail) => {
-          const filesHtml = detail.files
-            .map((f) => {
-              const addStr = f.additions > 0 ? `<span class="gp-detail-add">+${f.additions}</span>` : "";
-              const delStr = f.deletions > 0 ? `<span class="gp-detail-del">-${f.deletions}</span>` : "";
-              return `<div class="gp-detail-file">
-                <span class="gp-detail-path">${escapeHtml(f.path)}</span>
-                <span class="gp-detail-stats">${addStr}${delStr}</span>
-              </div>`;
-            })
-            .join("");
+          commitDetailCache.set(expandedCommitOid, detail);
           loadingEl.classList.remove("gp-commit-detail-loading");
-          loadingEl.innerHTML = `
-            <div class="gp-detail-meta">${escapeHtml(detail.author)} · ${formatRelativeTime(detail.timestamp)}</div>
-            <div class="gp-detail-files">${filesHtml || "<em>No file changes</em>"}</div>`;
+          loadingEl.innerHTML = commitDetailBodyHtml(detail);
         })
         .catch((err) => {
           loadingEl.classList.remove("gp-commit-detail-loading");
@@ -908,25 +974,43 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     btn.textContent = labelBusy;
     // Show cancel button for network operations
     let cancelBtn = null;
-    if (["git_fetch", "git_pull", "git_push"].includes(command)) {
+    let cancelled = false;
+    const isNetworkOp = ["git_fetch", "git_pull", "git_push"].includes(command);
+    if (isNetworkOp) {
+      inFlightOp = true;
       cancelBtn = document.createElement("button");
       cancelBtn.className = "gp-cancel-btn";
       cancelBtn.textContent = "Cancel";
       cancelBtn.addEventListener("click", async (ce) => {
         ce.stopPropagation();
-        await invoke("cancel_git_op");
-        showGitFeedback("Operation cancelled", "error");
+        // Set the flag synchronously so the outer catch knows the failure
+        // was user-initiated, even if the main op rejects before cancel
+        // returns. Disable the button + swap label so repeated clicks are
+        // ignored and the user sees progress.
+        cancelled = true;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "Cancelling…";
+        try { await invoke("cancel_git_op"); } catch (_) {}
       });
       btn.parentElement.insertBefore(cancelBtn, btn.nextSibling);
     }
     try {
       await invokeWithTimeout(command, { path: currentPath });
+      // Clear the in-flight flag BEFORE the forced refresh so renderPanel
+      // is allowed through and the toolbar returns to its fresh state.
+      if (isNetworkOp) inFlightOp = false;
       showGitFeedback(msgSuccess, "success");
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
-      showGitFeedback(`${msgError}: ${err}`, "error");
+      if (isNetworkOp) inFlightOp = false;
+      if (cancelled) {
+        showGitFeedback("Operation cancelled", "error");
+      } else {
+        showGitFeedback(`${msgError}: ${err}`, "error");
+      }
     } finally {
+      if (isNetworkOp) inFlightOp = false;
       btn.disabled = false;
       btn.textContent = labelDefault;
       if (cancelBtn) cancelBtn.remove();
@@ -956,6 +1040,7 @@ async function showDiff(filePath, staged = false) {
     showDiffPreview(filePath, html);
   } catch (err) {
     console.error("Diff error:", err);
+    showGitFeedback(`Could not open diff: ${err}`, "error");
   }
 }
 

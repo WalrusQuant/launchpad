@@ -895,7 +895,11 @@ function applySettingLive(key, value) {
   }
 
   if (key === "gitPollInterval") {
-    startGitPolling(getCurrentPath, value);
+    // Polling is project-scoped (see enterWorkspace at init), not keyed to
+    // the file-browser sub-folder cursor. Use the active project path so a
+    // mid-session interval change doesn't re-point polling at whatever
+    // sub-folder the browser is currently showing.
+    startGitPolling(() => getActiveProject()?.path, value);
   }
 
   if (key === "appTheme") {
