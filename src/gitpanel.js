@@ -97,6 +97,14 @@ export function togglePanel() {
 }
 
 export async function refreshPanel(path, force = false, preloadedStatus = null) {
+  // Project switch: wipe commit-detail cache and collapse any expanded
+  // commit so stale entries from the previous repo don't bleed across.
+  // (OID collisions between projects are vanishingly unlikely but possible
+  // with shallow clones / forks; and the cache otherwise grows unbounded.)
+  if (path && path !== currentPath) {
+    commitDetailCache.clear();
+    expandedCommitOid = null;
+  }
   if (path) currentPath = path;
   if (!panelVisible) return;
   // Skip the whole refresh while a network op is running. Re-rendering the
@@ -172,10 +180,12 @@ function formatRelativeTime(unixSeconds) {
 
 function parseGitHubUrl(remoteUrl) {
   if (!remoteUrl) return null;
-  // SSH: git@github.com:user/repo.git — also accept hostnames containing
-  // "github.com" so multi-account ~/.ssh/config aliases (e.g.
-  // git@github.com-work:user/repo.git) still resolve to the github.com repo.
-  const sshMatch = remoteUrl.match(/git@[\w.-]*github\.com[\w.-]*[:/](.+?)(?:\.git)?$/);
+  // SSH: anchor on the literal "github.com" with an optional alias suffix
+  // that starts with "-" (the SSH config convention: github.com-work,
+  // github.com-personal, etc.). Refuses spoofed hosts like
+  // not-github.com or github.com.evil by not allowing an arbitrary
+  // prefix or a "." boundary into the suffix.
+  const sshMatch = remoteUrl.match(/git@github\.com(?:-[\w.-]+)?[:/](.+?)(?:\.git)?$/);
   if (sshMatch) return `https://github.com/${sshMatch[1]}`;
   // HTTPS: https://github.com/user/repo.git
   const httpsMatch = remoteUrl.match(/https?:\/\/github\.com\/(.+?)(?:\.git)?$/);
@@ -845,13 +855,23 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       e.stopPropagation();
       const branchName = btn.dataset.branch;
       showConfirmPopup(btn, `Merge "${branchName}" into current branch?`, async () => {
+        // Merge can touch network refs (if the user's config pulls on
+        // merge), so it's routed through run_git_cancellable on the Rust
+        // side. Set inFlightOp while the invoke is pending so the 3s
+        // polling refresh doesn't re-render the panel mid-merge and
+        // destroy the confirmation / feedback state.
+        inFlightOp = true;
         try {
-          await invoke("git_merge_branch", { path: currentPath, branchName });
+          await invokeWithTimeout("git_merge_branch", { path: currentPath, branchName });
+          inFlightOp = false;
           showGitFeedback(`Merged ${branchName}`, "success");
           await refreshPanel(null, true);
           refreshFileBrowser();
         } catch (err) {
+          inFlightOp = false;
           showGitFeedback(`Merge failed: ${err}`, "error");
+        } finally {
+          inFlightOp = false;
         }
       });
     });

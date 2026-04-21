@@ -7,8 +7,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
@@ -1346,36 +1346,59 @@ struct GitOpSlot {
     cancelled: bool,
 }
 
-// SSH_AUTH_SOCK resolved once per process. Tauri .app bundles launched from
-// Finder/Dock don't inherit SSH_AUTH_SOCK from the user's login shell, so SSH
-// git remotes fail with "Permission denied (publickey)". On macOS we fall
-// back to `launchctl getenv` which returns the per-user value the system
+// SIGKILL, not SIGTERM. A git process blocked on a stalled TCP recv() often
+// ignores SIGTERM — which is the exact situation cancel is supposed to
+// escape — so we skip the polite signal and go straight to -9.
+fn kill_pid_hard(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
+// SSH_AUTH_SOCK resolution. Tauri .app bundles launched from Finder/Dock
+// don't inherit SSH_AUTH_SOCK from the user's login shell, so SSH git
+// remotes fail with "Permission denied (publickey)". On macOS we fall back
+// to `launchctl getenv` which returns the per-user value the system
 // ssh-agent advertises.
-static SSH_AUTH_SOCK_CACHE: OnceLock<Option<String>> = OnceLock::new();
+//
+// Positive results are cached for the process lifetime (the socket path
+// doesn't change after login). Negative results are cached only for
+// SSH_AUTH_SOCK_NEGATIVE_TTL so a user whose agent registers late (or who
+// adds their first key after launch) recovers without an app restart.
+static SSH_AUTH_SOCK_CACHE: Mutex<Option<(Option<String>, Instant)>> = Mutex::new(None);
+const SSH_AUTH_SOCK_NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 fn resolve_ssh_auth_sock() -> Option<String> {
-    SSH_AUTH_SOCK_CACHE
-        .get_or_init(|| {
-            if let Ok(v) = std::env::var("SSH_AUTH_SOCK") {
-                if !v.is_empty() {
-                    return Some(v);
-                }
+    let mut guard = SSH_AUTH_SOCK_CACHE.lock().unwrap();
+    if let Some((cached, at)) = guard.as_ref() {
+        if cached.is_some() || at.elapsed() < SSH_AUTH_SOCK_NEGATIVE_TTL {
+            return cached.clone();
+        }
+    }
+    let resolved = compute_ssh_auth_sock();
+    *guard = Some((resolved.clone(), Instant::now()));
+    resolved
+}
+
+fn compute_ssh_auth_sock() -> Option<String> {
+    if let Ok(v) = std::env::var("SSH_AUTH_SOCK") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("launchctl")
+            .args(["getenv", "SSH_AUTH_SOCK"])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
             }
-            #[cfg(target_os = "macos")]
-            {
-                if let Ok(out) = std::process::Command::new("launchctl")
-                    .args(["getenv", "SSH_AUTH_SOCK"])
-                    .output()
-                {
-                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !s.is_empty() {
-                        return Some(s);
-                    }
-                }
-            }
-            None
-        })
-        .clone()
+        }
+    }
+    None
 }
 
 // Apply the standard env every spawned `git` Command should carry:
@@ -1428,9 +1451,7 @@ fn spawn_git_under_slot(
         }
     };
     if kill_now {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
+        kill_pid_hard(pid);
     }
 
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
@@ -1584,9 +1605,7 @@ fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
         // we got here during the spawn window (PID not yet recorded).
         slot.cancelled = true;
         if let Some(pid) = slot.pid {
-            let _ = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .output();
+            kill_pid_hard(pid);
         }
         // Don't clear the slot here — run_git_cancellable's cleanup owns that
         // and only clears if the op_id still matches, so a stale cancel can't
@@ -1701,16 +1720,24 @@ fn git_unstage_all(path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let workdir = repo.workdir().ok_or("Repository has no workdir")?;
+    let abs = workdir.join(&file_path);
 
-    // Untracked files aren't touched by checkout_head, so discarding one
-    // would silently do nothing. Detect that case and delete from disk.
-    let status = repo
-        .status_file(std::path::Path::new(&file_path))
-        .map_err(|e| e.to_string())?;
+    // Two cases route to "delete from disk":
+    //   1) status_file says wt_new (untracked file at the top level).
+    //   2) status_file errors with GIT_ENOTFOUND because the path lives
+    //      inside an untracked directory — git reports the directory,
+    //      not its contents, so status_file can't see the child. Fall
+    //      back to a presence check on disk, gated on the NotFound
+    //      error code so we don't misclassify other libgit2 errors.
+    let status_result = repo.status_file(std::path::Path::new(&file_path));
+    let treat_as_untracked = match &status_result {
+        Ok(s) => s.is_wt_new(),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => abs.exists(),
+        Err(_) => false,
+    };
 
-    if status.is_wt_new() {
-        let workdir = repo.workdir().ok_or("Repository has no workdir")?;
-        let abs = workdir.join(&file_path);
+    if treat_as_untracked {
         let meta = fs::metadata(&abs).map_err(|e| e.to_string())?;
         if meta.is_dir() {
             fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
@@ -1719,6 +1746,10 @@ fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
         }
         return Ok(());
     }
+
+    // Surface any non-NotFound status_file error rather than silently
+    // falling through to checkout_head, which would just fail again.
+    status_result.map_err(|e| e.to_string())?;
 
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.path(&file_path).force();
