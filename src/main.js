@@ -612,6 +612,15 @@ async function createEditorTab(filePath, options = {}) {
     showToast(`Could not open ${fileName}: ${err}`, "error");
     return null;
   }
+  // Capture inode so we can follow an external rename. Unix rename
+  // preserves inode, so searching the project tree for this number
+  // later lets us relocate the tab to the file's new path.
+  // Best-effort: a failure here just disables the rename-detection
+  // feature for this tab, not the open itself.
+  let inode = null;
+  try {
+    inode = await invoke("get_file_inode", { path: filePath });
+  } catch (_) {}
 
   const uiId = nextUiTabId++;
 
@@ -641,6 +650,7 @@ async function createEditorTab(filePath, options = {}) {
     containerEl,
     filePath,
     fileName,
+    inode,
     editorView: null,
     originalContent: content,
     modified: false,
@@ -1198,17 +1208,41 @@ listen("fs-changed", (event) => {
             );
           }
         } catch (err) {
-          // Distinguish "file no longer exists" (common after a rebase/reset)
-          // from transient read errors. Deleted files get a one-time toast
-          // and a stale flag on the tab so the user sees the state change
-          // instead of silently keeping a tab tied to a vanished path.
+          // Distinguish "file no longer exists" from transient read
+          // errors. On missing, first try to follow an external rename
+          // via inode match — Finder / mv / git rename preserves the
+          // inode, so if the same inode turns up elsewhere in the
+          // project tree we can relocate the tab transparently. Only
+          // falls back to the stale flag when no match is found.
           const errStr = String(err);
           const missing = errStr.includes("No such file") || errStr.includes("not found");
-          if (missing && !tab.stale) {
-            tab.stale = true;
-            showToast(`${tab.fileName} was deleted on disk`, "error");
-            renderTabBar();
-          } else if (!missing) {
+          if (missing) {
+            let relocated = false;
+            if (tab.inode != null) {
+              try {
+                const found = await invoke("find_path_by_inode", {
+                  root: project.path,
+                  inode: tab.inode,
+                });
+                if (found && found !== tab.filePath) {
+                  const oldName = tab.fileName;
+                  tab.filePath = found;
+                  tab.fileName = found.split("/").pop();
+                  const bc = tab.containerEl.querySelector(".editor-breadcrumb");
+                  if (bc) renderBreadcrumb(bc, found);
+                  if (tab.stale) tab.stale = false;
+                  showToast(`${oldName} was renamed → ${tab.fileName}`, "info");
+                  renderTabBar();
+                  relocated = true;
+                }
+              } catch (_) {}
+            }
+            if (!relocated && !tab.stale) {
+              tab.stale = true;
+              showToast(`${tab.fileName} was deleted on disk`, "error");
+              renderTabBar();
+            }
+          } else {
             console.error("Reload failed for", tab.filePath, err);
           }
         }

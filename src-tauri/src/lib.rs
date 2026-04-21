@@ -1287,6 +1287,68 @@ fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
     std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())
 }
 
+// Inode of the file at `path`. Used to relocate editor tabs whose file
+// was renamed externally (Finder, `mv`, git operations). Unix rename
+// preserves the inode, so capturing it at open time lets us search for
+// the same file under its new name when the original path disappears.
+#[tauri::command]
+fn get_file_inode(path: String) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(&path).map(|m| m.ino()).map_err(|e| e.to_string())
+}
+
+// Walk the project tree looking for a file whose inode matches `inode`.
+// Returns the first match. Applies the same skip rules as search_files
+// (hidden dirs, node_modules, target, etc.) so a rename outside the
+// interesting tree doesn't cost us a giant walk.
+#[tauri::command]
+fn find_path_by_inode(root: String, inode: u64) -> Result<Option<String>, String> {
+    fn walk(
+        dir: &std::path::Path,
+        inode: u64,
+        found: &mut Option<String>,
+        depth: usize,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        if found.is_some() || depth > 12 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
+            if found.is_some() {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == "__pycache__"
+                || name == "dist"
+                || name == "build"
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                walk(&entry.path(), inode, found, depth + 1);
+            } else if metadata.ino() == inode {
+                *found = Some(entry.path().to_string_lossy().to_string());
+                return;
+            }
+        }
+    }
+
+    let mut found = None;
+    walk(std::path::Path::new(&root), inode, &mut found, 0);
+    Ok(found)
+}
+
 #[derive(Clone, Serialize)]
 struct DiffLine {
     old_line_no: i32,
@@ -2293,6 +2355,8 @@ pub fn run() {
             create_directory,
             delete_path,
             rename_path,
+            get_file_inode,
+            find_path_by_inode,
             get_file_diff,
             git_stage_all,
             git_stage_file,
