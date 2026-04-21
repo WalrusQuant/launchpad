@@ -3,11 +3,13 @@ import { refreshPanel } from "./gitpanel.js";
 const { invoke } = window.__TAURI__.core;
 
 let currentGitInfo = null;
+let currentGitRoot = null;
 let gitPollInterval = null;
 
 export async function fetchGitStatus(path) {
   try {
     currentGitInfo = await invoke("get_git_status", { path });
+    currentGitRoot = path;
     applyGitColors();
     return currentGitInfo;
   } catch (err) {
@@ -17,36 +19,46 @@ export async function fetchGitStatus(path) {
 }
 
 function applyGitColors() {
-  if (!currentGitInfo || !currentGitInfo.is_repo) return;
+  if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return;
 
-  // Build a map of file path → status
+  // Map of git-relative-path → status
   const statusMap = new Map();
   currentGitInfo.files.forEach((f) => {
     statusMap.set(f.path, f.status);
   });
 
-  // Apply to all file entries in the tree
-  document.querySelectorAll(".file-entry").forEach((el) => {
-    const filePath = el.dataset.path;
-    if (!filePath) return;
+  const rootWithSlash = currentGitRoot.replace(/\/+$/, "") + "/";
 
-    // Remove old git classes
+  document.querySelectorAll(".file-entry").forEach((el) => {
     el.classList.remove(
       "git-modified", "git-new", "git-deleted", "git-staged", "git-conflict", "git-renamed",
       "git-index_new", "git-index_modified", "git-index_deleted", "git-index_renamed"
     );
 
-    // Check if this file or any child matches
-    for (const [gitPath, status] of statusMap) {
-      // Match by filename at end of path
-      if (filePath.endsWith("/" + gitPath) || filePath.endsWith("/" + gitPath.split("/")[0])) {
-        // All index_ (staged) statuses map to git-staged in the file tree
-        if (status.startsWith("index_")) {
-          el.classList.add("git-staged");
-        } else {
-          el.classList.add(`git-${status}`);
+    const filePath = el.dataset.path;
+    if (!filePath || !filePath.startsWith(rootWithSlash)) return;
+    const rel = filePath.slice(rootWithSlash.length);
+
+    // First check exact match. Then check if this entry is an ancestor
+    // directory of a modified file (so a folder containing modified
+    // children shows a status color). Anchoring on the project root
+    // prevents the old endsWith() match from colliding with same-named
+    // files in sibling trees (src/foo.js vs lib/foo.js).
+    let matched = statusMap.get(rel);
+    if (!matched) {
+      const relWithSlash = rel + "/";
+      for (const [gitPath, status] of statusMap) {
+        if (gitPath.startsWith(relWithSlash)) {
+          matched = status;
+          break;
         }
-        break;
+      }
+    }
+    if (matched) {
+      if (matched.startsWith("index_")) {
+        el.classList.add("git-staged");
+      } else {
+        el.classList.add(`git-${matched}`);
       }
     }
   });

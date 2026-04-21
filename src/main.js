@@ -1137,60 +1137,67 @@ listen("fs-changed", (event) => {
   if (!project || !watchedProjectPath || event.payload.path !== watchedProjectPath) return;
   if (fsRefreshScheduled) return;
   fsRefreshScheduled = true;
-  setTimeout(async () => {
-    fsRefreshScheduled = false;
-    refreshFileBrowser();
-    fetchGitStatus(project.path);
-    refreshPanel(null, true);
+  // The Rust debouncer already coalesces bursts at 300 ms; the old
+  // frontend 500 ms setTimeout stacked on top of that produced ~800 ms of
+  // post-change lag for no benefit. Run immediately (inside an async IIFE
+  // so await on the tab-reload loop still works).
+  (async () => {
+    try {
+      refreshFileBrowser();
+      fetchGitStatus(project.path);
+      refreshPanel(null, true);
 
-    // Check open editor tabs for external file changes
-    for (const [uiId, tab] of tabs) {
-      if (tab.type !== "editor") continue;
-      try {
-        const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
-        if (tab.stale) {
-          tab.stale = false;
-          renderTabBar();
-        }
-        const editorContent = tab.editorView.state.doc.toString();
-        if (diskContent === editorContent) continue;
-        if (!tab.modified) {
-          // No local edits — silently reload
-          tab.editorView.dispatch({
-            changes: { from: 0, to: editorContent.length, insert: diskContent },
-          });
-          tab.originalContent = diskContent;
-        } else {
-          // User has unsaved changes — prompt
-          showConfirmDialog(
-            `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
-            () => {
-              tab.editorView.dispatch({
-                changes: { from: 0, to: tab.editorView.state.doc.length, insert: diskContent },
-              });
-              tab.originalContent = diskContent;
-              tab.modified = false;
-              renderTabBar();
-            }
-          );
-        }
-      } catch (err) {
-        // Distinguish "file no longer exists" (common after a rebase/reset)
-        // from transient read errors. Deleted files get a one-time toast
-        // and a stale flag on the tab so the user sees the state change
-        // instead of silently keeping a tab tied to a vanished path.
-        const errStr = String(err);
-        const missing = errStr.includes("No such file") || errStr.includes("not found");
-        if (missing && !tab.stale) {
-          tab.stale = true;
-          showToast(`${tab.fileName} was deleted on disk`, "error");
-          renderTabBar();
-        } else if (!missing) {
-          console.error("Reload failed for", tab.filePath, err);
+      // Check open editor tabs for external file changes
+      for (const [uiId, tab] of tabs) {
+        if (tab.type !== "editor") continue;
+        try {
+          const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
+          if (tab.stale) {
+            tab.stale = false;
+            renderTabBar();
+          }
+          const editorContent = tab.editorView.state.doc.toString();
+          if (diskContent === editorContent) continue;
+          if (!tab.modified) {
+            // No local edits — silently reload
+            tab.editorView.dispatch({
+              changes: { from: 0, to: editorContent.length, insert: diskContent },
+            });
+            tab.originalContent = diskContent;
+          } else {
+            // User has unsaved changes — prompt
+            showConfirmDialog(
+              `"${tab.fileName}" changed on disk. Reload and lose your changes?`,
+              () => {
+                tab.editorView.dispatch({
+                  changes: { from: 0, to: tab.editorView.state.doc.length, insert: diskContent },
+                });
+                tab.originalContent = diskContent;
+                tab.modified = false;
+                renderTabBar();
+              }
+            );
+          }
+        } catch (err) {
+          // Distinguish "file no longer exists" (common after a rebase/reset)
+          // from transient read errors. Deleted files get a one-time toast
+          // and a stale flag on the tab so the user sees the state change
+          // instead of silently keeping a tab tied to a vanished path.
+          const errStr = String(err);
+          const missing = errStr.includes("No such file") || errStr.includes("not found");
+          if (missing && !tab.stale) {
+            tab.stale = true;
+            showToast(`${tab.fileName} was deleted on disk`, "error");
+            renderTabBar();
+          } else if (!missing) {
+            console.error("Reload failed for", tab.filePath, err);
+          }
         }
       }
+    } finally {
+      fsRefreshScheduled = false;
     }
-  }, 500);
+  })();
 });
 
 // When a file or directory is renamed through the file-browser context

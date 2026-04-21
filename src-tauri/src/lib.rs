@@ -1249,7 +1249,18 @@ fn create_directory(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_path(path: String) -> Result<(), String> {
+fn delete_path(path: String, project_root: Option<String>) -> Result<(), String> {
+    // When a project_root is supplied, refuse deletions outside it. The
+    // context menu is the only caller today and always passes this, so in
+    // practice nothing unguarded reaches remove_dir_all. Cheap defense
+    // against a future caller handing an arbitrary path.
+    if let Some(root) = project_root {
+        let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
+        let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+        if !target.starts_with(&root_canon) {
+            return Err("Refusing to delete path outside project root".into());
+        }
+    }
     let p = std::path::Path::new(&path);
     if p.is_dir() {
         std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
