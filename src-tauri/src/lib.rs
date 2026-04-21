@@ -629,7 +629,7 @@ fn save_settings(data: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -658,7 +658,7 @@ fn save_file_settings(data: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1139,13 +1139,68 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
 #[tauri::command]
 fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, String> {
     let limit = max_bytes.unwrap_or(8192);
-    let data = fs::read(&path).map_err(|e| e.to_string())?;
-    let truncated = &data[..data.len().min(limit)];
-    // Binary detection: null bytes in the first 8KB indicate a binary file
-    if truncated.contains(&0) {
-        return Err("Binary file \u{2014} cannot display".to_string());
+
+    // Stream only up to `limit` bytes so a 50 MB file opened for a 512 KB
+    // preview doesn't allocate 50 MB transiently.
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut data = Vec::with_capacity(limit.min(64 * 1024));
+    use std::io::Read;
+    file.take(limit as u64)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+
+    // UTF-16 BOM: surface a specific, actionable message instead of a
+    // generic "binary" refusal. UTF-16 ASCII-dominant text used to trip
+    // the old null-byte check as a false positive.
+    if data.len() >= 2
+        && (data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]))
+    {
+        return Err("UTF-16 file — re-save as UTF-8 to edit".into());
     }
-    Ok(String::from_utf8_lossy(truncated).to_string())
+
+    // Binary heuristic: real text files rarely contain ANY null bytes, but
+    // tolerate a small ratio so source files with null-in-string-literal
+    // don't get rejected. UTF-16-like content will have ~50% nulls, far
+    // above the 1% threshold.
+    if !data.is_empty() {
+        let null_count = data.iter().filter(|&&b| b == 0).count();
+        if null_count * 100 > data.len() {
+            return Err("Binary file — cannot display".into());
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&data).to_string())
+}
+
+// Write `data` to `dest` atomically: write to a sibling temp file, fsync,
+// then rename onto the destination. A crash / kill / ENOSPC mid-write
+// leaves the old file intact; a successful rename replaces it in one step.
+// Preserves the existing file's mode when overwriting.
+fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("launchpad-write");
+    let tmp = dest.with_file_name(format!(".{}.lp-tmp-{}", file_name, std::process::id()));
+
+    let preserved_mode = fs::metadata(dest).ok().map(|m| m.permissions().mode());
+
+    let result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        if let Some(mode) = preserved_mode {
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        }
+        fs::rename(&tmp, dest)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[tauri::command]
@@ -1154,7 +1209,7 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     if content.len() > 10 * 1024 * 1024 {
         return Err("File content exceeds 10MB limit".into());
     }
-    fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write(std::path::Path::new(&path), content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
