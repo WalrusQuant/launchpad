@@ -1119,11 +1119,14 @@ listen("pty-exit", (event) => {
 
 // Listen for filesystem changes — refresh file browser and git panel
 let fsRefreshScheduled = false;
+let watchedProjectPath = null; // canonical path returned by watch_directory
 listen("fs-changed", (event) => {
   const project = getActiveProject();
   // Watcher is only started for the active project root, so a mismatch means
   // this event is from a stale watcher the frontend no longer cares about.
-  if (!project || event.payload.path !== project.path) return;
+  // Compare against the canonical path watch_directory returned — symlinked
+  // project roots make event.payload.path differ from project.path.
+  if (!project || !watchedProjectPath || event.payload.path !== watchedProjectPath) return;
   if (fsRefreshScheduled) return;
   fsRefreshScheduled = true;
   setTimeout(async () => {
@@ -2111,7 +2114,16 @@ async function enterWorkspace(project, settings) {
 
   // Everything project-scoped pins to project.path — no re-pointing on sub-folder navigation.
   const projectPathFn = () => project.path;
-  invoke("watch_directory", { path: project.path });
+  // watch_directory canonicalizes (resolves symlinks, normalizes trailing
+  // slashes) and returns the canonical form. Store that for fs-changed
+  // comparison so events emitted against the canonical path match even
+  // when project.path was opened via a symlink alias.
+  try {
+    watchedProjectPath = await invoke("watch_directory", { path: project.path });
+  } catch (err) {
+    console.error("watch_directory failed:", err);
+    watchedProjectPath = project.path;
+  }
   initQuickOpen(projectPathFn, (fullPath) => createEditorTab(fullPath));
   initProjectSearch(projectPathFn, (fullPath, opts) => createEditorTab(fullPath, opts));
   initGitPanel(projectPathFn, (filePath) => createEditorTab(filePath));

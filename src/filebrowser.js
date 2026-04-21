@@ -554,13 +554,26 @@ export function openFileByPath(fullPath) {
   }
 }
 
+// Coalesce concurrent refresh requests: if a second call arrives while the
+// first is in flight, don't drop it — set a dirty flag and re-run once
+// after the current load finishes. A rapid `git pull` can emit several
+// fs-changed events within one load cycle; dropping them used to leave
+// the tree stale with no scheduled catch-up.
 let refreshInFlight = false;
+let refreshDirty = false;
 export async function refreshFileBrowser() {
-  if (!currentPath || refreshInFlight) return;
+  if (!currentPath) return;
+  if (refreshInFlight) {
+    refreshDirty = true;
+    return;
+  }
   refreshInFlight = true;
   try {
     const tree = document.getElementById("file-tree");
-    await loadDirectory(currentPath, tree);
+    do {
+      refreshDirty = false;
+      await loadDirectory(currentPath, tree);
+    } while (refreshDirty);
   } finally {
     refreshInFlight = false;
   }

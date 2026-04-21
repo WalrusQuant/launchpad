@@ -2019,8 +2019,22 @@ fn get_home_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
-    let watch_path = path.clone();
+fn watch_directory(
+    path: String,
+    state: State<AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    // Canonicalize so the stored key and the emitted event path are stable
+    // regardless of symlink vs real-path or trailing-slash variations the
+    // caller happened to pass in. Returns the canonical form so the
+    // frontend can store it and compare fs-changed events against the
+    // exact same string.
+    let canonical = fs::canonicalize(&path)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    let emit_path = canonical.clone();
     let handle = app.clone();
 
     let mut debouncer = new_debouncer(
@@ -2028,7 +2042,12 @@ fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) 
         move |events: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             if let Ok(events) = events {
                 if !events.is_empty() {
-                    let _ = handle.emit("fs-changed", FsChanged { path: watch_path.clone() });
+                    let _ = handle.emit(
+                        "fs-changed",
+                        FsChanged {
+                            path: emit_path.clone(),
+                        },
+                    );
                 }
             }
         },
@@ -2038,21 +2057,31 @@ fn watch_directory(path: String, state: State<AppState>, app: tauri::AppHandle) 
     debouncer
         .watcher()
         .watch(
-            std::path::Path::new(&path),
+            std::path::Path::new(&canonical),
             notify::RecursiveMode::Recursive,
         )
         .map_err(|e| e.to_string())?;
 
     // Insert into the map, replacing any existing watcher for this path (dropping it stops the previous watch)
-    let mut guard = state.fs_watcher.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
-    guard.remove(&path);
-    guard.insert(path, debouncer);
-    Ok(())
+    let mut guard = state
+        .fs_watcher
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
+    guard.remove(&canonical);
+    guard.insert(canonical.clone(), debouncer);
+    Ok(canonical)
 }
 
 #[tauri::command]
 fn unwatch_directory(path: String, state: State<AppState>) -> Result<(), String> {
-    state.fs_watcher.lock().map_err(|e| e.to_string())?.remove(&path);
+    // Try both the raw path and its canonical form — callers may hold
+    // either (watch_directory returns the canonical version, but a teardown
+    // path built from the original project.path may still use the raw one).
+    let mut guard = state.fs_watcher.lock().map_err(|e| e.to_string())?;
+    guard.remove(&path);
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        guard.remove(&canonical.to_string_lossy().to_string());
+    }
     Ok(())
 }
 
