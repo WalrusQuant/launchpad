@@ -1783,21 +1783,40 @@ fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
     )
 }
 
+// Mark the active git slot cancelled and return the PID (if any) that the
+// caller should kill. Split out so tests can exercise the state machine
+// without spawning a real git process.
+//
+// Slot is intentionally NOT cleared here — run_git_cancellable's cleanup
+// only clears when its own op_id matches, so a stale cancel can't wipe a
+// newer op's registration. The cancelled flag persists so a still-spawning
+// op can observe it after recording its PID.
+fn cancel_git_op_inner(pid_store: &Mutex<Option<GitOpSlot>>) -> Option<u32> {
+    let mut guard = pid_store.lock().unwrap();
+    if let Some(slot) = guard.as_mut() {
+        slot.cancelled = true;
+        return slot.pid;
+    }
+    None
+}
+
 #[tauri::command]
 fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
-    let mut guard = state.git_op_pid.lock().unwrap();
-    if let Some(slot) = guard.as_mut() {
-        // Mark cancelled so run_git_cancellable can kill the child even if
-        // we got here during the spawn window (PID not yet recorded).
-        slot.cancelled = true;
-        if let Some(pid) = slot.pid {
-            kill_pid_hard(pid);
-        }
-        // Don't clear the slot here — run_git_cancellable's cleanup owns that
-        // and only clears if the op_id still matches, so a stale cancel can't
-        // accidentally wipe a newer op's registration.
+    if let Some(pid) = cancel_git_op_inner(&state.git_op_pid) {
+        kill_pid_hard(pid);
     }
     Ok(())
+}
+
+fn is_valid_merge_branch_name(branch_name: &str) -> bool {
+    // Reject empties and leading `-` (option injection: `--no-verify`).
+    // Allow only [A-Za-z0-9._/-] so spaces, backticks, semicolons, etc. can't reach git argv.
+    if branch_name.is_empty() || branch_name.starts_with('-') {
+        return false;
+    }
+    branch_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || "._/-".contains(c))
 }
 
 #[tauri::command]
@@ -1806,8 +1825,7 @@ fn git_merge_branch(
     branch_name: String,
     state: State<AppState>,
 ) -> Result<String, String> {
-    // Validate branch name to prevent option injection
-    if !branch_name.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c)) {
+    if !is_valid_merge_branch_name(&branch_name) {
         return Err("Invalid branch name".into());
     }
     // Merge can block on network I/O if the user's git config pulls on merge
@@ -2540,30 +2558,30 @@ mod tests {
 
     #[test]
     fn test_merge_branch_rejects_invalid_names() {
-        let dir = setup_git_repo();
-        let path = dir.path().to_string_lossy().to_string();
-
         // Names with spaces
-        assert!(git_merge_branch(path.clone(), "branch name".into()).is_err());
+        assert!(!is_valid_merge_branch_name("branch name"));
         // Names with shell-special chars
-        assert!(git_merge_branch(path.clone(), "branch;rm -rf".into()).is_err());
-        // Names starting with --
-        assert!(git_merge_branch(path.clone(), "--no-verify".into()).is_err());
+        assert!(!is_valid_merge_branch_name("branch;rm -rf"));
+        // Names starting with -- (option injection)
+        assert!(!is_valid_merge_branch_name("--no-verify"));
+        // Single leading dash
+        assert!(!is_valid_merge_branch_name("-x"));
         // Backtick injection
-        assert!(git_merge_branch(path.clone(), "`whoami`".into()).is_err());
+        assert!(!is_valid_merge_branch_name("`whoami`"));
+        // Empty
+        assert!(!is_valid_merge_branch_name(""));
     }
 
     #[test]
     fn test_merge_branch_accepts_valid_names() {
-        let dir = setup_git_repo();
-        let path = dir.path().to_string_lossy().to_string();
-
-        // Valid names should not fail the validation (may fail because branch doesn't exist,
-        // but shouldn't fail with "Invalid branch name")
-        let result = git_merge_branch(path.clone(), "feature/test-branch".into());
-        // Will error because branch doesn't exist, but not due to validation
-        if let Err(e) = result {
-            assert!(!e.contains("Invalid branch name"), "Valid name was rejected: {}", e);
+        for name in [
+            "main",
+            "feature/test-branch",
+            "release-1.2.3",
+            "v0.1.4",
+            "user/foo_bar",
+        ] {
+            assert!(is_valid_merge_branch_name(name), "{:?} should be valid", name);
         }
     }
 
@@ -2682,5 +2700,431 @@ mod tests {
         // Verify HEAD points to new branch
         let head = repo.head().unwrap();
         assert_eq!(head.shorthand().unwrap(), "test-branch");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // atomic_write / atomic_write_with_mode tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_atomic_write_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        atomic_write(&dest, b"hello").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_atomic_write_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        fs::write(&dest, b"old contents").unwrap();
+        atomic_write(&dest, b"new").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn test_atomic_write_preserves_mode_on_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        fs::write(&dest, b"old").unwrap();
+        // Set a non-default mode on the existing file
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&dest, b"new").unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic_write should preserve 0o600 across overwrite");
+    }
+
+    #[test]
+    fn test_atomic_write_with_explicit_mode_overrides_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        // Pre-create with 0o644
+        fs::write(&dest, b"old").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        // Explicit 0o600 should win over the preserved 0o644
+        atomic_write_with_mode(&dest, b"new", Some(0o600)).unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_atomic_write_with_explicit_mode_on_new_file() {
+        // First-write case for project-env.json: no destination yet, so the
+        // explicit mode is the *only* thing protecting the secret.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("new-secret.json");
+        atomic_write_with_mode(&dest, b"{}", Some(0o600)).unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_atomic_write_no_temp_leftover_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        atomic_write(&dest, b"data").unwrap();
+        // Scan dir for stray .lp-tmp- files
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".lp-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .lp-tmp- files should remain after success");
+    }
+
+    #[test]
+    fn test_atomic_write_unique_temp_paths_under_burst() {
+        // Counter must produce distinct temp names for back-to-back writes
+        // to the same destination from the same process. We can't observe
+        // the temp paths directly, so we drive a tight loop and assert that
+        // every write succeeds (a name collision would manifest as an
+        // io::Error from File::create or rename racing the cleanup).
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        for i in 0..50 {
+            atomic_write(&dest, format!("payload-{}", i).as_bytes()).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "payload-49");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // is_valid_env_key tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_env_key_accepts_valid_names() {
+        for k in ["FOO", "_FOO", "FOO_BAR", "F1", "_", "a", "lower_case", "MIXED_Case_1"] {
+            assert!(is_valid_env_key(k), "{:?} should be valid", k);
+        }
+    }
+
+    #[test]
+    fn test_env_key_rejects_empty() {
+        assert!(!is_valid_env_key(""));
+    }
+
+    #[test]
+    fn test_env_key_rejects_leading_digit() {
+        assert!(!is_valid_env_key("1FOO"));
+        assert!(!is_valid_env_key("9"));
+    }
+
+    #[test]
+    fn test_env_key_rejects_punctuation_and_whitespace() {
+        for k in ["FOO-BAR", "FOO.BAR", "FOO BAR", "FOO=BAR", "FOO/BAR", " FOO", "FOO ", "FOO\n"] {
+            assert!(!is_valid_env_key(k), "{:?} should be invalid", k);
+        }
+    }
+
+    #[test]
+    fn test_env_key_rejects_non_ascii() {
+        // POSIX is ASCII-only; reject Unicode letters even though they
+        // satisfy `char::is_alphabetic`.
+        assert!(!is_valid_env_key("FOOÉ"));
+        assert!(!is_valid_env_key("Ω"));
+        assert!(!is_valid_env_key("FOO_λ"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // read_file_preview binary / encoding heuristic tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_read_file_preview_rejects_utf16_le_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u16le.txt");
+        let mut data = vec![0xFF, 0xFE];
+        data.extend_from_slice(b"h\0e\0l\0l\0o\0");
+        fs::write(&path, &data).unwrap();
+        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        assert!(err.contains("UTF-16"), "expected UTF-16 message, got: {}", err);
+    }
+
+    #[test]
+    fn test_read_file_preview_rejects_utf16_be_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u16be.txt");
+        let mut data = vec![0xFE, 0xFF];
+        data.extend_from_slice(b"\0h\0e\0l\0l\0o");
+        fs::write(&path, &data).unwrap();
+        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        assert!(err.contains("UTF-16"));
+    }
+
+    #[test]
+    fn test_read_file_preview_rejects_binary_above_threshold() {
+        // 100 bytes, ~30% nulls — well above the 1% binary cutoff.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        let mut data = Vec::with_capacity(100);
+        for i in 0..100 {
+            data.push(if i % 3 == 0 { 0u8 } else { b'A' });
+        }
+        fs::write(&path, &data).unwrap();
+        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        assert!(err.contains("Binary"), "expected Binary message, got: {}", err);
+    }
+
+    #[test]
+    fn test_read_file_preview_tolerates_null_in_short_file() {
+        // 20 bytes, single null. Pre-fix this would have been "5% null" and
+        // wrongly rejected; the 64-byte minimum keeps it readable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.txt");
+        let mut data = b"hello world".to_vec();
+        data.push(0);
+        data.extend_from_slice(b"more text");
+        assert!(data.len() <= 64);
+        fs::write(&path, &data).unwrap();
+        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        assert!(result.is_ok(), "short file with single null should be readable");
+    }
+
+    #[test]
+    fn test_read_file_preview_accepts_long_text_with_no_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let body: String = "the quick brown fox jumps over the lazy dog\n".repeat(20);
+        fs::write(&path, body.as_bytes()).unwrap();
+        let result = read_file_preview(path.to_string_lossy().to_string(), None).unwrap();
+        // Default cap is 8192 bytes — body is well under that, so full content returns.
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn test_read_file_preview_just_at_binary_threshold() {
+        // 200 bytes with exactly 1 null = 0.5% — under the 1% cutoff, should pass.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.txt");
+        let mut data = vec![b'A'; 200];
+        data[100] = 0;
+        fs::write(&path, &data).unwrap();
+        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        assert!(result.is_ok(), "0.5% nulls should be tolerated");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // delete_path project-root guard tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_delete_path_allows_file_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let target = dir.path().join("doomed.txt");
+        fs::write(&target, b"x").unwrap();
+        let result = delete_path(target.to_string_lossy().to_string(), Some(root));
+        assert!(result.is_ok(), "delete inside root should succeed: {:?}", result);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_delete_path_allows_directory_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let sub = dir.path().join("nested/deeper");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"a").unwrap();
+        let target = dir.path().join("nested");
+        let result = delete_path(target.to_string_lossy().to_string(), Some(root));
+        assert!(result.is_ok());
+        assert!(!target.exists(), "recursive directory delete should remove tree");
+    }
+
+    #[test]
+    fn test_delete_path_refuses_outside_root() {
+        // Two sibling temp dirs. The "project" claims one as root; the
+        // target lives in the other. The guard should refuse.
+        let project_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let outside = other_dir.path().join("victim.txt");
+        fs::write(&outside, b"keep me").unwrap();
+
+        let root = project_dir.path().to_string_lossy().to_string();
+        let result = delete_path(outside.to_string_lossy().to_string(), Some(root));
+        assert!(result.is_err(), "expected refusal, got: {:?}", result);
+        assert!(
+            result.as_ref().unwrap_err().contains("outside project root"),
+            "wrong error message: {:?}",
+            result
+        );
+        assert!(outside.exists(), "guard must not delete the target");
+    }
+
+    #[test]
+    fn test_delete_path_no_guard_when_root_is_none() {
+        // When the caller doesn't pass project_root the guard is opt-out.
+        // Confirm that's what actually happens — proves the existing
+        // non-context-menu callers haven't accidentally been gated.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file.txt");
+        fs::write(&target, b"x").unwrap();
+        let result = delete_path(target.to_string_lossy().to_string(), None);
+        assert!(result.is_ok());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_delete_path_refuses_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+        // The symlink itself lives inside the project, but its target is
+        // outside. canonicalize() follows symlinks, so the guard's
+        // starts_with check sees the outside path and refuses.
+        let project_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let outside_target = other_dir.path().join("victim.txt");
+        fs::write(&outside_target, b"keep me").unwrap();
+
+        let escape_link = project_dir.path().join("escape");
+        symlink(&outside_target, &escape_link).unwrap();
+
+        let root = project_dir.path().to_string_lossy().to_string();
+        let result = delete_path(escape_link.to_string_lossy().to_string(), Some(root));
+        assert!(result.is_err(), "symlink whose target escapes root must be refused");
+        assert!(outside_target.exists(), "outside target must survive");
+    }
+
+    #[test]
+    fn test_delete_path_errors_on_missing_target() {
+        // canonicalize fails on a non-existent path → propagated error.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let missing = dir.path().join("never-existed.txt");
+        let result = delete_path(missing.to_string_lossy().to_string(), Some(root));
+        assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // normalize_project_path canonicalization tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_normalize_project_path_dedupes_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().to_string_lossy().to_string();
+        let with_slash = format!("{}/", raw);
+        assert_eq!(
+            normalize_project_path(&raw),
+            normalize_project_path(&with_slash),
+            "trailing slash should not produce a different key"
+        );
+    }
+
+    #[test]
+    fn test_normalize_project_path_dedupes_dot_segments() {
+        // `./foo` and `foo` from the same cwd should canonicalize identically.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("inner");
+        fs::create_dir(&sub).unwrap();
+        let direct = sub.to_string_lossy().to_string();
+        let dotted = format!("{}/./", sub.to_string_lossy());
+        assert_eq!(normalize_project_path(&direct), normalize_project_path(&dotted));
+    }
+
+    #[test]
+    fn test_normalize_project_path_dedupes_symlink_alias() {
+        use std::os::unix::fs::symlink;
+        // macOS has /var → /private/var as a system-level alias. Reproduce
+        // the same shape with our own symlink: alias should normalize to
+        // the canonical target.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+
+        let real_norm = normalize_project_path(&real.to_string_lossy());
+        let alias_norm = normalize_project_path(&alias.to_string_lossy());
+        assert_eq!(real_norm, alias_norm,
+            "symlink alias must dedupe to canonical target");
+    }
+
+    #[test]
+    fn test_normalize_project_path_fallback_for_missing_dir() {
+        // canonicalize fails on a non-existent path. The fallback path
+        // trims trailing `/` and returns the raw string, so two different
+        // not-yet-existing strings won't dedupe — but a single string
+        // remains stable (with trailing slash stripped).
+        let raw = "/no/such/place".to_string();
+        let trailing = "/no/such/place/".to_string();
+        assert_eq!(normalize_project_path(&raw), normalize_project_path(&trailing));
+        assert_eq!(normalize_project_path(&raw), "/no/such/place");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // cancel_git_op_inner / GitOpSlot state machine tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cancel_op_no_slot_is_noop() {
+        let store: Mutex<Option<GitOpSlot>> = Mutex::new(None);
+        let pid = cancel_git_op_inner(&store);
+        assert_eq!(pid, None);
+        assert!(store.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cancel_op_sets_flag_when_pid_unrecorded() {
+        // Simulates the spawn-window race: cancel arrives AFTER the slot
+        // is reserved but BEFORE spawn_git_under_slot has recorded a PID.
+        // The flag must persist so the spawning op observes it post-spawn.
+        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+            op_id: 42,
+            pid: None,
+            cancelled: false,
+        }));
+        let pid = cancel_git_op_inner(&store);
+        assert_eq!(pid, None, "no PID to kill yet");
+
+        let guard = store.lock().unwrap();
+        let slot = guard.as_ref().expect("slot must NOT be cleared");
+        assert!(slot.cancelled, "flag must be set so spawn-window cancel survives");
+        assert_eq!(slot.op_id, 42, "op_id must be preserved");
+    }
+
+    #[test]
+    fn test_cancel_op_returns_pid_when_recorded() {
+        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+            op_id: 7,
+            pid: Some(99999),
+            cancelled: false,
+        }));
+        let pid = cancel_git_op_inner(&store);
+        assert_eq!(pid, Some(99999), "caller needs the PID to kill");
+        assert!(store.lock().unwrap().as_ref().unwrap().cancelled);
+    }
+
+    #[test]
+    fn test_cancel_op_idempotent() {
+        // Double-click cancel: second call shouldn't change anything.
+        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+            op_id: 1,
+            pid: Some(123),
+            cancelled: false,
+        }));
+        assert_eq!(cancel_git_op_inner(&store), Some(123));
+        assert_eq!(cancel_git_op_inner(&store), Some(123));
+        let guard = store.lock().unwrap();
+        let slot = guard.as_ref().unwrap();
+        assert!(slot.cancelled);
+        assert_eq!(slot.pid, Some(123));
+    }
+
+    #[test]
+    fn test_cancel_op_does_not_clear_slot() {
+        // The cleanup of the slot (setting it back to None) is owned by
+        // run_git_cancellable / git_push, gated on op_id match. cancel
+        // must NOT do it — otherwise a stale cancel races a new op.
+        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+            op_id: 5,
+            pid: None,
+            cancelled: false,
+        }));
+        cancel_git_op_inner(&store);
+        assert!(
+            store.lock().unwrap().is_some(),
+            "cancel must not wipe slot — cleanup is the spawning op's job"
+        );
     }
 }
