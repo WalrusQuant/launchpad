@@ -3334,4 +3334,186 @@ mod tests {
         let hits = search_files(dir.path().to_string_lossy().to_string(), "main".into(), None).unwrap();
         assert_eq!(hits, vec!["src/main.rs"]);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // get_git_status tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_git_status_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        assert!(!info.is_repo);
+        assert_eq!(info.branch, None);
+        assert!(info.files.is_empty());
+        assert_eq!(info.ahead, 0);
+        assert_eq!(info.behind, 0);
+        assert!(!info.has_upstream);
+    }
+
+    #[test]
+    fn test_git_status_clean_repo_after_initial_commit() {
+        let dir = setup_git_repo();
+        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        assert!(info.is_repo);
+        assert!(info.branch.is_some(), "branch should resolve after a commit");
+        assert!(info.files.is_empty(), "clean tree should have no status entries");
+    }
+
+    #[test]
+    fn test_git_status_reports_untracked_as_new() {
+        let dir = setup_git_repo();
+        fs::write(dir.path().join("untracked.txt"), b"x").unwrap();
+        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let entry = info.files.iter().find(|f| f.path == "untracked.txt")
+            .expect("untracked file should appear in status");
+        assert_eq!(entry.status, "new");
+    }
+
+    #[test]
+    fn test_git_status_reports_staged_as_index_new() {
+        let dir = setup_git_repo();
+        fs::write(dir.path().join("added.txt"), b"x").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("added.txt")).unwrap();
+        idx.write().unwrap();
+
+        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let entry = info.files.iter().find(|f| f.path == "added.txt").unwrap();
+        assert_eq!(entry.status, "index_new",
+            "staged-but-not-committed file should be index_new");
+    }
+
+    #[test]
+    fn test_git_status_dual_entry_when_staged_then_modified() {
+        // The whole point of the dual-entry shape: a file appears in BOTH
+        // the staged list (index_modified) AND the unstaged list (modified)
+        // when its index version differs from HEAD AND its working tree
+        // differs from the index.
+        let dir = setup_git_repo();
+        let target = dir.path().join("hello.txt");
+        // Stage a change against HEAD ("hello world" → "stage me")
+        fs::write(&target, b"stage me").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("hello.txt")).unwrap();
+        idx.write().unwrap();
+        // Then modify again on disk so the worktree differs from the index
+        fs::write(&target, b"and again").unwrap();
+
+        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let kinds: Vec<&str> = info.files.iter()
+            .filter(|f| f.path == "hello.txt")
+            .map(|f| f.status.as_str())
+            .collect();
+        assert!(kinds.contains(&"index_modified"),
+            "expected staged entry, got: {:?}", kinds);
+        assert!(kinds.contains(&"modified"),
+            "expected unstaged entry, got: {:?}", kinds);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // git_discard_file tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_discard_deletes_untracked_file() {
+        let dir = setup_git_repo();
+        let target = dir.path().join("untracked.txt");
+        fs::write(&target, b"x").unwrap();
+        assert!(target.exists());
+
+        git_discard_file(
+            dir.path().to_string_lossy().to_string(),
+            "untracked.txt".into(),
+        ).unwrap();
+        assert!(!target.exists(), "untracked file should be deleted from disk");
+    }
+
+    #[test]
+    fn test_discard_deletes_file_inside_untracked_directory() {
+        // Reproduces the GIT_ENOTFOUND fallback path: status_file can't
+        // see children of an untracked directory (git only reports the
+        // dir), so libgit2 returns NotFound. We have to fall back to a
+        // disk presence check or the user clicks Discard on a file that
+        // looks tracked-but-isn't and nothing happens.
+        let dir = setup_git_repo();
+        let untracked_dir = dir.path().join("scratch");
+        fs::create_dir(&untracked_dir).unwrap();
+        let target = untracked_dir.join("notes.txt");
+        fs::write(&target, b"x").unwrap();
+
+        git_discard_file(
+            dir.path().to_string_lossy().to_string(),
+            "scratch/notes.txt".into(),
+        ).unwrap();
+        assert!(!target.exists(), "file inside untracked dir should be deleted");
+    }
+
+    #[test]
+    fn test_discard_restores_tracked_file_to_head() {
+        // setup_git_repo commits hello.txt with "hello world". Modify it
+        // on disk, then discard — should snap back to HEAD content.
+        let dir = setup_git_repo();
+        let target = dir.path().join("hello.txt");
+        fs::write(&target, b"corrupted").unwrap();
+
+        git_discard_file(
+            dir.path().to_string_lossy().to_string(),
+            "hello.txt".into(),
+        ).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"hello world",
+            "discard should restore HEAD content");
+    }
+
+    #[test]
+    fn test_discard_errors_on_truly_missing_file() {
+        // Path doesn't exist on disk and isn't tracked. status_file
+        // returns NotFound, abs.exists() is false → treat_as_untracked
+        // is false, status_result error propagates.
+        let dir = setup_git_repo();
+        let result = git_discard_file(
+            dir.path().to_string_lossy().to_string(),
+            "never-existed.txt".into(),
+        );
+        assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // git_upstream_status tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_upstream_status_non_repo_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (has, branch) = git_upstream_status(&dir.path().to_string_lossy());
+        assert!(!has);
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_upstream_status_unborn_head_returns_none() {
+        // Empty repo with no commits: head() fails because HEAD points
+        // at an unborn ref. The early-return must produce (false, None)
+        // rather than panic.
+        let dir = setup_empty_git_repo();
+        let (has, branch) = git_upstream_status(&dir.path().to_string_lossy());
+        assert!(!has);
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_upstream_status_branch_without_upstream() {
+        // Repo with a commit but no remote. Branch resolves; upstream doesn't.
+        // git_push relies on this exact shape to decide between `push` and
+        // `push --set-upstream origin <branch>`.
+        let dir = setup_git_repo();
+        let (has, branch) = git_upstream_status(&dir.path().to_string_lossy());
+        assert!(!has, "no remote configured → no upstream");
+        assert!(
+            branch.is_some(),
+            "branch name must be available so push can pass it to --set-upstream"
+        );
+    }
 }
