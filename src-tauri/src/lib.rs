@@ -3516,4 +3516,169 @@ mod tests {
             "branch name must be available so push can pass it to --set-upstream"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // git_stage_file / git_stage_all tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_stage_file_moves_status_from_unstaged_to_staged() {
+        // setup_git_repo committed hello.txt. Modify it, then stage it.
+        // It should appear as index_modified, NOT modified.
+        let dir = setup_git_repo();
+        let path_str = dir.path().to_string_lossy().to_string();
+        fs::write(dir.path().join("hello.txt"), b"changed").unwrap();
+
+        // Pre-stage: should be 'modified' (worktree)
+        let pre = get_git_status(path_str.clone()).unwrap();
+        assert!(pre.files.iter().any(|f| f.path == "hello.txt" && f.status == "modified"));
+
+        git_stage_file(path_str.clone(), "hello.txt".into()).unwrap();
+
+        let post = get_git_status(path_str).unwrap();
+        let kinds: Vec<&str> = post.files.iter()
+            .filter(|f| f.path == "hello.txt")
+            .map(|f| f.status.as_str())
+            .collect();
+        assert!(kinds.contains(&"index_modified"),
+            "post-stage should include index_modified, got: {:?}", kinds);
+        assert!(!kinds.contains(&"modified"),
+            "post-stage should NOT still have unstaged 'modified', got: {:?}", kinds);
+    }
+
+    #[test]
+    fn test_stage_file_picks_up_untracked() {
+        let dir = setup_git_repo();
+        let path_str = dir.path().to_string_lossy().to_string();
+        fs::write(dir.path().join("fresh.txt"), b"x").unwrap();
+
+        git_stage_file(path_str.clone(), "fresh.txt".into()).unwrap();
+
+        let info = get_git_status(path_str).unwrap();
+        let entry = info.files.iter().find(|f| f.path == "fresh.txt").unwrap();
+        assert_eq!(entry.status, "index_new",
+            "newly-tracked file should be index_new after staging");
+    }
+
+    #[test]
+    fn test_stage_all_picks_up_multiple_files() {
+        let dir = setup_git_repo();
+        let path_str = dir.path().to_string_lossy().to_string();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        fs::write(dir.path().join("hello.txt"), b"changed").unwrap();
+
+        git_stage_all(path_str.clone()).unwrap();
+
+        let info = get_git_status(path_str).unwrap();
+        // Every entry now should be a staged status.
+        for f in &info.files {
+            assert!(
+                f.status.starts_with("index_"),
+                "stage_all should have moved {:?} into the index, got {:?}",
+                f.path, f.status
+            );
+        }
+        // And specifically these three are present as staged.
+        let staged: std::collections::HashSet<&str> = info.files.iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(staged.contains("a.txt"));
+        assert!(staged.contains("b.txt"));
+        assert!(staged.contains("hello.txt"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // list_branches / get_commits tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_list_branches_marks_current() {
+        let dir = setup_git_repo();
+        // Create a second branch off HEAD
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature/x", &head_commit, false).unwrap();
+
+        let branches = list_branches(dir.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(branches.len(), 2);
+        let current_count = branches.iter().filter(|b| b.is_current).count();
+        assert_eq!(current_count, 1, "exactly one branch should be marked current");
+        // Current branch sorts first
+        assert!(branches[0].is_current);
+    }
+
+    #[test]
+    fn test_list_branches_no_upstream_when_remote_missing() {
+        let dir = setup_git_repo();
+        let branches = list_branches(dir.path().to_string_lossy().to_string()).unwrap();
+        assert!(branches.iter().all(|b| b.upstream.is_none()),
+            "no remote configured → no branch should report an upstream");
+    }
+
+    #[test]
+    fn test_get_commits_returns_history() {
+        let dir = setup_git_repo();
+        let commits = get_commits(dir.path().to_string_lossy().to_string(), None).unwrap();
+        assert_eq!(commits.len(), 1, "single initial commit from setup_git_repo");
+        let c = &commits[0];
+        assert_eq!(c.message, "initial commit");
+        assert_eq!(c.parent_count, 0);
+        assert_eq!(c.oid.len(), 7, "short OID is 7 chars");
+    }
+
+    #[test]
+    fn test_get_commits_respects_count_limit() {
+        // Add a couple more commits, then verify the limit caps results.
+        let dir = setup_git_repo();
+        let repo = Repository::open(dir.path()).unwrap();
+        let sig = repo.signature().unwrap();
+        for i in 0..3 {
+            let name = format!("file-{}.txt", i);
+            fs::write(dir.path().join(&name), b"x").unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(std::path::Path::new(&name)).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, &format!("commit {}", i), &tree, &[&parent]).unwrap();
+        }
+
+        let limited = get_commits(dir.path().to_string_lossy().to_string(), Some(2)).unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn test_get_commits_unborn_head_errors() {
+        let dir = setup_empty_git_repo();
+        let result = get_commits(dir.path().to_string_lossy().to_string(), None);
+        assert!(result.is_err(), "no HEAD target → should return Err, not panic");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // apply_git_env tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_apply_git_env_sets_no_prompt_vars() {
+        // GIT_TERMINAL_PROMPT=0 and GIT_ASKPASS=echo are the load-bearing
+        // bits — without them, an HTTPS remote with no credential helper
+        // hangs forever waiting on a stdin pipe with no TTY. Worth a test.
+        let mut cmd = std::process::Command::new("git");
+        apply_git_env(&mut cmd);
+
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().to_string(),
+                    v?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect();
+
+        assert_eq!(envs.get("GIT_TERMINAL_PROMPT"), Some(&"0".to_string()));
+        assert_eq!(envs.get("GIT_ASKPASS"), Some(&"echo".to_string()));
+    }
 }
