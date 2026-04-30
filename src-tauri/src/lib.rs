@@ -3127,4 +3127,211 @@ mod tests {
             "cancel must not wipe slot — cleanup is the spawning op's job"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // read_directory tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_read_directory_sorts_dirs_first_then_alpha() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mix dirs and files with names that test case-insensitive sort.
+        fs::write(dir.path().join("zeta.txt"), b"").unwrap();
+        fs::write(dir.path().join("Apple.txt"), b"").unwrap();
+        fs::create_dir(dir.path().join("Zoo")).unwrap();
+        fs::create_dir(dir.path().join("alpha-dir")).unwrap();
+
+        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        // Dirs first (case-insensitive alpha), then files (case-insensitive alpha).
+        assert_eq!(names, vec!["alpha-dir", "Zoo", "Apple.txt", "zeta.txt"]);
+    }
+
+    #[test]
+    fn test_read_directory_marks_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".hidden"), b"").unwrap();
+        fs::write(dir.path().join("visible.txt"), b"").unwrap();
+
+        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let hidden: Vec<&str> = entries.iter().filter(|e| e.is_hidden).map(|e| e.name.as_str()).collect();
+        assert_eq!(hidden, vec![".hidden"]);
+    }
+
+    #[test]
+    fn test_read_directory_populates_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("with-bytes.txt"), b"abcdefg").unwrap();
+
+        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let entry = entries.iter().find(|e| e.name == "with-bytes.txt").unwrap();
+        assert_eq!(entry.size, 7);
+        assert!(!entry.is_dir);
+        assert!(entry.modified.is_some(), "modified time should be populated");
+        assert_ne!(entry.mode, 0, "mode should be populated for an existing file");
+    }
+
+    #[test]
+    fn test_read_directory_errors_on_missing_dir() {
+        let result = read_directory("/no/such/directory/anywhere".into());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_directory_includes_hidden_entries_in_listing() {
+        // The hidden flag is informational — the entry must still appear.
+        // Filtering hidden files is a frontend choice.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".env"), b"").unwrap();
+        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        assert!(entries.iter().any(|e| e.name == ".env"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // find_path_by_inode walker tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_find_path_by_inode_locates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        fs::write(&path, b"x").unwrap();
+        let inode = get_file_inode(path.to_string_lossy().to_string()).unwrap();
+
+        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        assert_eq!(found, Some(path.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn test_find_path_by_inode_follows_rename() {
+        // The whole point of inode lookup: an external rename moves the
+        // file but preserves the inode. The walker should still find it.
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("before.txt");
+        fs::write(&original, b"x").unwrap();
+        let inode = get_file_inode(original.to_string_lossy().to_string()).unwrap();
+
+        let renamed = dir.path().join("nested").join("after.txt");
+        fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+        fs::rename(&original, &renamed).unwrap();
+
+        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        assert_eq!(found, Some(renamed.to_string_lossy().to_string()),
+            "inode walker should find the file at its new path");
+    }
+
+    #[test]
+    fn test_find_path_by_inode_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        // Inode 1 effectively never matches a real file in a tempdir.
+        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), 1).unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_find_path_by_inode_skips_node_modules() {
+        // File is the only one in the tree, but it lives under a skipped
+        // directory. The walker should NOT find it (skip rules apply).
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("pkg");
+        fs::create_dir_all(&nm).unwrap();
+        let buried = nm.join("buried.js");
+        fs::write(&buried, b"x").unwrap();
+        let inode = get_file_inode(buried.to_string_lossy().to_string()).unwrap();
+
+        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        assert_eq!(found, None,
+            "node_modules must be skipped to keep the walk bounded");
+    }
+
+    #[test]
+    fn test_find_path_by_inode_skips_hidden_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".cache");
+        fs::create_dir(&hidden).unwrap();
+        let buried = hidden.join("data");
+        fs::write(&buried, b"x").unwrap();
+        let inode = get_file_inode(buried.to_string_lossy().to_string()).unwrap();
+
+        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        assert_eq!(found, None);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // search_files skip-rule + ranking tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_search_files_basic_substring_match() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), b"").unwrap();
+        fs::write(dir.path().join("settings.rs"), b"").unwrap();
+        fs::write(dir.path().join("other.txt"), b"").unwrap();
+
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "set".into(), None).unwrap();
+        assert_eq!(hits, vec!["settings.rs"]);
+    }
+
+    #[test]
+    fn test_search_files_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ReadMe.md"), b"").unwrap();
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "README".into(), None).unwrap();
+        assert_eq!(hits, vec!["ReadMe.md"]);
+    }
+
+    #[test]
+    fn test_search_files_skips_node_modules_target_and_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // Files in skipped dirs — none should match.
+        for skipped in ["node_modules", "target", ".git", "__pycache__", "dist", "build"] {
+            let p = dir.path().join(skipped);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("hit.txt"), b"").unwrap();
+        }
+        // One match in the project root proper.
+        fs::write(dir.path().join("hit.txt"), b"").unwrap();
+
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "hit".into(), None).unwrap();
+        assert_eq!(hits, vec!["hit.txt"], "only the root-level file should match");
+    }
+
+    #[test]
+    fn test_search_files_respects_max_results() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            fs::write(dir.path().join(format!("file-{}.txt", i)), b"").unwrap();
+        }
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "file".into(), Some(3)).unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn test_search_files_ranks_shorter_paths_first() {
+        // Quick-open scoring: shorter relative path wins. A shallow file
+        // should rank above the same name buried deeper.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.rs"), b"").unwrap();
+        let nested = dir.path().join("subdir").join("more").join("config-deep.rs");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"").unwrap();
+
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "config".into(), None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0], "config.rs", "shorter path should rank first");
+    }
+
+    #[test]
+    fn test_search_files_returns_relative_paths() {
+        // Tab UI and Cmd+P show relative paths; absolute paths would
+        // bloat the list and reveal /private/var/folders/... noise.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src").join("main.rs");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"").unwrap();
+
+        let hits = search_files(dir.path().to_string_lossy().to_string(), "main".into(), None).unwrap();
+        assert_eq!(hits, vec!["src/main.rs"]);
+    }
 }
