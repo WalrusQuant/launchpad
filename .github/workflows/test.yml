@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to a branch supersedes the previous run for that branch.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run tests
+        # LAUNCHPAD_HOME redirects every read/write that would otherwise
+        # land in ~/.launchpad (config.json, projects.json,
+        # project-env.json, debug.log) to a runner-local tempdir, so
+        # tests can't pollute the runner's HOME or leak between runs.
+        env:
+          LAUNCHPAD_HOME: ${{ runner.temp }}/launchpad-test-home
+        run: |
+          mkdir -p "$LAUNCHPAD_HOME"
+          cargo test --manifest-path src-tauri/Cargo.toml

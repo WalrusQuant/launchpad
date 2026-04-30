@@ -286,8 +286,7 @@ fn resume_pty_reader(tab_id: u32, state: State<AppState>) -> Result<(), String> 
 // previous capture. Returns the absolute path so the frontend can display it.
 #[tauri::command]
 fn write_debug_log(content: String) -> Result<String, String> {
-    let home = dirs_home().ok_or_else(|| "no HOME".to_string())?;
-    let dir = home.join(".launchpad");
+    let dir = launchpad_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("debug.log");
     std::fs::write(&path, content).map_err(|e| e.to_string())?;
@@ -617,8 +616,7 @@ fn checkout_branch_inner(repo: &Repository, branch_name: &str) -> Result<(), Str
 
 // Settings
 fn config_path() -> std::path::PathBuf {
-    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
-    home.join(".launchpad").join("config.json")
+    launchpad_dir().join("config.json")
 }
 
 #[tauri::command]
@@ -647,8 +645,7 @@ fn save_settings(data: String) -> Result<(), String> {
 }
 
 fn file_settings_path() -> std::path::PathBuf {
-    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
-    home.join(".launchpad").join("file-settings.json")
+    launchpad_dir().join("file-settings.json")
 }
 
 #[tauri::command]
@@ -685,8 +682,7 @@ struct Project {
 }
 
 fn projects_path() -> std::path::PathBuf {
-    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
-    home.join(".launchpad").join("projects.json")
+    launchpad_dir().join("projects.json")
 }
 
 fn read_projects_file() -> Result<Vec<Project>, String> {
@@ -849,8 +845,7 @@ struct ProjectEnvVar {
 type ProjectEnvStore = std::collections::BTreeMap<String, Vec<ProjectEnvVar>>;
 
 fn project_env_path() -> std::path::PathBuf {
-    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
-    home.join(".launchpad").join("project-env.json")
+    launchpad_dir().join("project-env.json")
 }
 
 fn read_project_env_file() -> Result<ProjectEnvStore, String> {
@@ -2437,6 +2432,20 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+// Resolves to the directory holding config.json / projects.json /
+// project-env.json / debug.log. Honors $LAUNCHPAD_HOME so tests can
+// redirect to a tempdir without clobbering the user's real config.
+// `LAUNCHPAD_HOME` IS the directory (not its parent), so a test can
+// `std::env::set_var("LAUNCHPAD_HOME", tempdir.path())` and immediately
+// read/write files there.
+fn launchpad_dir() -> std::path::PathBuf {
+    if let Some(override_path) = std::env::var_os("LAUNCHPAD_HOME") {
+        return std::path::PathBuf::from(override_path);
+    }
+    let home = dirs_home().unwrap_or_else(|| "/tmp".into());
+    home.join(".launchpad")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2547,7 +2556,9 @@ mod tests {
 
     #[test]
     fn test_save_settings_accepts_valid_json() {
-        // This writes to ~/.launchpad/config.json — we accept that in tests
+        // Writes to launchpad_dir()/config.json. Local runs hit the real
+        // ~/.launchpad; CI sets LAUNCHPAD_HOME=$(mktemp -d) so the
+        // workflow stays sandboxed.
         let result = save_settings(r#"{"termFontSize": 14}"#.into());
         assert!(result.is_ok());
     }
