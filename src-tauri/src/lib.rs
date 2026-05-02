@@ -530,8 +530,14 @@ fn list_branches(path: String) -> Result<Vec<BranchInfo>, String> {
 #[tauri::command]
 fn get_commits(path: String, count: Option<usize>) -> Result<Vec<CommitInfo>, String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let head = repo.head().map_err(|e| e.to_string())?;
-    let head_oid = head.target().ok_or("No HEAD target")?;
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(_) => return Ok(vec![]),
+    };
+    let head_oid = match head.target() {
+        Some(oid) => oid,
+        None => return Ok(vec![]),
+    };
 
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
     revwalk.push(head_oid).map_err(|e| e.to_string())?;
@@ -3661,10 +3667,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_commits_unborn_head_errors() {
+    fn test_get_commits_unborn_head_returns_empty() {
         let dir = setup_empty_git_repo();
         let result = get_commits(dir.path().to_string_lossy().to_string(), None);
-        assert!(result.is_err(), "no HEAD target → should return Err, not panic");
+        assert!(result.is_ok(), "unborn HEAD should return Ok, not Err");
+        assert!(result.unwrap().is_empty(), "unborn HEAD should return empty vec");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

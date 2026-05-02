@@ -137,7 +137,7 @@ export async function refreshPanel(path, force = false, preloadedStatus = null) 
     const [branches, remoteBranches, commits, remoteUrl, stashes] = await Promise.all([
       invoke("list_branches", { path: currentPath }),
       invoke("list_remote_branches", { path: currentPath }).catch(() => []),
-      invoke("get_commits", { path: currentPath, count: 30 }),
+      invoke("get_commits", { path: currentPath, count: 30 }).catch(() => []),
       invoke("get_remote_url", { path: currentPath }).catch(() => null),
       invoke("git_stash_list", { path: currentPath }).catch(() => []),
     ]);
