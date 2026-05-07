@@ -3545,3 +3545,85 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: rgba(255, 95, 86, 0.1);
 }
 
+/* ===== Inline conflict editor (Phase 4 / PR3) ===== */
+.cm-conflict-ours {
+  background: rgba(90, 247, 142, 0.10);
+}
+
+.cm-conflict-theirs {
+  background: rgba(97, 175, 239, 0.10);
+}
+
+.cm-conflict-base {
+  background: rgba(255, 184, 108, 0.08);
+}
+
+.conflict-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface-6);
+  border-top: 1px solid var(--surface-8);
+  border-bottom: 1px solid var(--surface-8);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  user-select: none;
+}
+
+.conflict-action-label {
+  color: var(--text-1);
+  margin-right: 8px;
+}
+
+.conflict-action-btn {
+  background: var(--surface-8);
+  color: var(--text-10);
+  border: 1px solid var(--border-2);
+  border-radius: 3px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.conflict-action-btn:hover {
+  background: #57c7ff;
+  color: var(--surface-1);
+  border-color: #57c7ff;
+}
+
+.conflict-action-btn[data-choice="ours"]:hover {
+  background: #5af78e;
+  color: var(--surface-1);
+  border-color: #5af78e;
+}
+
+.conflict-action-btn[data-choice="theirs"]:hover {
+  background: #61afef;
+  color: var(--surface-1);
+  border-color: #61afef;
+}
+
+.conflict-action-btn[data-choice="both"]:hover {
+  background: #ffb86c;
+  color: var(--surface-1);
+  border-color: #ffb86c;
+}
+
+.conflict-separator {
+  padding: 2px 12px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  color: var(--text-1);
+  background: var(--surface-5);
+  border-top: 1px dashed var(--border-2);
+  border-bottom: 1px dashed var(--border-2);
+  user-select: none;
+}
+
+.conflict-separator-mid {
+  color: var(--text-10);
+  background: var(--surface-6);
+}
+
