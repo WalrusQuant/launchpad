@@ -18,6 +18,7 @@ import { StreamLanguage } from "@codemirror/language";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { vim } from "@replit/codemirror-vim";
+import { conflictExtension } from "./conflictmarkers.js";
 
 const langMap = {
   js: javascript,
@@ -151,7 +152,7 @@ const launchpadTheme = EditorView.theme({
  * Create a CodeMirror editor instance.
  * Returns { view, setTabSize, setWordWrap } — caller owns the view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme, conflictMode } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -176,6 +177,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
+    ...(conflictMode ? [conflictExtension({ phase6Available: false })] : []),
     EditorState.allowMultipleSelections.of(true),
     tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),

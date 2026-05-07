@@ -7,7 +7,8 @@ import { createEditor, getLangName } from "./editor.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
-import { fetchGitStatus, startGitPolling } from "./git.js";
+import { fetchGitStatus, startGitPolling, getGitFileStatus } from "./git.js";
+import { parseConflictBlocks } from "./conflictmarkers.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { buildFileDiffSection } from "./diffrender.js";
 import { loadSettings, saveSetting, getSettings } from "./settings.js";
@@ -671,6 +672,12 @@ async function createEditorTab(filePath, options = {}) {
 
   const updateStatus = () => renderEditorStatus(tab, statusBar);
 
+  // Conflict mode opts the editor into the inline action bar + tinted
+  // backgrounds. Decision is at open-time only; if a file becomes (or stops
+  // being) a conflict afterward the user closes and reopens — keeps the
+  // wiring simple.
+  const conflictMode = getGitFileStatus(filePath) === "conflict";
+
   const editorHandle = createEditor(editorContent, content, fileName, {
     onChange: (newContent) => {
       tab.modified = newContent !== tab.originalContent;
@@ -685,7 +692,9 @@ async function createEditorTab(filePath, options = {}) {
     wordWrap: effectiveWordWrap,
     vimMode: editorSettings.editorVimMode,
     theme: getResolvedTheme(),
+    conflictMode,
   });
+  tab.conflictMode = conflictMode;
 
   const editorView = editorHandle.view;
   tab.editorView = editorView;
@@ -1033,12 +1042,13 @@ async function saveEditorTab(uiId) {
   if (!tab || tab.type !== "editor") return;
 
   try {
-    let content = tab.editorView.state.doc.toString();
+    const rawContent = tab.editorView.state.doc.toString();
+    let content = rawContent;
     if (tab.lineEndings === "CRLF") {
       content = content.replace(/\r?\n/g, "\r\n");
     }
     await invoke("write_file", { path: tab.filePath, content });
-    tab.originalContent = tab.editorView.state.doc.toString();
+    tab.originalContent = rawContent;
     tab.modified = false;
     renderTabBar();
     // Flash the tab label green briefly to confirm save
@@ -1046,6 +1056,26 @@ async function saveEditorTab(uiId) {
     if (tabEl) {
       tabEl.classList.add("tab-save-flash");
       setTimeout(() => tabEl.classList.remove("tab-save-flash"), 600);
+    }
+    // Auto-stage when a conflict-mode tab is saved with all blocks resolved.
+    // Gate is `parseConflictBlocks` returning [] — not a substring scan —
+    // so source files containing literal "<<<<<<< HEAD" (e.g. test fixtures)
+    // never wrongly trigger a stage.
+    if (tab.conflictMode && parseConflictBlocks(rawContent).length === 0) {
+      const project = getActiveProject();
+      if (project) {
+        try {
+          await invoke("git_stage_file", { path: project.path, filePath: tab.filePath });
+          showToast(`Resolved ${tab.fileName}`, "info");
+          // Once staged, subsequent saves shouldn't re-stage this tab.
+          tab.conflictMode = false;
+          // Refresh the panel so the conflict moves out of the conflicts
+          // section and into staged.
+          refreshPanel(null, true);
+        } catch (err) {
+          showToast(`Auto-stage failed: ${err}`, "error");
+        }
+      }
     }
   } catch (err) {
     console.error("Save error:", err);
