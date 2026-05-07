@@ -64,8 +64,15 @@ export function parseConflictBlocks(text) {
     let closeIdx = -1; // line number of >>>>>>>
 
     let j = i + 1;
+    let nestedOpenIdx = -1;
     while (j < lines.length) {
-      if (isMarkerLine(lines[j], "<")) break; // nested open — give up on this block
+      if (isMarkerLine(lines[j], "<")) {
+        // Nested open — bail on this outer block but remember the inner
+        // open so the next iteration starts there (not at i+1, which would
+        // re-scan empty content and miss the inner block entirely).
+        nestedOpenIdx = j;
+        break;
+      }
       if (isMarkerLine(lines[j], "|")) {
         if (baseIdx !== -1) break; // already saw one ||| — malformed
         if (midIdx !== -1) break;  // ||| after === is malformed
@@ -88,9 +95,10 @@ export function parseConflictBlocks(text) {
     }
 
     if (closeIdx === -1 || midIdx === -1) {
-      // Malformed or unterminated — skip past the open marker only, leaving
-      // any subsequent markers free to start a fresh block.
-      i++;
+      // Malformed, unterminated, or hit a nested <<<. When a nested open was
+      // detected, jump TO it so it parses as a block on the next iteration —
+      // not past it, which would leave the inner block invisible.
+      i = nestedOpenIdx !== -1 ? nestedOpenIdx : i + 1;
       continue;
     }
 
@@ -107,12 +115,17 @@ export function parseConflictBlocks(text) {
 
     const start = lineOffsets[openIdx];
     const closeLineEnd = lineOffsets[closeIdx] + lines[closeIdx].length;
-    // Include the newline after >>>>>>> if it exists
-    const end = Math.min(docLength, closeLineEnd + 1);
+    // Include the newline after >>>>>>> if it exists. `hadTrailingNewline`
+    // tells `replaceBlock` whether the original file ended the block with a
+    // \n (so the replacement should preserve it) or not (so we mustn't
+    // invent one — that'd silently change the file's last byte).
+    const hadTrailingNewline = closeLineEnd + 1 <= docLength;
+    const end = hadTrailingNewline ? closeLineEnd + 1 : closeLineEnd;
 
     blocks.push({
       start,
       end,
+      hadTrailingNewline,
       openMarkerLine: openIdx,
       baseMarkerLine: baseIdx !== -1 ? baseIdx : undefined,
       midMarkerLine: midIdx,
@@ -148,13 +161,12 @@ export function replaceBlock(block, choice) {
     default:
       replacement = typeof choice === "string" ? choice : "";
   }
-  // Restore a trailing newline if the block extends past its closing marker
-  // (which `parseConflictBlocks.end` already includes when present).
-  if (replacement.length > 0 && !replacement.endsWith("\n")) {
+  // Preserve the file's existing newline policy. If the block was followed
+  // by \n in the original, re-append one (we consumed it as part of `end`).
+  // If the file had NO trailing newline (block was at EOF without \n), don't
+  // invent one — that would silently change the last byte of the file.
+  if (block.hadTrailingNewline && replacement.length > 0 && !replacement.endsWith("\n")) {
     replacement += "\n";
-  } else if (replacement.length === 0) {
-    // Even if all chosen sides are empty, the closing newline disappears
-    // along with the block. That's fine — the file just collapses cleanly.
   }
   return { from: block.start, to: block.end, insert: replacement };
 }
