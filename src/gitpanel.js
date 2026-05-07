@@ -1,33 +1,10 @@
 import { showDiffPreview, refreshFileBrowser } from "./filebrowser.js";
 import { setPanelTransitioning } from "./main.js";
 import { matches as keyMatches } from "./keymap.js";
+import { buildDiffHtml } from "./diffrender.js";
+import { inFlightOp, setInFlightOp, invokeWithTimeout } from "./git.js";
 
 const { invoke } = window.__TAURI__.core;
-
-// Wraps invoke with a timeout to prevent indefinite hangs on network
-// operations. Tauri IPC has no cancellation — Promise.race rejecting does
-// NOT stop the Rust side, so on timeout we explicitly call cancel_git_op
-// to kill the git child process and free its PID slot. Without this, every
-// timeout leaks a git process and occupies the single-slot pid_store,
-// making subsequent ops uncancellable.
-async function invokeWithTimeout(command, args, timeoutMs = 30000) {
-  let timedOut = false;
-  let timerId;
-  const timer = new Promise((_, reject) => {
-    timerId = setTimeout(() => {
-      timedOut = true;
-      reject(new Error("Operation timed out"));
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([invoke(command, args), timer]);
-  } finally {
-    clearTimeout(timerId);
-    if (timedOut) {
-      try { await invoke("cancel_git_op"); } catch (_) {}
-    }
-  }
-}
 
 // ─── Module-level state ────────────────────────────────────────────────────────
 let panelVisible = false;
@@ -35,12 +12,12 @@ let currentPath = "";
 let lastSnapshot = null;
 let expandedCommitOid = null;
 let openFileInEditor = null;
-// True while a network git op (push/pull/fetch) is in flight. Polling
-// refreshPanel calls skip their renderPanel step while this is set so the
-// toolbar DOM — including the Cancel button and the busy-state on the
-// active button — isn't destroyed out from under the user. The final
-// forced refresh at op-end (force=true) is always allowed through.
-let inFlightOp = false;
+let openDiffInTab = null;
+// Snapshot of branches from the last refresh; used by the "Compare…" popup
+// to populate its ref selectors. Updated each time refreshPanel runs.
+let lastBranches = [];
+let lastRemoteBranches = [];
+let lastHeadBranchName = null;
 // Commit OIDs are immutable, so details for a given OID never change.
 // Cache them to avoid a second invoke on every forced re-render — and to
 // render the expanded section fully instead of a loading flicker.
@@ -60,12 +37,31 @@ const STATUS_ICONS = {
 };
 
 // ─── Public API ────────────────────────────────────────────────────────────────
-export function initGitPanel(getPath, openFileCb) {
+export function initGitPanel(getPath, openFileCb, openDiffCb) {
   currentPath = getPath();
   openFileInEditor = openFileCb || null;
+  openDiffInTab = openDiffCb || null;
 
   const toggleBtn = document.getElementById("toggle-git-panel");
   toggleBtn.addEventListener("click", () => togglePanel());
+
+  // One delegated contextmenu handler for the whole panel. Per-row
+  // attachment kept failing silently in WKWebView; delegation survives any
+  // panel re-render and does not depend on listener attachment timing.
+  // Routes:
+  //   - target inside a commit row → showCommitContextMenu
+  //   - anything else → just preventDefault so macOS Services menu never
+  //     pops over our UI
+  const panel = document.getElementById("git-panel");
+  if (panel) {
+    panel.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const commitEl = e.target.closest && e.target.closest(".gp-commit");
+      if (commitEl && commitEl.dataset.oid) {
+        showCommitContextMenu(e, commitEl.dataset.oid);
+      }
+    });
+  }
 
   document.addEventListener("keydown", (e) => {
     if (keyMatches(e, "gitPanel")) {
@@ -145,6 +141,11 @@ export async function refreshPanel(path, force = false, preloadedStatus = null) 
     const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, stashes });
     if (snapshot === lastSnapshot && !force) return;
     lastSnapshot = snapshot;
+
+    // Snapshot for the Compare popup so it doesn't fire its own invokes.
+    lastBranches = branches;
+    lastRemoteBranches = remoteBranches;
+    lastHeadBranchName = branches.find((b) => b.is_current)?.name || null;
 
     renderPanel(status, branches, remoteBranches, commits, remoteUrl, stashes);
   } catch (err) {
@@ -253,6 +254,221 @@ function showConfirmPopup(anchorEl, message, onConfirm) {
   popup.querySelector(".gp-confirm-cancel").addEventListener("click", close);
 
   // Close on outside click
+  setTimeout(() => {
+    outsideClick = (e) => {
+      if (!popup.contains(e.target)) close();
+    };
+    document.addEventListener("mousedown", outsideClick);
+  }, 0);
+}
+
+// Two-select popup for picking a `from` and `to` ref. Anchored under the
+// triggering button. Populated from the most recent refresh's branch list,
+// so it doesn't fire its own invokes.
+function showCompareRefsPopup(anchorEl) {
+  document.querySelector(".gp-compare-popup")?.remove();
+  if (!openDiffInTab) {
+    showGitFeedback("Diff tab not wired", "error");
+    return;
+  }
+
+  const refs = [];
+  for (const b of lastBranches) refs.push({ name: b.name, group: "Local" });
+  for (const b of lastRemoteBranches) refs.push({ name: `origin/${b.name}`, group: "Remote" });
+  if (refs.length === 0) {
+    showGitFeedback("No branches to compare", "error");
+    return;
+  }
+
+  const head = lastHeadBranchName;
+  const optionsHtml = refs
+    .map((r) => `<option value="${escapeHtml(r.name)}" data-group="${r.group}">${escapeHtml(r.name)}</option>`)
+    .join("");
+
+  const popup = document.createElement("div");
+  popup.className = "gp-confirm-popup gp-compare-popup";
+  popup.innerHTML = `
+    <div class="gp-compare-row">
+      <label>From</label>
+      <select class="gp-compare-from">${optionsHtml}</select>
+    </div>
+    <div class="gp-compare-row">
+      <label>To</label>
+      <select class="gp-compare-to">${optionsHtml}</select>
+    </div>
+    <div class="gp-confirm-actions">
+      <button class="gp-confirm-yes">Compare</button>
+      <button class="gp-confirm-cancel">Cancel</button>
+    </div>`;
+
+  const rect = anchorEl.getBoundingClientRect();
+  document.body.appendChild(popup);
+  // Clamp to viewport — the BRANCHES button sits at the right edge of the
+  // git panel, so a naive `rect.left - 120` overflows the screen.
+  const popupRect = popup.getBoundingClientRect();
+  const popupWidth = popupRect.width || 280;
+  const popupHeight = popupRect.height || 160;
+  const left = Math.max(4, Math.min(rect.left - 120, window.innerWidth - popupWidth - 8));
+  // Prefer below the button; flip above if not enough space.
+  const top = rect.bottom + 4 + popupHeight > window.innerHeight
+    ? Math.max(4, rect.top - popupHeight - 4)
+    : rect.bottom + 4;
+  popup.style.position = "fixed";
+  popup.style.top = `${top}px`;
+  popup.style.left = `${left}px`;
+
+  const fromSel = popup.querySelector(".gp-compare-from");
+  const toSel = popup.querySelector(".gp-compare-to");
+  // Sensible default: compare HEAD with the first non-HEAD ref.
+  if (head) {
+    fromSel.value = head;
+    const otherRef = refs.find((r) => r.name !== head);
+    if (otherRef) toSel.value = otherRef.name;
+  }
+
+  let outsideClick = null;
+  const close = () => {
+    popup.remove();
+    if (outsideClick) document.removeEventListener("mousedown", outsideClick);
+  };
+
+  popup.querySelector(".gp-confirm-yes").addEventListener("click", () => {
+    const fromRef = fromSel.value;
+    const toRef = toSel.value;
+    close();
+    if (fromRef === toRef) {
+      showGitFeedback("Pick two different refs", "error");
+      return;
+    }
+    openDiffInTab({ fromRef, toRef });
+  });
+  popup.querySelector(".gp-confirm-cancel").addEventListener("click", close);
+
+  setTimeout(() => {
+    outsideClick = (e) => {
+      if (!popup.contains(e.target)) close();
+    };
+    document.addEventListener("mousedown", outsideClick);
+  }, 0);
+}
+
+// Right-click menu on a commit row. Compare with HEAD, parent, or arbitrary
+// ref; copy the OID.
+function showCommitContextMenu(mouseEvent, oid) {
+  document.querySelector(".gp-commit-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "context-menu gp-commit-menu";
+
+  const items = [
+    {
+      label: "Compare with HEAD",
+      enabled: !!openDiffInTab,
+      onClick: () => openDiffInTab && openDiffInTab({ fromRef: oid, toRef: "HEAD" }),
+    },
+    {
+      label: "Compare with parent",
+      enabled: !!openDiffInTab,
+      onClick: () => openDiffInTab && openDiffInTab({ fromRef: `${oid}^`, toRef: oid }),
+    },
+    {
+      label: "Compare with…",
+      enabled: !!openDiffInTab,
+      onClick: () => promptCompareRef(oid, mouseEvent.clientX, mouseEvent.clientY),
+    },
+    {
+      label: "Copy OID",
+      enabled: true,
+      onClick: () => {
+        navigator.clipboard.writeText(oid).catch(() => {});
+        showGitFeedback("Copied OID", "success");
+      },
+    },
+  ];
+
+  for (const it of items) {
+    const el = document.createElement("div");
+    el.className = "context-menu-item" + (it.enabled ? "" : " context-menu-item-disabled");
+    el.textContent = it.label;
+    if (it.enabled) {
+      el.addEventListener("click", () => {
+        menu.remove();
+        it.onClick();
+      });
+    }
+    menu.appendChild(el);
+  }
+
+  menu.style.left = `${mouseEvent.clientX}px`;
+  menu.style.top = `${mouseEvent.clientY}px`;
+  document.body.appendChild(menu);
+
+  setTimeout(() => {
+    document.addEventListener("click", () => menu.remove(), { once: true });
+  }, 0);
+}
+
+// Inline popup — Tauri WebView swallows window.prompt(), so we render our
+// own. Anchored at the mouse position from the originating context-menu
+// click. Validation is backend-side via is_valid_git_ref / is_valid_git_oid.
+function promptCompareRef(fromOid, anchorX, anchorY) {
+  document.querySelector(".gp-compare-popup")?.remove();
+  if (!openDiffInTab) {
+    showGitFeedback("Diff tab not wired", "error");
+    return;
+  }
+
+  const popup = document.createElement("div");
+  popup.className = "gp-confirm-popup gp-compare-popup";
+  popup.innerHTML = `
+    <div class="gp-compare-row">
+      <label>From</label>
+      <span class="gp-compare-fixed">${escapeHtml(fromOid.slice(0, 12))}</span>
+    </div>
+    <div class="gp-compare-row">
+      <label>To</label>
+      <input class="gp-compare-input" type="text" placeholder="branch / OID / HEAD~1" value="HEAD" autocomplete="off" />
+    </div>
+    <div class="gp-confirm-actions">
+      <button class="gp-confirm-yes">Compare</button>
+      <button class="gp-confirm-cancel">Cancel</button>
+    </div>`;
+
+  document.body.appendChild(popup);
+  const popupRect = popup.getBoundingClientRect();
+  const w = popupRect.width || 280;
+  const h = popupRect.height || 140;
+  const left = Math.max(4, Math.min((anchorX ?? 0) - 60, window.innerWidth - w - 8));
+  const top = (anchorY ?? 0) + h > window.innerHeight
+    ? Math.max(4, (anchorY ?? 0) - h - 4)
+    : (anchorY ?? 0) + 4;
+  popup.style.position = "fixed";
+  popup.style.top = `${top}px`;
+  popup.style.left = `${left}px`;
+
+  const input = popup.querySelector(".gp-compare-input");
+  input.focus();
+  input.select();
+
+  let outsideClick = null;
+  const close = () => {
+    popup.remove();
+    if (outsideClick) document.removeEventListener("mousedown", outsideClick);
+  };
+
+  const submit = () => {
+    const target = input.value.trim();
+    close();
+    if (!target) return;
+    openDiffInTab({ fromRef: fromOid, toRef: target });
+  };
+
+  popup.querySelector(".gp-confirm-yes").addEventListener("click", submit);
+  popup.querySelector(".gp-confirm-cancel").addEventListener("click", close);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submit();
+    if (e.key === "Escape") close();
+  });
+
   setTimeout(() => {
     outsideClick = (e) => {
       if (!popup.contains(e.target)) close();
@@ -509,7 +725,10 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
     <div class="gp-section">
       <div class="gp-section-title">
         BRANCHES
-        <button class="gp-action-btn" id="new-branch-btn" title="New branch">+</button>
+        <span class="gp-section-actions">
+          <button class="gp-action-btn" id="compare-refs-btn" title="Compare two refs">↔</button>
+          <button class="gp-action-btn" id="new-branch-btn" title="New branch">+</button>
+        </span>
       </div>
       <div class="gp-branch-sub-title">LOCAL</div>
       <div class="gp-branch-list" id="local-branch-list">`;
@@ -860,18 +1079,18 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
         // side. Set inFlightOp while the invoke is pending so the 3s
         // polling refresh doesn't re-render the panel mid-merge and
         // destroy the confirmation / feedback state.
-        inFlightOp = true;
+        setInFlightOp(true);
         try {
           await invokeWithTimeout("git_merge_branch", { path: currentPath, branchName });
-          inFlightOp = false;
+          setInFlightOp(false);
           showGitFeedback(`Merged ${branchName}`, "success");
           await refreshPanel(null, true);
           refreshFileBrowser();
         } catch (err) {
-          inFlightOp = false;
+          setInFlightOp(false);
           showGitFeedback(`Merge failed: ${err}`, "error");
         } finally {
-          inFlightOp = false;
+          setInFlightOp(false);
         }
       });
     });
@@ -902,6 +1121,17 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       showCreateBranchDialog();
     });
   }
+
+  // Compare refs button
+  const compareBtn = document.getElementById("compare-refs-btn");
+  if (compareBtn) {
+    compareBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showCompareRefsPopup(compareBtn);
+    });
+  }
+
+  // (Commit-row contextmenu handled via delegation in initGitPanel.)
 
   // Commit row expand/collapse
   panel.querySelectorAll(".gp-commit").forEach((el) => {
@@ -977,7 +1207,7 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
     let cancelled = false;
     const isNetworkOp = ["git_fetch", "git_pull", "git_push"].includes(command);
     if (isNetworkOp) {
-      inFlightOp = true;
+      setInFlightOp(true);
       cancelBtn = document.createElement("button");
       cancelBtn.className = "gp-cancel-btn";
       cancelBtn.textContent = "Cancel";
@@ -998,19 +1228,19 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
       await invokeWithTimeout(command, { path: currentPath });
       // Clear the in-flight flag BEFORE the forced refresh so renderPanel
       // is allowed through and the toolbar returns to its fresh state.
-      if (isNetworkOp) inFlightOp = false;
+      if (isNetworkOp) setInFlightOp(false);
       showGitFeedback(msgSuccess, "success");
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
-      if (isNetworkOp) inFlightOp = false;
+      if (isNetworkOp) setInFlightOp(false);
       if (cancelled) {
         showGitFeedback("Operation cancelled", "error");
       } else {
         showGitFeedback(`${msgError}: ${err}`, "error");
       }
     } finally {
-      if (isNetworkOp) inFlightOp = false;
+      if (isNetworkOp) setInFlightOp(false);
       btn.disabled = false;
       btn.textContent = labelDefault;
       if (cancelBtn) cancelBtn.remove();
@@ -1022,22 +1252,7 @@ function wireToolbarBtn(id, command, labelDefault, labelBusy, msgSuccess, msgErr
 async function showDiff(filePath, staged = false) {
   try {
     const diff = await invoke("get_file_diff", { path: currentPath, filePath, staged });
-    let html = "";
-    for (const hunk of diff.hunks) {
-      html += `<div class="diff-hunk-header">@@ -${hunk.old_start},${hunk.old_lines} +${hunk.new_start},${hunk.new_lines} @@</div>`;
-      for (const line of hunk.lines) {
-        const cls = line.origin === "add" ? "diff-add" : line.origin === "remove" ? "diff-del" : "";
-        const oldNo = line.old_line_no >= 0 ? line.old_line_no : "";
-        const newNo = line.new_line_no >= 0 ? line.new_line_no : "";
-        const escaped = line.content
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/\n$/, "");
-        html += `<div class="diff-line ${cls}"><span class="diff-gutter">${oldNo}</span><span class="diff-gutter">${newNo}</span><span class="diff-content">${escaped}</span></div>`;
-      }
-    }
-    showDiffPreview(filePath, html);
+    showDiffPreview(filePath, buildDiffHtml(diff.hunks));
   } catch (err) {
     console.error("Diff error:", err);
     showGitFeedback(`Could not open diff: ${err}`, "error");

@@ -1449,6 +1449,147 @@ fn collect_structured_diff(diff: &git2::Diff) -> Result<FileDiff, String> {
     Ok(FileDiff { old_path, new_path, hunks: hunks.into_inner() })
 }
 
+// Walks a libgit2 Diff that may span multiple files (e.g. tree-to-tree
+// between two refs) and returns one FileDiff per delta. Same line/hunk
+// shape as collect_structured_diff so the frontend renderer is unchanged.
+fn collect_structured_files_diff(diff: &git2::Diff) -> Result<Vec<FileDiff>, String> {
+    use std::cell::RefCell;
+
+    let files: RefCell<Vec<FileDiff>> = RefCell::new(Vec::new());
+    let current_file: RefCell<Option<FileDiff>> = RefCell::new(None);
+    let current_hunk: RefCell<Option<(u32, u32, u32, u32)>> = RefCell::new(None);
+    let current_lines: RefCell<Vec<DiffLine>> = RefCell::new(Vec::new());
+
+    diff.foreach(
+        &mut |delta, _progress| {
+            // file_cb fires once per file, before any hunk_cb for that file.
+            // Flush any pending hunk into the previous file, push it, then
+            // open a new accumulator for this delta.
+            let mut cur = current_file.borrow_mut();
+            if let Some(mut prev) = cur.take() {
+                if let Some((os, ns, ol, nl)) = current_hunk.borrow_mut().take() {
+                    prev.hunks.push(HunkDiff {
+                        old_start: os, new_start: ns, old_lines: ol, new_lines: nl,
+                        lines: current_lines.borrow_mut().drain(..).collect(),
+                    });
+                }
+                files.borrow_mut().push(prev);
+            }
+            *cur = Some(FileDiff {
+                old_path: delta.old_file().path().map(|p| p.to_string_lossy().to_string()),
+                new_path: delta.new_file().path().map(|p| p.to_string_lossy().to_string()),
+                hunks: Vec::new(),
+            });
+            true
+        },
+        None,
+        Some(&mut |_delta, hunk| {
+            // Flush previous hunk into the current file, then open new one.
+            if let Some(file) = current_file.borrow_mut().as_mut() {
+                if let Some((os, ns, ol, nl)) = current_hunk.borrow_mut().take() {
+                    file.hunks.push(HunkDiff {
+                        old_start: os, new_start: ns, old_lines: ol, new_lines: nl,
+                        lines: current_lines.borrow_mut().drain(..).collect(),
+                    });
+                }
+            }
+            *current_hunk.borrow_mut() = Some((
+                hunk.old_start(), hunk.new_start(), hunk.old_lines(), hunk.new_lines(),
+            ));
+            true
+        }),
+        Some(&mut |_delta, _hunk, line| {
+            let origin = match line.origin() {
+                '+' => "add",
+                '-' => "remove",
+                _ => "context",
+            }.to_string();
+            current_lines.borrow_mut().push(DiffLine {
+                old_line_no: line.old_lineno().map(|n| n as i32).unwrap_or(-1),
+                new_line_no: line.new_lineno().map(|n| n as i32).unwrap_or(-1),
+                content: String::from_utf8_lossy(line.content()).to_string(),
+                origin,
+            });
+            true
+        }),
+    ).map_err(|e| e.to_string())?;
+
+    // Flush trailing hunk + file
+    if let Some(mut last) = current_file.borrow_mut().take() {
+        if let Some((os, ns, ol, nl)) = current_hunk.borrow_mut().take() {
+            last.hunks.push(HunkDiff {
+                old_start: os, new_start: ns, old_lines: ol, new_lines: nl,
+                lines: current_lines.borrow_mut().drain(..).collect(),
+            });
+        }
+        files.borrow_mut().push(last);
+    }
+
+    Ok(files.into_inner())
+}
+
+#[derive(Clone, Serialize)]
+struct RefDiffStats {
+    files_changed: usize,
+    additions: usize,
+    deletions: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct RefDiff {
+    from_ref: String,
+    to_ref: String,
+    files: Vec<FileDiff>,
+    stats: RefDiffStats,
+}
+
+#[tauri::command]
+fn get_diff_between_refs(
+    path: String,
+    from_ref: String,
+    to_ref: String,
+) -> Result<RefDiff, String> {
+    if !(is_valid_git_ref(&from_ref) || is_valid_git_oid(&from_ref)) {
+        return Err("Invalid `from` ref".into());
+    }
+    if !(is_valid_git_ref(&to_ref) || is_valid_git_oid(&to_ref)) {
+        return Err("Invalid `to` ref".into());
+    }
+
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let from_obj = repo.revparse_single(&from_ref).map_err(|e| format!("from `{}`: {}", from_ref, e))?;
+    let to_obj = repo.revparse_single(&to_ref).map_err(|e| format!("to `{}`: {}", to_ref, e))?;
+    let from_tree = from_obj.peel_to_tree().map_err(|e| format!("from `{}` peel: {}", from_ref, e))?;
+    let to_tree = to_obj.peel_to_tree().map_err(|e| format!("to `{}` peel: {}", to_ref, e))?;
+
+    let mut diff_opts = git2::DiffOptions::new();
+    let diff = repo
+        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut diff_opts))
+        .map_err(|e| e.to_string())?;
+
+    let files = collect_structured_files_diff(&diff)?;
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for f in &files {
+        for h in &f.hunks {
+            for l in &h.lines {
+                match l.origin.as_str() {
+                    "add" => additions += 1,
+                    "remove" => deletions += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let files_changed = files.len();
+    Ok(RefDiff {
+        from_ref,
+        to_ref,
+        files,
+        stats: RefDiffStats { files_changed, additions, deletions },
+    })
+}
+
 #[tauri::command]
 fn get_file_diff(path: String, file_path: String, staged: Option<bool>) -> Result<FileDiff, String> {
     let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
@@ -1809,15 +1950,29 @@ fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_merge_branch_name(branch_name: &str) -> bool {
+fn is_valid_git_ref(name: &str) -> bool {
     // Reject empties and leading `-` (option injection: `--no-verify`).
-    // Allow only [A-Za-z0-9._/-] so spaces, backticks, semicolons, etc. can't reach git argv.
-    if branch_name.is_empty() || branch_name.starts_with('-') {
+    // Reject `..` (git ref-format forbids it; also blocks range syntax sneaking through).
+    // Allow [A-Za-z0-9._/-] plus `^` and `~` for parent/ancestor rev syntax
+    // (HEAD^, abc1234~3). These are not shell-special at argv level — we
+    // pass refs as discrete Command::arg arguments, never through `sh -c`.
+    if name.is_empty() || name.starts_with('-') {
         return false;
     }
-    branch_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || "._/-".contains(c))
+    if name.contains("..") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || "._/-^~".contains(c))
+}
+
+fn is_valid_git_oid(s: &str) -> bool {
+    // Accepts 4–40 hex chars (matches `git`'s short-OID accept range; SHA-1 is 40).
+    let len = s.len();
+    if !(4..=40).contains(&len) {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[tauri::command]
@@ -1826,7 +1981,7 @@ fn git_merge_branch(
     branch_name: String,
     state: State<AppState>,
 ) -> Result<String, String> {
-    if !is_valid_merge_branch_name(&branch_name) {
+    if !is_valid_git_ref(&branch_name) {
         return Err("Invalid branch name".into());
     }
     // Merge can block on network I/O if the user's git config pulls on merge
@@ -2400,6 +2555,7 @@ pub fn run() {
             get_file_inode,
             find_path_by_inode,
             get_file_diff,
+            get_diff_between_refs,
             git_stage_all,
             git_stage_file,
             git_commit,
@@ -2570,36 +2726,174 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // git_merge_branch validation tests
+    // is_valid_git_ref / is_valid_git_oid validation tests
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_merge_branch_rejects_invalid_names() {
-        // Names with spaces
-        assert!(!is_valid_merge_branch_name("branch name"));
-        // Names with shell-special chars
-        assert!(!is_valid_merge_branch_name("branch;rm -rf"));
-        // Names starting with -- (option injection)
-        assert!(!is_valid_merge_branch_name("--no-verify"));
-        // Single leading dash
-        assert!(!is_valid_merge_branch_name("-x"));
-        // Backtick injection
-        assert!(!is_valid_merge_branch_name("`whoami`"));
-        // Empty
-        assert!(!is_valid_merge_branch_name(""));
+    fn test_git_ref_rejects_invalid_names() {
+        assert!(!is_valid_git_ref("branch name"));
+        assert!(!is_valid_git_ref("branch;rm -rf"));
+        assert!(!is_valid_git_ref("--no-verify"));
+        assert!(!is_valid_git_ref("-x"));
+        assert!(!is_valid_git_ref("`whoami`"));
+        assert!(!is_valid_git_ref(""));
+        // `..` is forbidden by git ref-format and also blocks range-syntax injection
+        assert!(!is_valid_git_ref("foo..bar"));
+        assert!(!is_valid_git_ref(".."));
     }
 
     #[test]
-    fn test_merge_branch_accepts_valid_names() {
+    fn test_git_ref_accepts_valid_names() {
         for name in [
             "main",
             "feature/test-branch",
             "release-1.2.3",
             "v0.1.4",
             "user/foo_bar",
+            // Rev syntax (parent / ancestor)
+            "HEAD^",
+            "HEAD~3",
+            "abc1234^",
+            "main~2",
         ] {
-            assert!(is_valid_merge_branch_name(name), "{:?} should be valid", name);
+            assert!(is_valid_git_ref(name), "{:?} should be valid", name);
         }
+    }
+
+    #[test]
+    fn test_git_oid_accepts_short_and_full() {
+        // 4 hex (minimum)
+        assert!(is_valid_git_oid("abcd"));
+        // 7 hex (typical short)
+        assert!(is_valid_git_oid("abc1234"));
+        // 40 hex (full SHA-1)
+        assert!(is_valid_git_oid("0123456789abcdef0123456789abcdef01234567"));
+        // Mixed case
+        assert!(is_valid_git_oid("ABcd1234"));
+    }
+
+    #[test]
+    fn test_git_oid_rejects_invalid() {
+        // Too short
+        assert!(!is_valid_git_oid("abc"));
+        // Too long (41)
+        assert!(!is_valid_git_oid("0123456789abcdef0123456789abcdef012345678"));
+        // Empty
+        assert!(!is_valid_git_oid(""));
+        // Non-hex
+        assert!(!is_valid_git_oid("ghij"));
+        // Contains shell metachar
+        assert!(!is_valid_git_oid("abcd; rm"));
+        // Contains slash (range-ish)
+        assert!(!is_valid_git_oid("abcd..efgh"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // get_diff_between_refs tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Helper: create a repo with two commits — c1 has hello.txt; c2 modifies
+    // hello.txt and adds foo.txt. Returns (TempDir, c1_oid, c2_oid).
+    fn setup_two_commit_repo() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+        let sig = repo.signature().unwrap();
+
+        // Commit 1: hello.txt = "one\ntwo\nthree\n"
+        fs::write(dir.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("hello.txt")).unwrap();
+        index.write().unwrap();
+        let tree1 = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let c1 = repo.commit(Some("HEAD"), &sig, &sig, "c1", &tree1, &[]).unwrap();
+
+        // Commit 2: hello.txt becomes "one\nTWO\nthree\nfour\n"; new foo.txt = "alpha\n"
+        fs::write(dir.path().join("hello.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        fs::write(dir.path().join("foo.txt"), "alpha\n").unwrap();
+        index.add_path(std::path::Path::new("hello.txt")).unwrap();
+        index.add_path(std::path::Path::new("foo.txt")).unwrap();
+        index.write().unwrap();
+        let tree2 = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.find_commit(c1).unwrap();
+        let c2 = repo.commit(Some("HEAD"), &sig, &sig, "c2", &tree2, &[&parent]).unwrap();
+
+        (dir, c1.to_string(), c2.to_string())
+    }
+
+    #[test]
+    fn test_diff_between_refs_multi_file() {
+        let (dir, c1, c2) = setup_two_commit_repo();
+        let result = get_diff_between_refs(
+            dir.path().to_string_lossy().to_string(),
+            c1,
+            c2,
+        ).unwrap();
+
+        assert_eq!(result.stats.files_changed, 2, "should detect 2 changed files");
+        // foo.txt: 1 added line; hello.txt: 1 added (TWO), 1 removed (two), 1 added (four)
+        // Total: 3 additions, 1 deletion
+        assert_eq!(result.stats.additions, 3);
+        assert_eq!(result.stats.deletions, 1);
+
+        // Each file should have at least one hunk
+        for f in &result.files {
+            assert!(!f.hunks.is_empty(), "file {:?} should have hunks", f.new_path);
+        }
+
+        // Files are walked in libgit2's order (typically alphabetical):
+        // foo.txt (new file) and hello.txt (modified)
+        let paths: Vec<&str> = result.files.iter()
+            .filter_map(|f| f.new_path.as_deref())
+            .collect();
+        assert!(paths.contains(&"foo.txt"));
+        assert!(paths.contains(&"hello.txt"));
+    }
+
+    #[test]
+    fn test_diff_between_refs_short_oid() {
+        // Short OIDs (7 chars) should resolve via revparse_single
+        let (dir, c1, c2) = setup_two_commit_repo();
+        let result = get_diff_between_refs(
+            dir.path().to_string_lossy().to_string(),
+            c1[..7].to_string(),
+            c2[..7].to_string(),
+        ).unwrap();
+        assert_eq!(result.stats.files_changed, 2);
+    }
+
+    #[test]
+    fn test_diff_between_refs_rejects_bad_input() {
+        let (dir, _c1, c2) = setup_two_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Shell-injection attempt
+        let err = get_diff_between_refs(path.clone(), "HEAD; rm -rf /".into(), c2.clone()).err().unwrap();
+        assert!(err.contains("Invalid"), "expected validation error, got: {}", err);
+
+        // Leading dash (option injection)
+        let err = get_diff_between_refs(path.clone(), "--upload-pack=evil".into(), c2.clone()).err().unwrap();
+        assert!(err.contains("Invalid"), "expected validation error, got: {}", err);
+
+        // Non-existent ref (passes validation, fails revparse)
+        assert!(get_diff_between_refs(path.clone(), "nonexistent-ref".into(), c2).is_err());
+    }
+
+    #[test]
+    fn test_diff_between_refs_same_ref_is_empty() {
+        // Diff of a ref with itself should produce no files / no changes.
+        let (dir, _c1, c2) = setup_two_commit_repo();
+        let result = get_diff_between_refs(
+            dir.path().to_string_lossy().to_string(),
+            c2.clone(),
+            c2,
+        ).unwrap();
+        assert_eq!(result.stats.files_changed, 0);
+        assert_eq!(result.stats.additions, 0);
+        assert_eq!(result.stats.deletions, 0);
+        assert!(result.files.is_empty());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
