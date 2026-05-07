@@ -15,6 +15,10 @@ User-confirmed scope:
 
 The existing infrastructure can absorb most of this without architectural change. The cancellable shellout pattern (`GitOpSlot` / `run_git_cancellable` / `apply_git_env` in `src-tauri/src/lib.rs:1530-1700`) handles every long-running git child uniformly. The unified tab system in `src/main.js` already supports new tab types via the `type` field. The structured diff types (`FileDiff` / `HunkDiff` / `DiffLine` at `lib.rs:1377-1398`) and `collect_structured_diff` (`lib.rs:1400-1450`) are exactly what arbitrary-ref diffing needs.
 
+> **Note on line numbers.** The line refs throughout this document are indicative — accurate at the time of writing but expected to drift. Use them as starting points; treat the symbol names (`run_git_cancellable`, `collect_structured_diff`, `showConfirmPopup`) as the durable anchors.
+
+> **Platform.** Launchpad is macOS-only (per `CLAUDE.md`). Anywhere this plan calls for `0o700` temp scripts, POSIX shebangs, or `kill -9`, that assumption is load-bearing. A future Windows port would need a separate driver design for Phase 5.
+
 ---
 
 ## Phasing
@@ -51,7 +55,7 @@ Smallest of the three features and the one that touches the least delicate code.
 
 #### Frontend
 
-1. **New tab type `"diff"`** in `main.js`. Tab shape: `{ type: "diff", containerEl, fromRef, toRef, refDiff, selectedFileIndex }`. Dedupe key: `diff::${fromRef}..${toRef}`.
+1. **New tab type `"diff"`** in `main.js`. Tab shape: `{ type: "diff", containerEl, fromRef, toRef, refDiff, selectedFileIndex }`. Dedupe key: `diff::${fromRef}..${toRef}` — used only as a JS Map key, never as a DOM id. Any DOM ids derived from refs go through a sanitizer (`encodeURIComponent` or a short hash) so refs like `feature/foo` or `release-1.0` don't break selectors.
 2. **Layout** (built directly, not via CodeMirror): two-column flex inside `tab.containerEl`. Left = sticky file list with per-file `+N -N` stats; right = scrollable diff produced by `buildFileDiffSection(file)` from Phase 1. Clicking a file scrolls the right pane to that file's anchor.
 3. **Entry points**:
    - **Commit context menu** (new `gitpanel.js` handler on `.gp-commit` right-click): "Compare with HEAD", "Compare with parent" (resolves to `oid^`), "Copy OID", "Compare with…" (prompts for ref).
@@ -86,6 +90,7 @@ Smallest of the three features and the one that touches the least delicate code.
 1. **Amend** button in commit form (`gitpanel.js:444-470`):
    - Visible only when HEAD is not unborn AND we're not mid-merge/rebase/cherry-pick.
    - Two modes: "Amend message" (when no staged changes; opens a textbox prefilled with the last commit's message) and "Amend with staged" (when staged > 0; uses the new message if typed, else keeps the old).
+   - **Published-commit guard**: before amending, check via libgit2 whether HEAD is reachable from any remote-tracking ref (`refs/remotes/*`). If yes, route through `showConfirmPopup` with copy: "This commit is already on the remote. Amending will require a force-push to share it. Continue?" Skip the prompt when HEAD is purely local. (No new command needed — the check is cheap and lives in `git_amend_commit` returning a structured `{ requires_force_push: bool }` alongside the new OID, so the toast can include "You'll need to force-push.")
    - Calls `git_amend_commit`. Refresh + toast on success.
 
 2. **Cherry-pick** entry in commit-row context menu (Phase 2's new menu).
@@ -103,6 +108,7 @@ This unblocks Phase 5: rebase and cherry-pick conflicts route through the same U
 
 1. **New module `src/conflictmarkers.js`**:
    - `parseConflictBlocks(text) -> Block[]` returning `{ start, oursEnd, baseStart?, baseEnd?, theirsStart, end, oursText, baseText?, theirsText }`. Handles both 2-way (`<<<<<<<` / `=======` / `>>>>>>>`) and diff3 (`|||||||` base section).
+   - **Strict block matching to avoid source-code false positives.** A line is treated as a marker only when it (a) starts at column 0, (b) consists of exactly seven `<`/`=`/`>`/`|` followed by either end-of-line or a single space + label (e.g. `<<<<<<< HEAD`), and (c) participates in a complete `<<<` → (`|||`)? → `===` → `>>>` sequence in the right order. An unmatched `<<<<<<<` (e.g. inside a string literal in source) is silently ignored — only fully-formed blocks are returned. This is also the correctness gate for the auto-stage-on-save flow below: "no markers remain" means "`parseConflictBlocks` returns `[]`", not "no line starts with `<<<`".
    - `replaceBlock(doc, block, choice: "ours"|"theirs"|"both"|string)` returning a CodeMirror change spec.
 
 2. **CodeMirror extension** in same module:
@@ -129,17 +135,28 @@ Largest feature. Builds on Phase 1 (validation), Phase 3 (`get_pending_op_state`
 #### Backend
 
 1. **`get_rebase_candidate_commits(path, count) -> Vec<CommitInfo>`** — convenience wrapper around `get_commits` that excludes merge commits and stops at the first commit shared with the upstream (so users don't accidentally rewrite published history). Returns the editable subset.
+   - **No upstream**: when the current branch has no upstream configured, the "shared-with-upstream" cutoff is undefined. In that case, fall back to capping at `count` commits and surface a `{ commits, upstream_known: false }` shape so the frontend can render an info banner ("No upstream branch — showing the last N commits. All are safe to rewrite.").
+   - **Detached HEAD**: refuse with a typed error (`"detached_head"`); the rebase tab won't open.
 
 2. **`git_rebase_interactive_apply(path, base_oid: String, todo: Vec<RebaseTodoEntry>, state) -> Result<RebaseResult, String>`** — the core of the feature:
    - `RebaseTodoEntry { action: "pick"|"reword"|"squash"|"fixup"|"drop"|"edit", oid: String, new_message: Option<String> }`.
    - Validate every oid + the base.
-   - **Driver pattern**: write JSON of `todo` to a temp file. Generate two helper shell scripts:
-     - `seq_editor.sh` — reads `$1` (rebase-todo path provided by git), the JSON temp file, and rewrites the todo file accordingly. Lines for `drop` are deleted; `reword`/`squash` keep their action keywords.
-     - `commit_editor.sh` — for each `reword`/`squash`, reads the next entry's `new_message` from the JSON and writes it to `$1` (the commit message file).
-   - Spawn `git rebase -i <base>` under `run_git_cancellable` with `GIT_SEQUENCE_EDITOR=<seq_editor.sh>` and `GIT_EDITOR=<commit_editor.sh>` plus `apply_git_env`.
-   - Return `RebaseResult { ok: bool, stopped_at: Option<String>, conflicted_files: Vec<String>, completed: bool }`.
+   - **Pre-rebase safety tag**: before spawning, create a lightweight tag `refs/tags/launchpad/pre-rebase/<timestamp>` pointing at the current HEAD. The frontend toast on success includes "Backup tag: `<name>` (delete with `git tag -d <name>`)"; on abort the cleanup also deletes the tag. This is cheaper than a reflog hint and discoverable for users who don't know reflog exists.
+   - **Driver pattern**: write a single JSON state file to a per-run temp dir (`mktemp -d`-style). Layout:
+     ```
+     /tmp/launchpad-rebase-<pid>-<rand>/
+       state.json        # { todo: [...], reword_index: 0, version: 1 }
+       seq_editor.sh     # 0o700
+       commit_editor.sh  # 0o700
+     ```
+   - Both scripts receive the state-dir path via a single env var `LAUNCHPAD_REBASE_STATE_DIR` (set by the Rust spawner alongside `GIT_SEQUENCE_EDITOR` / `GIT_EDITOR`). They `cd $LAUNCHPAD_REBASE_STATE_DIR` and read `state.json` from a known relative path — no argument plumbing through git.
+   - `seq_editor.sh` — invoked once with `$1` = git's rebase-todo path. Reads `state.json.todo`, rewrites `$1`: drops `drop` entries, keeps action keywords for `reword`/`squash`/`fixup`/`edit`, preserves order from the JSON (which is the user's drag-reordered list).
+   - `commit_editor.sh` — invoked once per `reword`/`squash`/`edit` step. Maintains a counter file `commit_editor.counter` in the state dir (created on first call, incremented atomically via `mv`-rename trick or `flock`). On invocation N, it walks `state.json.todo` to find the Nth entry whose action requires a message edit, writes that entry's `new_message` to `$1`, increments the counter. If `new_message` is null/missing for `reword`, it leaves `$1` untouched (preserves existing message).
+   - **Exotic `core.editor` wrappers**: `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` env vars take precedence over `core.editor` in git's resolution order, so user wrappers are bypassed. The spawn explicitly clears `EDITOR` and `VISUAL` too, so a malformed user `EDITOR=...` can't override our scripts. Documented as a known compatibility gotcha for users with `core.editor = some-wrapper.sh`.
+   - Spawn `git rebase -i <base>` under `run_git_cancellable` with `GIT_SEQUENCE_EDITOR=<state_dir>/seq_editor.sh`, `GIT_EDITOR=<state_dir>/commit_editor.sh`, `LAUNCHPAD_REBASE_STATE_DIR=<state_dir>`, plus `apply_git_env`.
+   - Return `RebaseResult { ok: bool, stopped_at: Option<String>, conflicted_files: Vec<String>, completed: bool, backup_tag: String }`.
    - On conflict: leave rebase state, return `ok: false` with conflict info; frontend routes to the inline conflict UI from Phase 4 + the Pending Operation banner.
-   - Helper scripts are written next to the JSON temp file in the OS temp dir, marked `0o700`, and cleaned up in a `defer`-style guard regardless of success/failure.
+   - **Cleanup**: state dir is removed in a `Drop`-style guard regardless of success/failure/cancel. Backup tag is kept on success (user-visible safety net) and deleted on abort.
 
 3. **`git_rebase_abort(path)`** / **`git_rebase_continue(path)`** / **`git_rebase_skip(path)`** — shellouts via `run_git_cancellable`.
 
@@ -159,8 +176,9 @@ Largest feature. Builds on Phase 1 (validation), Phase 3 (`get_pending_op_state`
    - "Rebase onto upstream…" button in branches section, when `behind > 0`.
 
 4. **Apply flow**:
+   - **Confirm prompt** before spawning when any candidate commit is reachable from a remote-tracking ref (same check as Phase 3's amend guard, applied per commit). Copy: "N of these commits are already on the remote. Rewriting them will require a force-push. Continue?" Skip the prompt entirely when the rebase is fully local. The check runs in the frontend off the `upstream_known` flag from `get_rebase_candidate_commits` plus a per-row `on_remote: bool` field added to that response.
    - Disables Apply, sets `inFlightOp`, calls `git_rebase_interactive_apply`.
-   - On `ok: true` + `completed: true`: closes the rebase tab, refreshes git panel, toast "Rebase complete".
+   - On `ok: true` + `completed: true`: closes the rebase tab, refreshes git panel, toast "Rebase complete. Backup: `<backup_tag>`".
    - On `ok: false` (conflicts): closes the rebase tab, switches focus to the conflicted file (opens it via Phase 4 conflict editor), shows the Pending Operation banner with Abort/Continue/Skip.
 
 5. **Mid-rebase polling**: the Pending Operation banner from Phase 3 already covers rebase. After conflicts are resolved (file saved + auto-staged via Phase 4), Continue runs `git_rebase_continue`. Progress text comes from `get_pending_op_state`'s `current_step / total_steps`.
@@ -237,6 +255,8 @@ Each phase ships with manual + Rust-test coverage. UI work is verified live in `
 
 **Phase 3**
 - Stage a file, edit message, click Amend → HEAD message + tree updated; `git log -1` confirms.
+- Amend a commit that's already on `origin/<branch>` → confirm prompt fires; on accept the result toast mentions force-push.
+- Amend a purely-local commit → no confirm prompt.
 - Cherry-pick a clean commit → success toast; `git log` shows it.
 - Cherry-pick a conflicting commit → conflicts banner + Pending Operation banner appears; "Abort" returns to clean state.
 
@@ -244,13 +264,20 @@ Each phase ships with manual + Rust-test coverage. UI work is verified live in `
 - Trigger a conflict via merge of a divergent branch; open conflicted file → `<<<<<<<`/`=======`/`>>>>>>>` lines replaced by the action bar; backgrounds tinted.
 - Click "Accept Ours" → block collapses to ours text; Cmd+S → file written + auto-staged; conflicts section clears for that file.
 - Open a clean file (no markers) → no decorations, no perf hit.
+- **False-positive guard**: open a source file containing the literal string `"<<<<<<< HEAD"` inside a quoted string or comment (no matching `=======` / `>>>>>>>`) → no decorations, no auto-stage interference.
+- Save a file where one of three conflict blocks is still unresolved → file written but NOT auto-staged; conflicts section still lists the file.
 
 **Phase 5**
 - Right-click a commit 4 back from HEAD → "Rebase from here…" → rebase tab opens with 3 candidate commits.
 - Drag the middle row to the top, set bottom to `squash` with a new message, top to `drop`, apply.
 - `git log` verifies new order, new squash message, dropped commit gone.
-- Trigger a rebase conflict → flow lands in Phase 4 conflict editor → save + Continue completes.
-- Cancel mid-rebase → Pending Operation banner's Abort returns the branch to its pre-rebase state.
+- Backup tag exists at the pre-rebase HEAD (`git tag -l 'launchpad/pre-rebase/*'`); `git reset --hard <tag>` recovers the branch.
+- Apply a rebase that touches a published commit → confirm prompt fires; on cancel, no state-dir is left behind in `/tmp` and no backup tag is created.
+- On a branch with no upstream → rebase tab opens with the info banner; apply succeeds without a confirm prompt.
+- Detached HEAD → "Rebase from here…" surfaces an error toast and does not open the tab.
+- Trigger a rebase conflict → flow lands in Phase 4 conflict editor → save + Continue completes; state dir is cleaned up at the end.
+- Cancel mid-rebase → Pending Operation banner's Abort returns the branch to its pre-rebase state; backup tag is deleted.
+- With `core.editor` set to a wrapper script that exits 1 → rebase still completes (env-var override path is exercised).
 
 **Phase 6**
 - Open 3-pane merge tab from a conflict → all three panes load, ours/theirs read-only, merged editable.
