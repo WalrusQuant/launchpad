@@ -6,6 +6,15 @@ let currentGitInfo = null;
 let currentGitRoot = null;
 let gitPollInterval = null;
 
+// Snapshot of `get_pending_op_state` from the most recent poll. Exposed via
+// getter so the panel can render the Pending Operation banner without a
+// second invoke per cycle. Shape: { kind, current_step?, total_steps?, head_message? }.
+let currentPendingOp = { kind: "none" };
+
+export function getPendingOp() {
+  return currentPendingOp;
+}
+
 // True while a network git op (push/pull/fetch/merge) is in flight. Polling
 // refreshPanel calls skip their renderPanel step while this is set so the
 // toolbar DOM — including the Cancel button and the busy-state on the
@@ -108,9 +117,14 @@ export function startGitPolling(getPath, intervalSeconds) {
     const path = getPath();
     if (!path) return;
     // Fetch once per tick and hand the result to refreshPanel so the panel
-    // doesn't invoke get_git_status a second time.
-    const status = await fetchGitStatus(path);
-    refreshPanel(path, false, status);
+    // doesn't invoke get_git_status a second time. Same trick for the
+    // pending-op state — one poll per cycle, panel reads from getPendingOp().
+    const [status, pending] = await Promise.all([
+      fetchGitStatus(path),
+      invoke("get_pending_op_state", { path }).catch(() => ({ kind: "none" })),
+    ]);
+    currentPendingOp = pending || { kind: "none" };
+    refreshPanel(path, false, status, currentPendingOp);
   }, ms);
 }
 

@@ -2,7 +2,7 @@ import { showDiffPreview, refreshFileBrowser } from "./filebrowser.js";
 import { setPanelTransitioning } from "./main.js";
 import { matches as keyMatches } from "./keymap.js";
 import { buildDiffHtml } from "./diffrender.js";
-import { inFlightOp, setInFlightOp, invokeWithTimeout } from "./git.js";
+import { inFlightOp, setInFlightOp, invokeWithTimeout, getPendingOp } from "./git.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -18,6 +18,9 @@ let openDiffInTab = null;
 let lastBranches = [];
 let lastRemoteBranches = [];
 let lastHeadBranchName = null;
+// Most recent pending-op snapshot — kept locally in addition to git.js's
+// copy so renderPanel can read synchronously without crossing modules.
+let currentPendingOp = { kind: "none" };
 // Commit OIDs are immutable, so details for a given OID never change.
 // Cache them to avoid a second invoke on every forced re-render — and to
 // render the expanded section fully instead of a loading flicker.
@@ -92,7 +95,7 @@ export function togglePanel() {
   }
 }
 
-export async function refreshPanel(path, force = false, preloadedStatus = null) {
+export async function refreshPanel(path, force = false, preloadedStatus = null, preloadedPendingOp = null) {
   // Project switch: wipe commit-detail cache and collapse any expanded
   // commit so stale entries from the previous repo don't bleed across.
   // (OID collisions between projects are vanishingly unlikely but possible
@@ -130,15 +133,19 @@ export async function refreshPanel(path, force = false, preloadedStatus = null) 
       return;
     }
 
-    const [branches, remoteBranches, commits, remoteUrl, stashes] = await Promise.all([
+    const [branches, remoteBranches, commits, remoteUrl, stashes, pendingOp] = await Promise.all([
       invoke("list_branches", { path: currentPath }),
       invoke("list_remote_branches", { path: currentPath }).catch(() => []),
       invoke("get_commits", { path: currentPath, count: 30 }).catch(() => []),
       invoke("get_remote_url", { path: currentPath }).catch(() => null),
       invoke("git_stash_list", { path: currentPath }).catch(() => []),
+      preloadedPendingOp
+        ? Promise.resolve(preloadedPendingOp)
+        : invoke("get_pending_op_state", { path: currentPath }).catch(() => ({ kind: "none" })),
     ]);
+    currentPendingOp = pendingOp || { kind: "none" };
 
-    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, stashes });
+    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, stashes, pendingOp });
     if (snapshot === lastSnapshot && !force) return;
     lastSnapshot = snapshot;
 
@@ -352,6 +359,164 @@ function showCompareRefsPopup(anchorEl) {
   }, 0);
 }
 
+// Inline amend popup. Pre-fills with HEAD's current message; if the textarea
+// is left empty the backend keeps the existing message (Option<String> = None).
+// Pre-amend: backend tells us if HEAD is on a remote-tracking ref so we can
+// warn the user that a force-push will be needed.
+async function startAmendFlow(anchorEl, includeStaged) {
+  document.querySelector(".gp-amend-popup")?.remove();
+
+  // Probe HEAD reachability + grab the head commit's message in parallel.
+  let onRemote = false;
+  let lastMessage = "";
+  try {
+    [onRemote] = await Promise.all([
+      invoke("git_head_on_remote", { path: currentPath }),
+    ]);
+  } catch (_) {}
+  // Use the most recent commit from the panel snapshot for the prefill.
+  // (lastSnapshot was JSON-stringified for cache compare, so we re-derive
+  // from the latest get_commits via the message we already render.)
+  try {
+    const commits = await invoke("get_commits", { path: currentPath, count: 1 });
+    if (commits && commits.length > 0) lastMessage = commits[0].message || "";
+  } catch (_) {}
+
+  const popup = document.createElement("div");
+  popup.className = "gp-confirm-popup gp-amend-popup";
+  popup.innerHTML = `
+    <div class="gp-amend-title">Amend last commit${includeStaged ? " (uses staged changes)" : ""}</div>
+    ${onRemote ? `<div class="gp-amend-warning">⚠ This commit is on a remote — you'll need to force-push.</div>` : ""}
+    <textarea class="gp-amend-textarea" rows="4" spellcheck="false">${escapeHtml(lastMessage)}</textarea>
+    <div class="gp-confirm-actions">
+      <button class="gp-confirm-yes">${onRemote ? "Amend (force-push needed)" : "Amend"}</button>
+      <button class="gp-confirm-cancel">Cancel</button>
+    </div>`;
+
+  document.body.appendChild(popup);
+  const popupRect = popup.getBoundingClientRect();
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const w = popupRect.width || 320;
+  const h = popupRect.height || 200;
+  const left = Math.max(4, Math.min(anchorRect.left, window.innerWidth - w - 8));
+  const top = anchorRect.top - h - 6 < 4
+    ? anchorRect.bottom + 6
+    : anchorRect.top - h - 6;
+  popup.style.position = "fixed";
+  popup.style.top = `${top}px`;
+  popup.style.left = `${left}px`;
+
+  const textarea = popup.querySelector(".gp-amend-textarea");
+  textarea.focus();
+  textarea.select();
+
+  let outsideClick = null;
+  const close = () => {
+    popup.remove();
+    if (outsideClick) document.removeEventListener("mousedown", outsideClick);
+  };
+
+  popup.querySelector(".gp-confirm-yes").addEventListener("click", async () => {
+    const newMessage = textarea.value.trim();
+    // Send None when the message is unchanged so libgit2 keeps the existing one.
+    const message = (newMessage && newMessage !== lastMessage.trim()) ? newMessage : null;
+    close();
+    try {
+      const result = await invoke("git_amend_commit", {
+        path: currentPath,
+        message,
+        includeStaged,
+      });
+      if (result.requires_force_push) {
+        showGitFeedback("Amended. Force-push needed to share.", "success");
+      } else {
+        showGitFeedback("Amended", "success");
+      }
+      await refreshPanel(null, true);
+      refreshFileBrowser();
+    } catch (err) {
+      showGitFeedback(`Amend failed: ${err}`, "error");
+    }
+  });
+  popup.querySelector(".gp-confirm-cancel").addEventListener("click", close);
+  textarea.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Escape") close();
+  });
+
+  setTimeout(() => {
+    outsideClick = (e) => {
+      if (!popup.contains(e.target)) close();
+    };
+    document.addEventListener("mousedown", outsideClick);
+  }, 0);
+}
+
+// Routes a Pending Operation banner button to the right backend command.
+// Rebase actions are wired but the rebase backend lands in PR4; until then
+// the rebase variant of this banner is exercised only via raw git CLI.
+async function runPendingOpAction(kind, action) {
+  const cmds = {
+    merge: {
+      // No first-class continue/abort for merge yet — fall back to commit
+      // (continue = create the merge commit) or git_merge_branch with a
+      // sentinel. For now, surface helpful feedback rather than hang.
+      continue: () => invokeWithTimeout("git_commit", { path: currentPath, message: "Merge" }),
+      abort: () => Promise.reject(new Error("Merge abort not yet implemented — use `git merge --abort` from a terminal")),
+    },
+    cherry_pick: {
+      continue: () => invokeWithTimeout("git_cherry_pick_continue", { path: currentPath }),
+      abort: () => invokeWithTimeout("git_cherry_pick_abort", { path: currentPath }),
+    },
+    rebase: {
+      // PR4 lands the cancellable rebase wrappers; for now the user can
+      // still use `git rebase --continue/--abort/--skip` from a terminal.
+      continue: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
+      abort: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
+      skip: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
+    },
+  };
+  const handler = cmds[kind]?.[action];
+  if (!handler) {
+    showGitFeedback(`Unknown ${kind} action: ${action}`, "error");
+    return;
+  }
+  setInFlightOp(true);
+  try {
+    await handler();
+    showGitFeedback(`${kind.replace("_", "-")} ${action}`, "success");
+  } catch (err) {
+    showGitFeedback(`${err}`, "error");
+  } finally {
+    setInFlightOp(false);
+    await refreshPanel(null, true);
+    refreshFileBrowser();
+  }
+}
+
+// Cherry-pick a single commit onto HEAD. Backend returns a structured
+// CherryPickResult so we can route conflicts to the Pending Operation banner
+// without a second round-trip. Wrapped in inFlightOp so the polling refresh
+// can't re-render the panel mid-shellout.
+async function doCherryPick(oid) {
+  setInFlightOp(true);
+  try {
+    const result = await invokeWithTimeout("git_cherry_pick", { path: currentPath, oid });
+    if (result.ok) {
+      showGitFeedback(`Cherry-picked ${oid.slice(0, 7)}`, "success");
+    } else {
+      const n = result.conflicted_files.length;
+      showGitFeedback(`Cherry-pick has conflicts in ${n} file${n === 1 ? "" : "s"}`, "error");
+    }
+  } catch (err) {
+    showGitFeedback(`Cherry-pick failed: ${err}`, "error");
+  } finally {
+    setInFlightOp(false);
+    await refreshPanel(null, true);
+    refreshFileBrowser();
+  }
+}
+
 // Right-click menu on a commit row. Compare with HEAD, parent, or arbitrary
 // ref; copy the OID.
 function showCommitContextMenu(mouseEvent, oid) {
@@ -374,6 +539,13 @@ function showCommitContextMenu(mouseEvent, oid) {
       label: "Compare with…",
       enabled: !!openDiffInTab,
       onClick: () => promptCompareRef(oid, mouseEvent.clientX, mouseEvent.clientY),
+    },
+    {
+      // Cherry-pick is gated on no pending op — applying a commit on top
+      // of a half-merged or in-progress rebase tree is asking for trouble.
+      label: "Cherry-pick onto HEAD",
+      enabled: currentPendingOp.kind === "none",
+      onClick: () => doCherryPick(oid),
     },
     {
       label: "Copy OID",
@@ -621,6 +793,43 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
       </div>`;
   }
 
+  // ── 3a. Pending Operation banner ──────────────────────────────────────────
+  // Surfaces merge / cherry-pick / rebase pause states with the right
+  // continue/abort buttons. Shared across PR2 (cherry-pick), PR1 (merge,
+  // already supported), and PR5+ (rebase).
+  let pendingOpHtml = "";
+  const op = currentPendingOp;
+  if (op && op.kind && op.kind !== "none") {
+    const labels = {
+      merge: "Merge in progress",
+      cherry_pick: "Cherry-pick paused",
+      rebase: "Rebase in progress",
+    };
+    const label = labels[op.kind] || op.kind;
+    const progress = (op.current_step != null && op.total_steps != null)
+      ? ` <span class="gp-pending-op-progress">(${op.current_step}/${op.total_steps})</span>`
+      : "";
+    const headLine = op.head_message
+      ? `<div class="gp-pending-op-head">HEAD: ${escapeHtml(op.head_message)}</div>`
+      : "";
+    const buttons = op.kind === "rebase"
+      ? `
+        <button class="gp-pending-op-btn" data-op-action="continue">Continue</button>
+        <button class="gp-pending-op-btn" data-op-action="skip">Skip</button>
+        <button class="gp-pending-op-btn gp-pending-op-abort" data-op-action="abort">Abort</button>`
+      : `
+        <button class="gp-pending-op-btn" data-op-action="continue">Continue</button>
+        <button class="gp-pending-op-btn gp-pending-op-abort" data-op-action="abort">Abort</button>`;
+    pendingOpHtml = `
+      <div class="gp-section gp-pending-op-banner gp-pending-op-${op.kind}">
+        <div class="gp-pending-op-row">
+          <span class="gp-pending-op-label">${label}${progress}</span>
+        </div>
+        ${headLine}
+        <div class="gp-pending-op-actions" data-op-kind="${op.kind}">${buttons}</div>
+      </div>`;
+  }
+
   // ── 3. Conflicts ───────────────────────────────────────────────────────────
   let conflictsHtml = "";
   if (conflictFiles.length > 0) {
@@ -715,7 +924,19 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
           <span class="gp-char-count" id="commit-char-count">0/72</span>
         </div>
         <textarea id="commit-message" class="gp-commit-textarea" rows="3" placeholder="Commit message..." autocomplete="off"></textarea>
-        <button id="commit-btn" class="gp-commit-btn">Commit</button>
+        <div class="gp-commit-actions">
+          <button id="commit-btn" class="gp-commit-btn">Commit</button>
+          ${(commits.length > 0 && currentPendingOp.kind === "none")
+            ? `<button id="amend-btn" class="gp-amend-btn" title="Amend the last commit (uses staged files; reuses last message if textbox is empty)">Amend</button>`
+            : ""}
+        </div>
+      </div>`;
+  } else if (commits.length > 0 && currentPendingOp.kind === "none") {
+    // No staged changes, but a previous commit exists — offer message-only
+    // amend so the user can fix a typo without staging something.
+    commitHtml = `
+      <div class="gp-commit-form gp-amend-only">
+        <button id="amend-message-btn" class="gp-amend-btn" title="Amend the last commit's message">Amend last commit message…</button>
       </div>`;
   }
 
@@ -803,6 +1024,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
     headerHtml +
     toolbarHtml +
     stashHtml +
+    pendingOpHtml +
     conflictsHtml +
     stagedHtml +
     changedHtml +
@@ -1051,6 +1273,43 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
 
   if (commitBtn) {
     commitBtn.addEventListener("click", doCommit);
+  }
+
+  // Pending Operation banner buttons (merge / cherry-pick / rebase).
+  panel.querySelectorAll(".gp-pending-op-actions .gp-pending-op-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.opAction;
+      const kind = btn.parentElement?.dataset.opKind;
+      if (!action || !kind) return;
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "…";
+      try {
+        await runPendingOpAction(kind, action);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    });
+  });
+
+  // Amend buttons (with-staged variant in the form, message-only variant
+  // when no staged changes). Both delegate to startAmendFlow which opens
+  // the inline editor and handles the libgit2 reachability prompt.
+  const amendBtn = document.getElementById("amend-btn");
+  if (amendBtn) {
+    amendBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startAmendFlow(amendBtn, /*includeStaged*/ true);
+    });
+  }
+  const amendMessageBtn = document.getElementById("amend-message-btn");
+  if (amendMessageBtn) {
+    amendMessageBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startAmendFlow(amendMessageBtn, /*includeStaged*/ false);
+    });
   }
 
   // Local branch checkout
