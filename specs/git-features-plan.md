@@ -70,11 +70,12 @@ Smallest of the three features and the one that touches the least delicate code.
 
 #### Backend
 
-1. **`git_amend_commit(path, message: Option<String>, include_staged: bool) -> Result<String, String>`** — pure libgit2 (no shellout):
+1. **`git_amend_commit(path, message: Option<String>, include_staged: bool) -> Result<AmendResult, String>`** — pure libgit2 (no shellout):
+   - `AmendResult { oid: String, requires_force_push: bool }` — `requires_force_push` is set when the pre-amend HEAD was reachable from any `refs/remotes/*` ref.
    - Open repo, find HEAD commit.
    - If `include_staged`: read index, write tree from index. Else use `head.tree()`.
    - `head.amend(Some("HEAD"), Some(&signature), Some(&signature), None, message.as_deref(), Some(&new_tree))`.
-   - Return short OID. Refuse if HEAD is unborn or detached unless explicitly allowed.
+   - Refuse if HEAD is unborn or detached.
 
 2. **`git_cherry_pick(path, oid, state) -> Result<CherryPickResult, String>`** — shellout via `run_git_cancellable`:
    - Validate OID with `is_valid_git_oid`.
@@ -90,7 +91,7 @@ Smallest of the three features and the one that touches the least delicate code.
 1. **Amend** button in commit form (`gitpanel.js:444-470`):
    - Visible only when HEAD is not unborn AND we're not mid-merge/rebase/cherry-pick.
    - Two modes: "Amend message" (when no staged changes; opens a textbox prefilled with the last commit's message) and "Amend with staged" (when staged > 0; uses the new message if typed, else keeps the old).
-   - **Published-commit guard**: before amending, check via libgit2 whether HEAD is reachable from any remote-tracking ref (`refs/remotes/*`). If yes, route through `showConfirmPopup` with copy: "This commit is already on the remote. Amending will require a force-push to share it. Continue?" Skip the prompt when HEAD is purely local. (No new command needed — the check is cheap and lives in `git_amend_commit` returning a structured `{ requires_force_push: bool }` alongside the new OID, so the toast can include "You'll need to force-push.")
+   - **Published-commit guard**: before amending, check via libgit2 whether HEAD is reachable from any remote-tracking ref (`refs/remotes/*`). If yes, route through `showConfirmPopup` with copy: "This commit is already on the remote. Amending will require a force-push to share it. Continue?" Skip the prompt when HEAD is purely local. The check is duplicated server-side: `git_amend_commit`'s `AmendResult.requires_force_push` is the source of truth for the post-amend toast ("You'll need to force-push."), so a stale frontend prompt result can't desync the message.
    - Calls `git_amend_commit`. Refresh + toast on success.
 
 2. **Cherry-pick** entry in commit-row context menu (Phase 2's new menu).
@@ -114,7 +115,7 @@ This unblocks Phase 5: rebase and cherry-pick conflicts route through the same U
 2. **CodeMirror extension** in same module:
    - StateField holds `Block[]` recomputed on doc change.
    - ViewPlugin produces `Decoration.mark` for ours/theirs/base ranges (background tint via CSS classes `.cm-conflict-ours`, `.cm-conflict-theirs`, `.cm-conflict-base`).
-   - WidgetType for the marker lines themselves: replaces the `<<<<<<< HEAD` line (and its siblings) with a button bar `[Accept Ours] [Accept Theirs] [Accept Both] [Open 3-Way]`. Buttons dispatch a transaction calling `replaceBlock`.
+   - WidgetType for the marker lines themselves: replaces the `<<<<<<< HEAD` line (and its siblings) with a button bar `[Accept Ours] [Accept Theirs] [Accept Both]`. Buttons dispatch a transaction calling `replaceBlock`. The `[Open 3-Way]` button is hidden behind a `phase6Available` flag (default `false`) and only renders once Phase 6 lands — no dead UI in Phase 4.
    - Extension exported as `conflictExtension({ onResolveAll })` so callers can hook into "all conflicts cleared".
 
 3. **Wire into `editor.js`**: `createEditor` accepts a new option `conflictMode: boolean`. When true, the conflict extension is appended to the extensions array. `main.js`'s `createEditorTab` opts in when the file is in `getGitStatus().conflictFiles`.
@@ -122,7 +123,7 @@ This unblocks Phase 5: rebase and cherry-pick conflicts route through the same U
 4. **Resolve flow**:
    - Each button mutates the doc; the file becomes dirty.
    - On Cmd+S, the existing save flow writes the file. After write, frontend calls `git_stage_file(path, file_path)` automatically when no markers remain in the saved text — this is git's standard "edited + add = resolved" pattern. Toast: "Resolved <file>".
-   - "Open 3-Way" button is a no-op until Phase 6; in Phase 4 it opens an info toast.
+   - "Open 3-Way" button is gated behind `phase6Available` and not rendered in Phase 4.
 
 **Files:** `src-tauri/src/lib.rs` (no change), **new** `src/conflictmarkers.js`, `src/editor.js`, `src/main.js`, `src/styles.css` (new: `.cm-conflict-*` classes, `.conflict-action-bar`).
 
@@ -134,8 +135,9 @@ Largest feature. Builds on Phase 1 (validation), Phase 3 (`get_pending_op_state`
 
 #### Backend
 
-1. **`get_rebase_candidate_commits(path, count) -> Vec<CommitInfo>`** — convenience wrapper around `get_commits` that excludes merge commits and stops at the first commit shared with the upstream (so users don't accidentally rewrite published history). Returns the editable subset.
-   - **No upstream**: when the current branch has no upstream configured, the "shared-with-upstream" cutoff is undefined. In that case, fall back to capping at `count` commits and surface a `{ commits, upstream_known: false }` shape so the frontend can render an info banner ("No upstream branch — showing the last N commits. All are safe to rewrite.").
+1. **`get_rebase_candidate_commits(path, count) -> Result<RebaseCandidates, String>`** — convenience wrapper around `get_commits` that excludes merge commits and stops at the first commit shared with the upstream (so users don't accidentally rewrite published history).
+   - `RebaseCandidates { commits: Vec<CommitInfo>, upstream_known: bool }`. Each `CommitInfo` gains an `on_remote: bool` field (true when the commit is reachable from any `refs/remotes/*` ref) so the frontend's force-push confirm count is computed without a second round-trip.
+   - **No upstream**: when the current branch has no upstream configured, the "shared-with-upstream" cutoff is undefined. In that case, cap at `count` commits and return `upstream_known: false`; the frontend renders an info banner ("No upstream branch — showing the last N commits. All are safe to rewrite.").
    - **Detached HEAD**: refuse with a typed error (`"detached_head"`); the rebase tab won't open.
 
 2. **`git_rebase_interactive_apply(path, base_oid: String, todo: Vec<RebaseTodoEntry>, state) -> Result<RebaseResult, String>`** — the core of the feature:
@@ -145,18 +147,23 @@ Largest feature. Builds on Phase 1 (validation), Phase 3 (`get_pending_op_state`
    - **Driver pattern**: write a single JSON state file to a per-run temp dir (`mktemp -d`-style). Layout:
      ```
      /tmp/launchpad-rebase-<pid>-<rand>/
-       state.json        # { todo: [...], reword_index: 0, version: 1 }
-       seq_editor.sh     # 0o700
-       commit_editor.sh  # 0o700
+       state.json              # { todo: [...], version: 1 }
+       commit_editor.counter   # created lazily on first commit_editor.sh call
+       seq_editor.sh           # 0o700
+       commit_editor.sh        # 0o700
      ```
+     `state.json` is immutable for the lifetime of the rebase; mutable progress lives in `commit_editor.counter` (atomic increment via `mv`-rename or `flock`), which is the only file the editor scripts write.
    - Both scripts receive the state-dir path via a single env var `LAUNCHPAD_REBASE_STATE_DIR` (set by the Rust spawner alongside `GIT_SEQUENCE_EDITOR` / `GIT_EDITOR`). They `cd $LAUNCHPAD_REBASE_STATE_DIR` and read `state.json` from a known relative path — no argument plumbing through git.
    - `seq_editor.sh` — invoked once with `$1` = git's rebase-todo path. Reads `state.json.todo`, rewrites `$1`: drops `drop` entries, keeps action keywords for `reword`/`squash`/`fixup`/`edit`, preserves order from the JSON (which is the user's drag-reordered list).
-   - `commit_editor.sh` — invoked once per `reword`/`squash`/`edit` step. Maintains a counter file `commit_editor.counter` in the state dir (created on first call, incremented atomically via `mv`-rename trick or `flock`). On invocation N, it walks `state.json.todo` to find the Nth entry whose action requires a message edit, writes that entry's `new_message` to `$1`, increments the counter. If `new_message` is null/missing for `reword`, it leaves `$1` untouched (preserves existing message).
+   - `commit_editor.sh` — invoked once per `reword`/`squash` step (NOT `edit` — git's `edit` action pauses without invoking the commit editor; the user resumes via `git rebase --continue` after our UI walks them through any amend). `fixup` also doesn't invoke the editor. Maintains a counter file `commit_editor.counter` in the state dir (created on first call, incremented atomically via `mv`-rename trick or `flock`). On invocation N, it walks `state.json.todo` to find the Nth entry whose action is `reword` or `squash`, writes that entry's `new_message` to `$1`, increments the counter. If `new_message` is null/missing for `reword`, it leaves `$1` untouched (preserves existing message).
+   - **`edit` action handling**: when the rebase pauses on an `edit` entry, `get_pending_op_state` reports `kind: "rebase"` with `current_step` pointing at the edit row. The Pending Operation banner shows "Stopped to edit `<oid>` — make changes and click Continue." The user uses Launchpad's existing amend UI (Phase 3) to amend, then clicks Continue, which runs `git_rebase_continue`.
    - **Exotic `core.editor` wrappers**: `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` env vars take precedence over `core.editor` in git's resolution order, so user wrappers are bypassed. The spawn explicitly clears `EDITOR` and `VISUAL` too, so a malformed user `EDITOR=...` can't override our scripts. Documented as a known compatibility gotcha for users with `core.editor = some-wrapper.sh`.
    - Spawn `git rebase -i <base>` under `run_git_cancellable` with `GIT_SEQUENCE_EDITOR=<state_dir>/seq_editor.sh`, `GIT_EDITOR=<state_dir>/commit_editor.sh`, `LAUNCHPAD_REBASE_STATE_DIR=<state_dir>`, plus `apply_git_env`.
    - Return `RebaseResult { ok: bool, stopped_at: Option<String>, conflicted_files: Vec<String>, completed: bool, backup_tag: String }`.
-   - On conflict: leave rebase state, return `ok: false` with conflict info; frontend routes to the inline conflict UI from Phase 4 + the Pending Operation banner.
-   - **Cleanup**: state dir is removed in a `Drop`-style guard regardless of success/failure/cancel. Backup tag is kept on success (user-visible safety net) and deleted on abort.
+   - On conflict: leave rebase state, return `ok: false` with conflict info; frontend routes to the inline conflict UI from Phase 4 + the Pending Operation banner. The state dir AND backup tag MUST survive the pause — `commit_editor.sh` will be re-invoked on `git rebase --continue`, and the user may want to bail to the backup tag manually.
+   - **Cleanup lifecycle**: cleanup is gated on a *terminal* op result, not on `git_rebase_interactive_apply` returning. Terminal results are: clean completion of the initial apply, or `git_rebase_continue` returning `completed: true`, or `git_rebase_abort` returning success, or `git_rebase_skip` returning `completed: true`.
+     - State dir: removed by a `Drop`-style guard wired to whichever command produces the terminal result. A mid-rebase `cancel_git_op` of the *initial* apply does NOT remove the state dir (the rebase may still be paused mid-operation — abort owns the cleanup).
+     - Backup tag: kept on clean completion (user-visible safety net, surfaced in the success toast). Deleted on `git_rebase_abort`. Kept across all conflict pauses.
 
 3. **`git_rebase_abort(path)`** / **`git_rebase_continue(path)`** / **`git_rebase_skip(path)`** — shellouts via `run_git_cancellable`.
 
@@ -197,7 +204,7 @@ Largest feature. Builds on Phase 1 (validation), Phase 3 (`get_pending_op_state`
    - Synchronized scrolling: line-anchored (use the merged pane's scrollTop → line position; map to ours/theirs lines via the parsed hunk structure).
    - Save writes the merged pane to disk + auto-stages (same flow as Phase 4).
 
-3. **Entry point** — "Open 3-Way" button in Phase 4's inline action bar now becomes functional.
+3. **Entry point** — flip `phase6Available` to `true` so Phase 4's `[Open 3-Way]` button renders, wired to open a `merge` tab for the conflicted file.
 
 **Files:** `src-tauri/src/lib.rs`, `src/main.js`, `src/editor.js`, `src/styles.css`.
 
