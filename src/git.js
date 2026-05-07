@@ -6,6 +6,43 @@ let currentGitInfo = null;
 let currentGitRoot = null;
 let gitPollInterval = null;
 
+// True while a network git op (push/pull/fetch/merge) is in flight. Polling
+// refreshPanel calls skip their renderPanel step while this is set so the
+// toolbar DOM — including the Cancel button and the busy-state on the
+// active button — isn't destroyed out from under the user. Lives in `git.js`
+// so the diff tab and rebase tab can share the same cancellation flow.
+// Read via `inFlightOp` (live binding); flip via `setInFlightOp(bool)`.
+export let inFlightOp = false;
+
+export function setInFlightOp(v) {
+  inFlightOp = !!v;
+}
+
+// Wraps invoke with a timeout to prevent indefinite hangs on network
+// operations. Tauri IPC has no cancellation — Promise.race rejecting does
+// NOT stop the Rust side, so on timeout we explicitly call cancel_git_op
+// to kill the git child process and free its PID slot. Without this, every
+// timeout leaks a git process and occupies the single-slot pid_store,
+// making subsequent ops uncancellable.
+export async function invokeWithTimeout(command, args, timeoutMs = 30000) {
+  let timedOut = false;
+  let timerId;
+  const timer = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      timedOut = true;
+      reject(new Error("Operation timed out"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([invoke(command, args), timer]);
+  } finally {
+    clearTimeout(timerId);
+    if (timedOut) {
+      try { await invoke("cancel_git_op"); } catch (_) {}
+    }
+  }
+}
+
 export async function fetchGitStatus(path) {
   try {
     currentGitInfo = await invoke("get_git_status", { path });

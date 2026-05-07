@@ -768,6 +768,17 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   flex-direction: column;
   transition: width 0.2s ease;
   position: relative;
+  /* Disable text selection panel-wide so right-click never selects a row's
+     text and lets macOS WebKit pop the Services menu. Inputs/textareas are
+     re-enabled below so commit messages and rename fields still work. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#git-panel input,
+#git-panel textarea {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 #git-panel.visible {
@@ -1069,6 +1080,11 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   padding: 4px 16px;
   font-size: 11px;
   gap: 8px;
+  /* Prevent OS native context menu from appearing on right-click of selected
+     text (macOS WebKit shows Services / Look Up / Copy menu when right-
+     clicking selected text, which preempts our custom JS contextmenu). */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .gp-commit-oid {
@@ -3145,5 +3161,227 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   height: 1px;
   background: var(--border-2);
   margin: 4px 0;
+}
+
+/* ===== Diff Tab (compare two refs) ===== */
+.diff-instance {
+  height: 100%;
+  width: 100%;
+  display: none;
+  flex-direction: column;
+  background: var(--surface-4);
+}
+
+.diff-tab-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: var(--text-10);
+  background: var(--surface-4);
+  border-bottom: 1px solid var(--surface-8);
+  flex-shrink: 0;
+}
+
+.diff-tab-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 12px;
+}
+
+.diff-tab-stats {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-1);
+  flex-shrink: 0;
+}
+
+.diff-tab-stats .diff-add-count { color: #5af78e; }
+.diff-tab-stats .diff-del-count { color: #ff5f56; }
+
+.diff-tab-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.diff-tab-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-1);
+  font-size: 12px;
+  padding: 24px;
+  gap: 10px;
+}
+
+.diff-tab-empty-title {
+  color: var(--text-10);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.diff-tab-empty-hint {
+  max-width: 420px;
+  line-height: 1.5;
+}
+
+.diff-file-list {
+  width: 240px;
+  min-width: 240px;
+  max-width: 320px;
+  overflow-y: auto;
+  background: var(--surface-4);
+  border-right: 1px solid var(--surface-8);
+  padding: 4px 0;
+  flex-shrink: 0;
+}
+
+.diff-file-list-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: var(--text-10);
+  border-left: 2px solid transparent;
+}
+
+.diff-file-list-item:hover {
+  background: var(--surface-6);
+}
+
+.diff-file-list-item.selected {
+  background: var(--surface-8);
+  border-left-color: #61afef;
+}
+
+.diff-file-list-path {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  margin-right: 8px;
+  flex: 1;
+}
+
+.diff-file-list-stats {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.diff-file-list-stats .diff-add-count { color: #5af78e; }
+.diff-file-list-stats .diff-del-count { color: #ff5f56; }
+
+.diff-tab-content {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--surface-4);
+}
+
+.diff-file-section {
+  border-bottom: 1px solid var(--surface-8);
+}
+
+.diff-file-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--surface-6);
+  border-bottom: 1px solid var(--surface-8);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+}
+
+.diff-file-path {
+  color: var(--text-10);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-stats {
+  display: flex;
+  gap: 8px;
+  font-size: 10px;
+  flex-shrink: 0;
+  margin-left: 12px;
+}
+
+.diff-file-stats .diff-add-count { color: #5af78e; }
+.diff-file-stats .diff-del-count { color: #ff5f56; }
+
+.diff-file-body {
+  background: var(--surface-4);
+}
+
+/* Compare popup — extends gp-confirm-popup but uses fixed positioning
+   from JS (top/left set by JS) instead of the centered transform. */
+.gp-compare-popup {
+  width: 280px;
+  position: fixed !important;
+  transform: none !important;
+  z-index: 200;
+}
+
+.gp-compare-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--text-10);
+}
+
+.gp-compare-row label {
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.gp-compare-row select,
+.gp-compare-row input {
+  flex: 1;
+  /* Without min-width:0, the select expands to its longest option, blowing
+     the popup wider than its declared 280px. */
+  min-width: 0;
+  max-width: 100%;
+  background: var(--surface-6);
+  color: var(--text-10);
+  border: 1px solid var(--border-2);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.gp-compare-fixed {
+  flex: 1;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: var(--text-1);
+  padding: 3px 6px;
+}
+
+.gp-section-actions {
+  display: inline-flex;
+  gap: 4px;
 }
 
