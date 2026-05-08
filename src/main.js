@@ -502,18 +502,33 @@ function switchTab(uiId) {
   renderTabBar();
 }
 
-function showConfirmDialog(message, onConfirm) {
+// Themed in-app modal confirm. Defaults to a "Close" affirmative button to
+// preserve historical callers (close-with-unsaved-changes). Pass `opts` to
+// customize the affirmative label and tone:
+//   { confirmLabel: "Delete", tone: "danger" }
+// `tone: "danger"` colors the affirmative button red so a destructive
+// action visibly differs from a benign one.
+export function showConfirmDialog(message, onConfirm, opts = {}) {
+  const confirmLabel = opts.confirmLabel || "Close";
+  const cancelLabel = opts.cancelLabel || "Cancel";
+  const toneClass = opts.tone === "danger" ? " confirm-danger" : "";
+
   document.querySelector(".confirm-overlay")?.remove();
   const overlay = document.createElement("div");
   overlay.className = "confirm-overlay";
   overlay.innerHTML = `
     <div class="confirm-dialog">
-      <div class="confirm-message">${message}</div>
+      <div class="confirm-message"></div>
       <div class="confirm-actions">
-        <button class="confirm-btn confirm-cancel">Cancel</button>
-        <button class="confirm-btn confirm-ok">Close</button>
+        <button class="confirm-btn confirm-cancel"></button>
+        <button class="confirm-btn confirm-ok${toneClass}"></button>
       </div>
     </div>`;
+  // textContent assignments avoid HTML injection from caller-supplied
+  // strings (filenames containing "<" etc.).
+  overlay.querySelector(".confirm-message").textContent = message;
+  overlay.querySelector(".confirm-cancel").textContent = cancelLabel;
+  overlay.querySelector(".confirm-ok").textContent = confirmLabel;
   document.body.appendChild(overlay);
 
   const dismiss = () => { overlay.remove(); popEscape(dismiss); };
