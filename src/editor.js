@@ -152,7 +152,7 @@ const launchpadTheme = EditorView.theme({
  * Create a CodeMirror editor instance.
  * Returns { view, setTabSize, setWordWrap } — caller owns the view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme, conflictMode } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme, conflictMode, readOnly, onOpenThreeWay } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -177,7 +177,13 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
-    ...(conflictMode ? [conflictExtension({ phase6Available: false })] : []),
+    ...(conflictMode
+      ? [conflictExtension({
+          phase6Available: !!onOpenThreeWay,
+          onOpenThreeWay,
+        })]
+      : []),
+    ...(readOnly ? [EditorState.readOnly.of(true)] : []),
     EditorState.allowMultipleSelections.of(true),
     tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),

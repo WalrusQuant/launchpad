@@ -328,8 +328,10 @@ function buildConflictDecorations(state, phase6Available) {
 
 // Public extension factory. `onResolveAll` (currently unused — Phase 4
 // auto-stage lives in main.js's save flow) is reserved for future hooks.
-// `phase6Available` toggles the "Open 3-Way" button — kept off in PR3.
-export function conflictExtension({ onResolveAll: _unused, phase6Available = false } = {}) {
+// `phase6Available` toggles the "Open 3-Way" button. When the user clicks
+// it, `onOpenThreeWay` is invoked (no args — the caller already knows the
+// file path because it bound this callback to its own editor tab).
+export function conflictExtension({ onResolveAll: _unused, phase6Available = false, onOpenThreeWay } = {}) {
   const field = StateField.define({
     create(state) {
       return buildConflictDecorations(state, phase6Available);
@@ -352,6 +354,18 @@ export function conflictExtension({ onResolveAll: _unused, phase6Available = fal
       if (!btn) return false;
       const choice = btn.dataset.choice;
       if (!choice) return false;
+      // "three-way" doesn't rewrite the block — it opens the 3-pane merge
+      // tab via the parent-supplied callback. Falls through to a no-op if
+      // the host didn't wire one up.
+      if (choice === "three-way") {
+        if (typeof onOpenThreeWay === "function") {
+          onOpenThreeWay();
+          event.preventDefault();
+          event.stopPropagation();
+          return true;
+        }
+        return false;
+      }
       // Find the block this button belongs to: walk back to the nearest
       // .conflict-action-bar, then locate by its position in the doc.
       const bar = btn.closest(".conflict-action-bar");
