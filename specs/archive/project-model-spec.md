@@ -171,12 +171,12 @@ The main question: does each window get its own set of PTYs in the shared AppSta
 
 Launchpad ships its own built-in coding agent AND supports external CLI agents side by side.
 
-### Built-in Agent (see `specs/agent-spec.md`)
-- Native Rust agent module in the Tauri backend — agentic loop, tool use, streaming
-- Agent tab type alongside terminal/editor/settings
-- Deep integration: file browser updates, git panel sync, editor tab opens
-- Provider-agnostic: Anthropic + OpenAI
-- **Project-scoped**: agent's working directory = project root, file writes blocked outside boundary
+### Built-in Agent (see `specs/agent-integration-spec.md`)
+- launchpad-agent integrated in-process via Cargo workspace deps — no subprocess
+- Chat tab type alongside terminal/editor/settings
+- Deep integration: file browser updates, git panel sync, editor tab opens, Launchpad-native tools registered into the agent's tool registry
+- Provider-agnostic: Anthropic, OpenAI, Gemini, OpenRouter, Groq, Together, Mistral, Ollama, Z.ai coding plan
+- **Project-scoped**: agent's working directory = project root, file writes blocked outside boundary by launchpad-agent's safety layer
 
 ### External CLI Agents
 Users can still run whatever CLI agent they want in terminal tabs:
@@ -199,7 +199,7 @@ The project model makes both built-in and CLI agents better:
 
 ## What's Out of Scope
 
-- ~~Native AI agent panel~~ — **Updated**: built-in agent now planned (see `specs/agent-spec.md`). Complements CLI agents, doesn't replace them.
+- ~~Native AI agent panel~~ — **Updated**: built-in agent now planned (see `specs/agent-integration-spec.md`). Complements CLI agents, doesn't replace them.
 - Multi-project in one window — too complex, not worth it.
 - Agent orchestration / coordination — that's the agent's job, not the workspace's.
 - Per-project settings — later, not now.

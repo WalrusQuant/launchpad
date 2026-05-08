@@ -7,6 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No frameworks, no bloat.
 
+## Product Philosophy
+
+- **Terminal-first.** The terminal is the primary surface, not a sidebar. Every other surface (file browser, git panel, editor tabs) exists to serve work happening in the terminal. AI lives both in the terminal via CLI agents (Claude Code, Aider, OpenCode, goose) and as a chat tab via the integrated launchpad-agent (see `specs/agent-integration-spec.md`).
+- **Project-scoped, one window per project.** A project is just a root directory. No `.launchpad/` folder in the repo, no config files, no lock-in. Working on two projects? Two windows. The alternative — multi-project in one window — sounds cool but ends up rebuilding VS Code's multi-root workspace, which everyone hates. A window IS a project, not a project-spawner. This drives the picker UX (clicking a project takes over the current window; Cmd+Shift+N opens a fresh picker for a parallel project).
+- **CLI agents are first-class, not legacy.** The built-in agent complements them, doesn't replace them. Users who prefer Claude Code in a terminal tab keep using it. Launchpad's job is to make every agent (built-in or CLI) start in the right directory with the right env, undisrupted by accidental `cd`s. This is why the file browser writes nothing to PTYs — the old ⏎ "cd to this directory" button was removed precisely because it was the only file-browser control that could disrupt a running agent.
+- **Not an IDE.** Launchpad is a workspace. No scaffolding, no project templates, no debugger, no language-server-mediated cross-file rename. If you need those, use VS Code or Zed alongside.
+
 ## Tech Stack
 - **Tauri v2** — native macOS desktop shell
 - **Rust** — PTY management, filesystem ops, git operations via `git2` crate + system `git` for network ops (push/pull/fetch/merge)
@@ -41,7 +48,7 @@ specs/                  # Design specs (project model, agent model, etc.)
 
 ## Key Architecture Decisions
 
-### Projects (see `specs/project-model-spec.md`)
+### Projects
 - **One window = one project.** A project is just a root directory stored in `~/.launchpad/projects.json`. The workspace is gated behind a picker; `enterWorkspace(project)` initializes terminal/file-browser/git-panel only after a project is chosen.
 - **Active project** is held in `projects.js` as module state (`activeProject`). It's the single source of truth for: terminal spawn cwd, file browser root, git panel path, Cmd+P search root, filesystem watcher.
 - **All three PTY spawn sites** (`createTab`, `splitPane`, `createTabInRight`) pass `getActiveProject()?.path` directly — no inheritance from the previous tab's cwd, no `defaultDirectory` setting, no file-browser path.
@@ -102,7 +109,7 @@ specs/                  # Design specs (project model, agent model, etc.)
 
 ### Settings & State
 - **Live settings**: Settings changes apply immediately to all open terminals/editors. Stored as JSON at `~/.launchpad/config.json`.
-- **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Path canonicalization dedupes equivalent paths. See `specs/project-model-spec.md`.
+- **Projects**: Stored at `~/.launchpad/projects.json` as an array of `{ name, path, lastOpened }`. Path canonicalization dedupes equivalent paths.
 - **Atomic writes**: `atomic_write(dest, data)` in `lib.rs` is the shared helper for every user-facing write (user code via `write_file`, settings via `save_settings`/`save_file_settings`, projects via `write_projects_file`, project-env via `write_project_env_file`). Writes to `.<name>.lp-tmp-<pid>-<counter>` (PID + `AtomicU64` counter to avoid collisions between concurrent same-dest writes from multiple windows in the same process), `fsync`, preserves existing mode, then `rename`. A crash / kill / ENOSPC mid-write leaves the old file intact. `atomic_write_with_mode(dest, data, Some(mode))` is used for secrets files so the chmod happens on the temp BEFORE rename (no 0o644 window on first-write for `project-env.json`).
 - **No framework**: Vanilla JS with direct DOM manipulation. Keeps the bundle small and fast.
 
@@ -259,6 +266,18 @@ Key patterns:
 - `showConfirmPopup()` — positioned popup for destructive actions (discard, delete branch)
 - `showGitFeedback()` — temporary toast inside the git panel for success/error messages (panel-scoped)
 - GitHub URL parsing accepts alias hosts of the form `git@github.com-<suffix>:...` (common `~/.ssh/config` multi-account setup). Anchored on the literal `github.com` to reject spoofed hosts like `git@not-github.com` and `git@github.com.evil`.
+
+## What's Out of Scope
+
+Decisions of record. Don't propose features in this list without strong new evidence.
+
+- **Multi-project in one window.** Tried in early designs, abandoned. Rebuilds VS Code multi-root.
+- **Agent orchestration / coordination.** That's the agent's job, not the workspace's. The workspace gives each agent a clean scope; what they do with it is up to them.
+- **Per-project settings.** Deferred. The data model could support it, but every preference doubling the config surface adds confusion. Revisit only if a strong use case appears.
+- **Project templates / scaffolding.** Not an IDE.
+- **Cross-window agent monitoring.** Deferred. May land if the integrated agent grows multi-window orchestration use cases (would get its own spec).
+- **Config files in the project repo.** A project is a directory, period. No `.launchpad/` folder, no project-level lockfile. Per-project state lives in `~/.launchpad/`, keyed by canonical project path.
+- **Auto-migration from legacy settings.** An empty `~/.launchpad/projects.json` always lands the user on the picker's welcome state; projects only exist because the user explicitly opened a folder.
 
 ## Toast Notifications
 `main.js` exports `showToast(message, type)` for app-level errors and info events not scoped to a specific panel (file-open failures, external-rename notifications, deleted-on-disk warnings). Lazy-creates a fixed-position container at bottom-right (`z-index: 1100` so it sits above modal overlays at 1000), auto-dismisses after 4s. Types are `"error"` and `"info"`. The git panel keeps its own `showGitFeedback` for panel-scoped messages.

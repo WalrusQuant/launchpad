@@ -2263,7 +2263,7 @@ fn get_pending_op_state(path: String) -> Result<PendingOpState, String> {
 // state dir, no argv plumbing through git. The state dir + a pre-rebase
 // backup tag survive conflict pauses; cleanup is gated on a TERMINAL op
 // (clean completion / abort / final continue or skip), not on the initial
-// apply returning. See specs/git-features-plan.md Phase 5 for the rationale.
+// apply returning. See specs/archive/git-features-plan.md Phase 5 for the rationale.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Serialize)]
