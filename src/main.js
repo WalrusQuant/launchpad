@@ -1282,11 +1282,20 @@ async function applyRebase(tab, uiId) {
       showToast(`Rebase complete. Backup tag: ${result.backup_tag}`, "info");
       closeTab(uiId);
     } else {
-      // Conflict pause — PR6 wires the inline conflict editor + Pending Op
-      // banner integration. For now, leave the tab closeable + refresh the
-      // git panel so the Pending Operation banner (from PR2) shows up.
-      showToast(`Rebase paused — resolve conflicts in the git panel`, "info");
+      // Pause — close the rebase tab, open the first conflicted file in
+      // the inline conflict editor (auto-staged on save via PR3). Empty
+      // conflicted_files means an `edit`-action pause, not a conflict —
+      // the Pending Operation banner is enough on its own there.
+      const conflicts = result.conflicted_files || [];
+      const n = conflicts.length;
+      const msg = n > 0
+        ? `Rebase paused — ${n} file${n === 1 ? "" : "s"} with conflicts. Resolve and click Continue.`
+        : "Rebase paused at edit. Make changes and click Continue.";
+      showToast(msg, "info");
       closeTab(uiId);
+      if (n > 0) {
+        await createEditorTab(`${project.path}/${conflicts[0]}`);
+      }
     }
   } catch (err) {
     showToast(`Rebase failed: ${err}`, "error");
@@ -1294,6 +1303,7 @@ async function applyRebase(tab, uiId) {
     tab.applying = false;
     setInFlightOp(false);
     refreshPanel(null, true);
+    refreshFileBrowser();
   }
 }
 
