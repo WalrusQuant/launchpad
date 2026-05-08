@@ -1,7 +1,7 @@
 use git2::{BranchType, Repository, StatusOptions};
 use notify_debouncer_mini::{new_debouncer, notify};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -46,6 +46,17 @@ struct AppState {
     // Serializes read→mutate→write of ~/.launchpad/projects.json so concurrent
     // commands (e.g. two windows both hitting add_project) can't lose updates.
     projects_file_lock: Arc<Mutex<()>>,
+    // Active interactive rebase state. Set by git_rebase_interactive_apply
+    // before spawn; consulted by abort/continue/skip for cleanup. None when
+    // no rebase is in progress (or one was leaked across an app restart —
+    // git --continue/--abort still work; we just don't get the cleanup).
+    rebase_state: Arc<Mutex<Option<RebaseStateInfo>>>,
+}
+
+#[derive(Clone)]
+struct RebaseStateInfo {
+    state_dir: std::path::PathBuf,
+    backup_tag: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -2243,6 +2254,668 @@ fn get_pending_op_state(path: String) -> Result<PendingOpState, String> {
     Ok(none)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Interactive rebase (PR4 / Phase 5a)
+//
+// Driver pattern: we generate two tiny Python scripts in a per-run temp dir
+// and point GIT_SEQUENCE_EDITOR / GIT_EDITOR at them. They read the user's
+// drag-reordered todo list (state.json) and the per-step counter from the
+// state dir, no argv plumbing through git. The state dir + a pre-rebase
+// backup tag survive conflict pauses; cleanup is gated on a TERMINAL op
+// (clean completion / abort / final continue or skip), not on the initial
+// apply returning. See specs/git-features-plan.md Phase 5 for the rationale.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Serialize)]
+struct RebaseCandidateCommit {
+    oid: String,
+    short_oid: String,
+    message: String,
+    author: String,
+    timestamp: i64,
+    on_remote: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct RebaseCandidates {
+    commits: Vec<RebaseCandidateCommit>,
+    upstream_known: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RebaseTodoEntry {
+    action: String, // "pick" | "reword" | "squash" | "fixup" | "drop" | "edit"
+    oid: String,
+    new_message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RebaseResult {
+    ok: bool,
+    stopped_at: Option<String>,
+    conflicted_files: Vec<String>,
+    completed: bool,
+    backup_tag: String,
+}
+
+const VALID_REBASE_ACTIONS: &[&str] = &["pick", "reword", "squash", "fixup", "drop", "edit"];
+
+#[tauri::command]
+fn get_rebase_candidate_commits(
+    path: String,
+    count: usize,
+) -> Result<RebaseCandidates, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+
+    if matches!(repo.head_detached(), Ok(true)) {
+        // Use a recognizable typed prefix so the frontend can show a useful
+        // error toast without parsing free-form text.
+        return Err("detached_head".into());
+    }
+
+    let head = repo.head().map_err(|e| format!("HEAD: {}", e))?;
+    let head_oid = head
+        .target()
+        .ok_or_else(|| "HEAD has no target".to_string())?;
+
+    // Determine the upstream cutoff: walk forward from `head` until we hit
+    // a commit reachable from the upstream's tip. That commit (and earlier)
+    // are "shared", so we don't include them in the rebase candidate list.
+    let upstream_oid = (|| -> Option<git2::Oid> {
+        let head_branch_name = head.shorthand()?;
+        let local = repo.find_branch(head_branch_name, BranchType::Local).ok()?;
+        let upstream = local.upstream().ok()?;
+        upstream.get().target()
+    })();
+
+    let upstream_known = upstream_oid.is_some();
+
+    // Build an "on any remote ref" set so we can flag commits as on_remote.
+    // For typical repos this is a small set; we materialize it once.
+    let mut remote_tips: Vec<git2::Oid> = Vec::new();
+    if let Ok(refs) = repo.references_glob("refs/remotes/*") {
+        for r in refs.flatten() {
+            if let Some(t) = r.target() {
+                remote_tips.push(t);
+            }
+        }
+    }
+
+    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    walk.push(head_oid).map_err(|e| e.to_string())?;
+
+    let mut commits: Vec<RebaseCandidateCommit> = Vec::new();
+    for oid_res in walk.take(count) {
+        let oid = match oid_res {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        // Stop walking once we hit the upstream-shared frontier — anything
+        // beyond is published history we shouldn't be rewriting silently.
+        if let Some(up) = upstream_oid {
+            if oid == up {
+                break;
+            }
+            if matches!(repo.graph_descendant_of(up, oid), Ok(true)) {
+                break;
+            }
+        }
+
+        let on_remote = remote_tips.iter().any(|tip| {
+            *tip == oid || matches!(repo.graph_descendant_of(*tip, oid), Ok(true))
+        });
+
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        commits.push(RebaseCandidateCommit {
+            oid: oid.to_string(),
+            short_oid: oid.to_string()[..7].to_string(),
+            message: commit.summary().unwrap_or("(no message)").to_string(),
+            author: commit.author().name().unwrap_or("Unknown").to_string(),
+            timestamp: commit.time().seconds(),
+            on_remote,
+        });
+    }
+
+    Ok(RebaseCandidates { commits, upstream_known })
+}
+
+// Lightweight tag at HEAD before the rebase mutates anything. Tag name is
+// timestamp-based so two consecutive rebases don't collide.
+fn create_rebase_backup_tag(repo: &Repository) -> Result<String, String> {
+    let head_oid = repo
+        .head()
+        .map_err(|e| format!("HEAD: {}", e))?
+        .target()
+        .ok_or_else(|| "HEAD has no target".to_string())?;
+    let target = repo.find_object(head_oid, None).map_err(|e| e.to_string())?;
+    // Nanos avoid the within-same-second collision two consecutive rebases
+    // would otherwise hit (tag_lightweight refuses to overwrite without
+    // force=true, surfacing as a confusing "backup tag" error).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tag_name = format!("launchpad/pre-rebase/{}", nanos);
+    repo.tag_lightweight(&tag_name, &target, false)
+        .map_err(|e| format!("backup tag: {}", e))?;
+    Ok(tag_name)
+}
+
+fn delete_rebase_backup_tag(repo_path: &str, tag_name: &str) {
+    if let Ok(repo) = Repository::discover(repo_path) {
+        let _ = repo.tag_delete(tag_name);
+    }
+}
+
+// Generate the per-run temp dir holding state.json + the two editor scripts.
+// Uses tempfile::Builder so the directory name has a secure random suffix
+// (no TOCTOU window where a local attacker can pre-create the path) and is
+// created atomically. Directory mode is set to 0o700 immediately after
+// creation; state.json is written at 0o600 so other users on shared
+// machines can't read commit-message contents.
+fn create_rebase_state_dir(todo: &[RebaseTodoEntry]) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // tempfile::Builder uses O_EXCL with a securely random suffix — no
+    // pre-creation race possible. .into_path() detaches the cleanup guard
+    // because we need the directory to outlive this function (cleanup is
+    // owned by the rebase command lifecycle in run_git_with_rebase_env's
+    // callers; see finalize_rebase).
+    let temp = tempfile::Builder::new()
+        .prefix("launchpad-rebase-")
+        .tempdir()
+        .map_err(|e| format!("create state dir: {}", e))?;
+    let dir = temp.into_path();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod state dir: {}", e))?;
+
+    let state_json = serde_json::json!({
+        "version": 1,
+        "todo": todo,
+    });
+    let state_path = dir.join("state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_string(&state_json).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write state.json: {}", e))?;
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod state.json: {}", e))?;
+
+    // seq_editor.sh — git invokes this once with $1 = path to the rebase-todo
+    // file. It reads our state.json and rewrites $1 in our drag-reordered
+    // order, dropping `drop` entries.
+    let seq_script = r#"#!/usr/bin/env python3
+import json, os, sys
+state_dir = os.environ["LAUNCHPAD_REBASE_STATE_DIR"]
+with open(os.path.join(state_dir, "state.json")) as f:
+    state = json.load(f)
+todo_path = sys.argv[1]
+with open(todo_path, "w") as out:
+    for entry in state["todo"]:
+        action = entry["action"]
+        if action == "drop":
+            continue
+        out.write(f"{action} {entry['oid']}\n")
+"#;
+    let seq_path = dir.join("seq_editor.sh");
+    std::fs::write(&seq_path, seq_script).map_err(|e| format!("write seq_editor.sh: {}", e))?;
+    std::fs::set_permissions(&seq_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod seq_editor.sh: {}", e))?;
+
+    // commit_editor.sh — git invokes this once per reword/squash entry with
+    // $1 = path to the COMMIT_EDITMSG file. We track which reword/squash
+    // we're on via a counter file and write the matching new_message (or
+    // leave the file untouched when new_message is null/missing). `edit`
+    // does NOT invoke this — git pauses for shell on `edit` and the user
+    // resumes via Continue from our UI.
+    let commit_script = r#"#!/usr/bin/env python3
+import json, os, sys, fcntl
+state_dir = os.environ["LAUNCHPAD_REBASE_STATE_DIR"]
+with open(os.path.join(state_dir, "state.json")) as f:
+    state = json.load(f)
+
+counter_path = os.path.join(state_dir, "commit_editor.counter")
+# Atomic open-or-create + flock-protected increment.
+fd = os.open(counter_path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    raw = os.read(fd, 64).decode().strip()
+    n = int(raw) if raw else 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(n + 1).encode())
+finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+target = None
+seen = 0
+for entry in state["todo"]:
+    if entry["action"] in ("reword", "squash"):
+        if seen == n:
+            target = entry
+            break
+        seen += 1
+
+msg_path = sys.argv[1]
+if target and target.get("new_message"):
+    with open(msg_path, "w") as f:
+        f.write(target["new_message"])
+        if not target["new_message"].endswith("\n"):
+            f.write("\n")
+# else: leave file untouched — preserves existing message (git's default)
+"#;
+    let commit_path = dir.join("commit_editor.sh");
+    std::fs::write(&commit_path, commit_script)
+        .map_err(|e| format!("write commit_editor.sh: {}", e))?;
+    std::fs::set_permissions(&commit_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod commit_editor.sh: {}", e))?;
+
+    Ok(dir)
+}
+
+fn cleanup_rebase_state_dir(dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// True when git's rebase state files indicate the rebase has finished
+// (state files removed). We poll this after each command result to decide
+// whether to clean up the state dir + (optionally) the backup tag.
+fn rebase_in_progress(repo_path: &str) -> bool {
+    let gd = match git_dir(repo_path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    gd.join("rebase-merge").is_dir() || gd.join("rebase-apply").is_dir()
+}
+
+#[tauri::command]
+fn git_rebase_interactive_apply(
+    path: String,
+    base_oid: String,
+    todo: Vec<RebaseTodoEntry>,
+    state: State<AppState>,
+) -> Result<RebaseResult, String> {
+    if !is_valid_git_oid(&base_oid) {
+        return Err("Invalid base oid".into());
+    }
+    for entry in &todo {
+        if !VALID_REBASE_ACTIONS.contains(&entry.action.as_str()) {
+            return Err(format!("Invalid action: {}", entry.action));
+        }
+        if !is_valid_git_oid(&entry.oid) {
+            return Err(format!("Invalid commit oid: {}", entry.oid));
+        }
+    }
+
+    // Hold the rebase_state lock across the in-progress check + tag/dir
+    // creation + register, so two near-simultaneous IPC calls can't both
+    // pass the in-progress check and clobber each other's state. Also
+    // refuses if our own AppState already has a rebase registered (i.e.
+    // an earlier attempt is paused mid-conflict).
+    let (backup_tag, state_dir) = {
+        let mut guard = state.rebase_state.lock().unwrap();
+        if guard.is_some() || rebase_in_progress(&path) {
+            return Err("A rebase is already in progress — abort or continue it before starting a new one".into());
+        }
+
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let backup_tag = create_rebase_backup_tag(&repo)?;
+        drop(repo);
+
+        let state_dir = match create_rebase_state_dir(&todo) {
+            Ok(d) => d,
+            Err(e) => {
+                // Tag was created but we never spawned — drop it so we
+                // don't leave noise behind.
+                delete_rebase_backup_tag(&path, &backup_tag);
+                return Err(e);
+            }
+        };
+        *guard = Some(RebaseStateInfo {
+            state_dir: state_dir.clone(),
+            backup_tag: backup_tag.clone(),
+        });
+        (backup_tag, state_dir)
+    };
+
+    let result = spawn_rebase(&path, &base_oid, &state_dir, &state);
+
+    // Inspect git's repo state to decide whether this was a terminal result
+    // (rebase finished) or a pause (state files still on disk). Three cases
+    // matter: (1) rebase still paused → conflict-or-edit pause; (2) finished
+    // with Ok → clean completion; (3) finished with Err → terminal failure.
+    let rebase_paused = rebase_in_progress(&path);
+
+    if rebase_paused {
+        // Conflict (or `edit`) pause — leave state dir + tag intact for
+        // continue/abort to consume. Surface the actual stopped commit so
+        // the frontend can highlight it.
+        return Ok(RebaseResult {
+            ok: false,
+            stopped_at: read_rebase_stopped_sha(&path),
+            conflicted_files: list_conflict_files(&path),
+            completed: false,
+            backup_tag,
+        });
+    }
+
+    match result {
+        Ok(_) => {
+            // Clean completion — drop the state dir, KEEP the backup tag
+            // (user-visible safety net surfaced in the success toast).
+            cleanup_rebase_state_dir(&state_dir);
+            *state.rebase_state.lock().unwrap() = None;
+            Ok(RebaseResult {
+                ok: true,
+                stopped_at: None,
+                conflicted_files: Vec::new(),
+                completed: true,
+                backup_tag,
+            })
+        }
+        Err(err) => {
+            // Terminal failure — clean up everything we created.
+            cleanup_rebase_state_dir(&state_dir);
+            delete_rebase_backup_tag(&path, &backup_tag);
+            *state.rebase_state.lock().unwrap() = None;
+            Err(err)
+        }
+    }
+}
+
+// During a rebase pause, .git/rebase-merge/stopped-sha contains the OID of
+// the commit that caused the stop (conflict or `edit`). Best-effort: a
+// missing or unparseable file just yields None, which the frontend tolerates.
+fn read_rebase_stopped_sha(repo_path: &str) -> Option<String> {
+    let gd = git_dir(repo_path).ok()?;
+    let candidates = [
+        gd.join("rebase-merge").join("stopped-sha"),
+        gd.join("rebase-apply").join("stopped-sha"),
+    ];
+    for p in &candidates {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let trimmed = s.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn spawn_rebase(
+    path: &str,
+    base_oid: &str,
+    state_dir: &std::path::Path,
+    state: &State<AppState>,
+) -> Result<String, String> {
+    // We can't reuse run_git_cancellable directly — it doesn't take env
+    // overrides. Instead replicate its slot reservation pattern around a
+    // bespoke spawn that sets the editor envs.
+    let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
+    *state.git_op_pid.lock().unwrap() = Some(GitOpSlot {
+        op_id,
+        pid: None,
+        cancelled: false,
+    });
+
+    let result = (|| -> Result<String, String> {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["rebase", "-i", base_oid])
+            .current_dir(path)
+            .env(
+                "GIT_SEQUENCE_EDITOR",
+                state_dir.join("seq_editor.sh"),
+            )
+            .env("GIT_EDITOR", state_dir.join("commit_editor.sh"))
+            .env("LAUNCHPAD_REBASE_STATE_DIR", state_dir)
+            // Neutralize user wrappers — GIT_*_EDITOR take precedence over
+            // EDITOR/VISUAL/core.editor in git's resolution order, but
+            // clear EDITOR/VISUAL too just in case a user wrapper script
+            // ignores our overrides.
+            .env_remove("EDITOR")
+            .env_remove("VISUAL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        apply_git_env(&mut command);
+
+        let child = command.spawn().map_err(|e| e.to_string())?;
+        let pid = child.id();
+
+        let kill_now = {
+            let mut guard = state.git_op_pid.lock().unwrap();
+            match guard.as_mut() {
+                Some(s) if s.op_id == op_id => {
+                    s.pid = Some(pid);
+                    s.cancelled
+                }
+                _ => false,
+            }
+        };
+        if kill_now {
+            kill_pid_hard(pid);
+        }
+
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+
+        {
+            let mut guard = state.git_op_pid.lock().unwrap();
+            if let Some(s) = guard.as_mut() {
+                if s.op_id == op_id {
+                    s.pid = None;
+                }
+            }
+        }
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    })();
+
+    {
+        let mut guard = state.git_op_pid.lock().unwrap();
+        if let Some(ref s) = *guard {
+            if s.op_id == op_id {
+                *guard = None;
+            }
+        }
+    }
+
+    result
+}
+
+// Common cleanup logic for terminal results from continue/skip/abort.
+// `delete_tag` controls whether the backup tag is also removed (true on
+// abort; false on clean continue/skip — the tag is the user's safety net).
+fn finalize_rebase(state: &State<AppState>, repo_path: &str, delete_tag: bool) {
+    let info = state.rebase_state.lock().unwrap().take();
+    if let Some(info) = info {
+        cleanup_rebase_state_dir(&info.state_dir);
+        if delete_tag {
+            delete_rebase_backup_tag(repo_path, &info.backup_tag);
+        }
+    }
+}
+
+fn run_git_with_rebase_env(
+    args: &[&str],
+    path: &str,
+    state: &State<AppState>,
+) -> Result<String, String> {
+    // Rebase --continue/--skip may invoke commit_editor.sh again (for the
+    // next reword/squash entry), so we have to keep the env vars set.
+    // Replicate run_git_cancellable's slot pattern with the env overrides.
+    let info = state.rebase_state.lock().unwrap().clone();
+    let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
+    *state.git_op_pid.lock().unwrap() = Some(GitOpSlot {
+        op_id,
+        pid: None,
+        cancelled: false,
+    });
+
+    let result = (|| -> Result<String, String> {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(args)
+            .current_dir(path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(info) = info.as_ref() {
+            command
+                .env("GIT_SEQUENCE_EDITOR", info.state_dir.join("seq_editor.sh"))
+                .env("GIT_EDITOR", info.state_dir.join("commit_editor.sh"))
+                .env("LAUNCHPAD_REBASE_STATE_DIR", &info.state_dir)
+                .env_remove("EDITOR")
+                .env_remove("VISUAL");
+        }
+        apply_git_env(&mut command);
+
+        let child = command.spawn().map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let kill_now = {
+            let mut guard = state.git_op_pid.lock().unwrap();
+            match guard.as_mut() {
+                Some(s) if s.op_id == op_id => {
+                    s.pid = Some(pid);
+                    s.cancelled
+                }
+                _ => false,
+            }
+        };
+        if kill_now {
+            kill_pid_hard(pid);
+        }
+
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        {
+            let mut guard = state.git_op_pid.lock().unwrap();
+            if let Some(s) = guard.as_mut() {
+                if s.op_id == op_id {
+                    s.pid = None;
+                }
+            }
+        }
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    })();
+
+    {
+        let mut guard = state.git_op_pid.lock().unwrap();
+        if let Some(ref s) = *guard {
+            if s.op_id == op_id {
+                *guard = None;
+            }
+        }
+    }
+
+    result
+}
+
+#[tauri::command]
+fn git_rebase_continue(path: String, state: State<AppState>) -> Result<RebaseResult, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &state);
+    let still_paused = rebase_in_progress(&path);
+    let backup_tag = state
+        .rebase_state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| i.backup_tag.clone())
+        .unwrap_or_default();
+
+    if still_paused {
+        // Another conflict — keep state dir + tag.
+        return Ok(RebaseResult {
+            ok: false,
+            stopped_at: read_rebase_stopped_sha(&path),
+            conflicted_files: list_conflict_files(&path),
+            completed: false,
+            backup_tag,
+        });
+    }
+
+    // Terminal: rebase finished. Clean up state dir; keep tag on success.
+    let ok = result.is_ok();
+    finalize_rebase(&state, &path, /*delete_tag=*/ false);
+    if !ok {
+        let err = result.err().unwrap_or_else(|| "Rebase continue failed".into());
+        return Err(err);
+    }
+    Ok(RebaseResult {
+        ok: true,
+        stopped_at: None,
+        conflicted_files: Vec::new(),
+        completed: true,
+        backup_tag,
+    })
+}
+
+#[tauri::command]
+fn git_rebase_skip(path: String, state: State<AppState>) -> Result<RebaseResult, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--skip"], &path, &state);
+    let still_paused = rebase_in_progress(&path);
+    let backup_tag = state
+        .rebase_state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| i.backup_tag.clone())
+        .unwrap_or_default();
+
+    if still_paused {
+        return Ok(RebaseResult {
+            ok: false,
+            stopped_at: read_rebase_stopped_sha(&path),
+            conflicted_files: list_conflict_files(&path),
+            completed: false,
+            backup_tag,
+        });
+    }
+    let ok = result.is_ok();
+    finalize_rebase(&state, &path, /*delete_tag=*/ false);
+    if !ok {
+        return Err(result.err().unwrap_or_else(|| "Rebase skip failed".into()));
+    }
+    Ok(RebaseResult {
+        ok: true,
+        stopped_at: None,
+        conflicted_files: Vec::new(),
+        completed: true,
+        backup_tag,
+    })
+}
+
+#[tauri::command]
+fn git_rebase_abort(path: String, state: State<AppState>) -> Result<String, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--abort"], &path, &state);
+    // Abort always cleans up — drop the tag too. Even on abort failure we
+    // still try to drop the state dir (it's our temp resource), but leave
+    // the tag in place so the user can recover manually if abort failed.
+    if result.is_ok() {
+        finalize_rebase(&state, &path, /*delete_tag=*/ true);
+    } else {
+        // Best-effort: clean the state dir without removing the tag.
+        let info = state.rebase_state.lock().unwrap().take();
+        if let Some(info) = info {
+            cleanup_rebase_state_dir(&info.state_dir);
+        }
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// End interactive rebase block
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[tauri::command]
 fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
     let mut checkout = std::process::Command::new("git");
@@ -2757,6 +3430,7 @@ pub fn run() {
         git_op_counter: Arc::new(AtomicU64::new(0)),
         project_windows: Arc::new(Mutex::new(HashMap::new())),
         projects_file_lock: Arc::new(Mutex::new(())),
+        rebase_state: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -2817,6 +3491,11 @@ pub fn run() {
             git_cherry_pick_abort,
             git_cherry_pick_continue,
             get_pending_op_state,
+            get_rebase_candidate_commits,
+            git_rebase_interactive_apply,
+            git_rebase_continue,
+            git_rebase_skip,
+            git_rebase_abort,
             git_resolve_ours,
             git_resolve_theirs,
             git_unstage_file,
@@ -3237,6 +3916,7 @@ mod tests {
             git_op_counter: Arc::new(AtomicU64::new(0)),
             project_windows: Arc::new(Mutex::new(HashMap::new())),
             projects_file_lock: Arc::new(Mutex::new(())),
+            rebase_state: Arc::new(Mutex::new(None)),
         };
         // Tauri's State<T> is created via app handle; here we just verify the
         // validator path by calling the command body indirectly. Simplest:
@@ -3316,6 +3996,182 @@ mod tests {
         assert_eq!(s.kind, "rebase");
         assert_eq!(s.current_step, Some(1));
         assert_eq!(s.total_steps, Some(3));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Interactive rebase tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    fn setup_three_commit_repo() -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+        // Disable any commit signing the user's global config might enable —
+        // the test env has no GPG key.
+        config.set_bool("commit.gpgsign", false).unwrap();
+        let sig = repo.signature().unwrap();
+        let mut oids = Vec::new();
+        let mut parent: Option<git2::Commit> = None;
+
+        for (i, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+            fs::write(dir.path().join(name), format!("line {}\n", i)).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(std::path::Path::new(name)).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            let oid = repo
+                .commit(Some("HEAD"), &sig, &sig, &format!("commit {}", i + 1), &tree, &parents)
+                .unwrap();
+            oids.push(oid.to_string());
+            parent = Some(repo.find_commit(oid).unwrap());
+        }
+        (dir, oids)
+    }
+
+    #[test]
+    fn test_rebase_candidates_no_upstream_caps_at_count() {
+        let (dir, oids) = setup_three_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+        let candidates = get_rebase_candidate_commits(path, 10).unwrap();
+        assert!(!candidates.upstream_known, "no upstream configured");
+        assert_eq!(candidates.commits.len(), 3);
+        // Newest first
+        assert_eq!(candidates.commits[0].oid, oids[2]);
+        assert_eq!(candidates.commits[2].oid, oids[0]);
+        // Local repo only — no remote refs, so all on_remote should be false
+        assert!(candidates.commits.iter().all(|c| !c.on_remote));
+    }
+
+    #[test]
+    fn test_rebase_candidates_detached_head_typed_error() {
+        let (dir, oids) = setup_three_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+        // Detach HEAD at the middle commit
+        let repo = Repository::open(dir.path()).unwrap();
+        let mid_oid = git2::Oid::from_str(&oids[1]).unwrap();
+        repo.set_head_detached(mid_oid).unwrap();
+        drop(repo);
+
+        let err = get_rebase_candidate_commits(path, 10).err().unwrap();
+        assert_eq!(err, "detached_head");
+    }
+
+    #[test]
+    fn test_rebase_candidates_on_remote_flag() {
+        // When a remote-tracking ref points at HEAD, on_remote is true for
+        // that commit and any earlier reachable from it.
+        let (dir, oids) = setup_three_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_oid = git2::Oid::from_str(&oids[2]).unwrap();
+        repo.reference("refs/remotes/origin/main", head_oid, true, "test fixture")
+            .unwrap();
+        drop(repo);
+
+        let candidates = get_rebase_candidate_commits(path, 10).unwrap();
+        // All three commits are reachable from origin/main → all on_remote.
+        assert!(candidates.commits.iter().all(|c| c.on_remote));
+    }
+
+    #[test]
+    fn test_rebase_state_dir_creates_executable_scripts() {
+        // Verifies the script generation independently of running git, so
+        // we don't depend on a system git binary in this assertion.
+        let todo = vec![
+            RebaseTodoEntry { action: "pick".into(), oid: "abc1234".into(), new_message: None },
+        ];
+        let dir = create_rebase_state_dir(&todo).unwrap();
+        assert!(dir.join("state.json").exists());
+        assert!(dir.join("seq_editor.sh").exists());
+        assert!(dir.join("commit_editor.sh").exists());
+
+        use std::os::unix::fs::PermissionsExt;
+        let seq_perms = fs::metadata(dir.join("seq_editor.sh")).unwrap().permissions();
+        assert_eq!(seq_perms.mode() & 0o777, 0o700);
+        let commit_perms = fs::metadata(dir.join("commit_editor.sh")).unwrap().permissions();
+        assert_eq!(commit_perms.mode() & 0o777, 0o700);
+        // Directory is 0o700 — other users on a shared box can't read state.
+        let dir_perms = fs::metadata(&dir).unwrap().permissions();
+        assert_eq!(dir_perms.mode() & 0o777, 0o700);
+        // state.json is 0o600 so a permissive umask doesn't expose contents.
+        let state_perms = fs::metadata(dir.join("state.json")).unwrap().permissions();
+        assert_eq!(state_perms.mode() & 0o777, 0o600);
+
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["version"], 1);
+        assert_eq!(state["todo"][0]["action"], "pick");
+
+        cleanup_rebase_state_dir(&dir);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_rebase_state_dir_round_trips_complex_messages() {
+        // Reword messages can contain newlines, Unicode, quotes, and JSON
+        // metacharacters. serde must round-trip them so commit_editor.sh
+        // (which json.loads the file) writes the literal user content.
+        let messages = [
+            "simple message",
+            "multi\nline\nmessage",
+            "with \"quotes\" and \\backslashes",
+            "Unicode: 日本語 🎉",
+            "shell\\meta;chars`$(echo evil)",
+        ];
+        for msg in messages.iter() {
+            let todo = vec![
+                RebaseTodoEntry {
+                    action: "reword".into(),
+                    oid: "abc1234".into(),
+                    new_message: Some((*msg).into()),
+                },
+            ];
+            let dir = create_rebase_state_dir(&todo).unwrap();
+            let state: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+            assert_eq!(state["todo"][0]["new_message"].as_str().unwrap(), *msg);
+            cleanup_rebase_state_dir(&dir);
+        }
+    }
+
+    #[test]
+    fn test_rebase_backup_tag_lifecycle() {
+        let (dir, _oids) = setup_three_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_before = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        let tag = create_rebase_backup_tag(&repo).unwrap();
+        assert!(tag.starts_with("launchpad/pre-rebase/"));
+
+        // Tag should resolve to HEAD's commit.
+        let tag_ref = repo
+            .find_reference(&format!("refs/tags/{}", tag))
+            .unwrap();
+        assert_eq!(tag_ref.target().unwrap(), head_before);
+
+        // Delete works.
+        delete_rebase_backup_tag(&path, &tag);
+        assert!(repo
+            .find_reference(&format!("refs/tags/{}", tag))
+            .is_err());
+    }
+
+    #[test]
+    fn test_rebase_in_progress_detection() {
+        let (dir, _) = setup_three_commit_repo();
+        let path = dir.path().to_string_lossy().to_string();
+        assert!(!rebase_in_progress(&path));
+
+        // Simulate a rebase pause by writing the state directory git uses.
+        let rd = dir.path().join(".git").join("rebase-merge");
+        fs::create_dir_all(&rd).unwrap();
+        assert!(rebase_in_progress(&path));
+        fs::remove_dir_all(&rd).unwrap();
+        assert!(!rebase_in_progress(&path));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
