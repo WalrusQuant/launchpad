@@ -95,17 +95,23 @@ Files open as tabs alongside your terminal tabs — one unified tab bar. Click a
 - Save with Cmd+S
 
 ### Git Panel
-Open with Cmd+G. A visual git workflow designed so you never have to remember git commands. Stage, commit, push, pull, stash, merge, create branches — all from buttons.
+Open with Cmd+G. A visual git workflow designed so you never have to remember git commands. Stage, commit, push, pull, stash, merge, create branches, amend, cherry-pick, rebase — all from buttons.
 
 - **Quick actions toolbar** — Pull, Push, Fetch, Stash, Pop in one click
 - **Staged vs unstaged split** — clear separation of what's going into your commit
 - **Stage / unstage / discard** — per-file buttons with confirmation on destructive actions
 - **Commit form** — multi-line textarea with conventional commit prefix dropdown (feat/fix/chore/...) and character counter
+- **Amend** — `Amend (with staged)` reuses the index, `Amend message only` keeps the existing tree. Both prompt before rewriting a commit that's already on a remote.
+- **Cherry-pick onto HEAD** — right-click a commit → cherry-pick. Conflicts route through the Pending Operation banner with Continue / Abort.
+- **Interactive rebase** — right-click a commit → "Rebase from here…" opens a dedicated rebase tab. Drag commits to reorder, choose `pick / reword / squash / fixup / drop / edit` per row, then Apply. Conflicts pause the rebase, open the conflicted file inline, and surface Continue / Skip / Abort on the Pending Operation banner. Every interactive rebase creates a backup tag (`rebase-backup-<branch>-<timestamp>`) so you can recover from a bad rewrite.
+- **Pending Operation banner** — when a merge / cherry-pick / rebase is paused, the banner shows the operation kind, current step / total steps (rebase), and the relevant Continue / Skip / Abort buttons. Single source of truth for "what state is git in?"
 - **Branch management** — create, switch, delete, merge branches. View local and remote branches with last commit info
-- **Commit history** — last 30 commits with OID, message, author, and timestamp. Click to expand and see changed files with +/- line counts
+- **Commit history** — last 30 commits with OID, message, author, and timestamp. Click to expand and see changed files with +/- line counts. Right-click for: Compare with HEAD / parent / arbitrary ref, Cherry-pick onto HEAD, Rebase from here, Copy OID.
+- **Compare two refs** — Compare with… opens a dedicated diff tab showing every changed file between the two refs, with full hunks and +/- counts.
 - **Diff preview** — click any changed file to see a structured diff with line numbers and hunk headers
+- **Inline conflict editor** — open a conflicted file and the editor renders an action bar above each conflict block with Accept Ours / Theirs / Both. Save when all blocks are resolved → file auto-stages and the panel updates.
+- **3-pane merge tab** — for tougher conflicts, click Open 3-Way to see ours / merged / theirs side by side. Side panes are read-only; the center pane is editable with synchronized line-aligned scrolling. Save → auto-stages.
 - **GitHub integration** — Open Repo, Open Branch, and Create PR buttons (auto-detected from your remote URL)
-- **Conflict resolution** — when merge conflicts happen, resolve with Ours/Theirs buttons or open the file in the editor
 - **Stash management** — save, pop, apply, and drop stashes
 - **Git cheatsheet** — hit `?` for a plain-English explanation of git concepts
 - **Auto-push with upstream** — first push to a new branch automatically sets up tracking

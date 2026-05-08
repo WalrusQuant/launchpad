@@ -121,7 +121,7 @@
         <p>
           Open with <kbd>⌘G</kbd>. A visual git workflow designed so you never
           have to remember git commands. Stage, commit, push, pull, stash, merge,
-          create branches — all from buttons.
+          create branches, amend, cherry-pick, rebase — all from buttons.
         </p>
 
         <h3>Working with changes</h3>
@@ -130,6 +130,7 @@
           <li><strong>Staged vs unstaged split</strong> — clear separation of what's going into your commit</li>
           <li><strong>Stage / unstage / discard</strong> — per-file buttons with confirmation on destructive actions</li>
           <li><strong>Commit form</strong> — multi-line textarea with conventional commit prefix dropdown (feat / fix / chore / ...) and character counter</li>
+          <li><strong>Amend</strong> — <em>Amend (with staged)</em> reuses the index, <em>Amend message only</em> keeps the existing tree. Both prompt before rewriting a commit that's already on a remote.</li>
           <li><strong>Diff preview</strong> — click any changed file to see a structured diff with line numbers and hunk headers</li>
         </ul>
 
@@ -137,16 +138,33 @@
         <ul>
           <li><strong>Branch management</strong> — create, switch, delete, merge branches. View local and remote branches with last commit info.</li>
           <li><strong>Commit history</strong> — last 30 commits with OID, message, author, and timestamp. Click to expand and see changed files with +/- line counts.</li>
+          <li><strong>Right-click any commit</strong> for: Compare with HEAD / parent / arbitrary ref, Cherry-pick onto HEAD, Rebase from here…, Copy OID.</li>
+          <li><strong>Compare two refs</strong> — opens a dedicated diff tab listing every changed file between the refs, with full hunks and +/- counts.</li>
           <li><strong>Ahead/behind indicators</strong> — see how your branch compares to remote at a glance</li>
           <li><strong>Auto-push with upstream</strong> — first push to a new branch automatically sets up tracking</li>
         </ul>
 
-        <h3>GitHub and conflicts</h3>
+        <h3>Cherry-pick, interactive rebase, pending operations</h3>
         <ul>
-          <li><strong>GitHub integration</strong> — Open Repo, Open Branch, and Create PR buttons (auto-detected from your remote URL, works for SSH and HTTPS)</li>
-          <li><strong>Conflict resolution</strong> — when merge conflicts happen, resolve with Ours / Theirs buttons or open the file in the editor</li>
+          <li><strong>Cherry-pick onto HEAD</strong> — pick a single commit forward; conflicts route through the Pending Operation banner with Continue / Abort.</li>
+          <li><strong>Interactive rebase tab</strong> — right-click → Rebase from here… opens a dedicated composer. Drag commits to reorder, choose <code>pick / reword / squash / fixup / drop / edit</code> per row, then Apply. Conflicts pause the rebase, open the conflicted file inline, and surface Continue / Skip / Abort on the banner.</li>
+          <li><strong>Backup tag</strong> — every interactive rebase creates <code>rebase-backup-&lt;branch&gt;-&lt;timestamp&gt;</code> before any history rewrite, so you can recover from a bad rewrite.</li>
+          <li><strong>Pending Operation banner</strong> — when a merge / cherry-pick / rebase is paused, the banner shows the operation kind, current step / total steps (rebase), and Continue / Skip / Abort buttons.</li>
+        </ul>
+
+        <h3>Conflict resolution</h3>
+        <ul>
+          <li><strong>Inline conflict editor</strong> — open a conflicted file and the editor renders an action bar above each <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code> block with <em>Accept Ours</em> / <em>Theirs</em> / <em>Both</em>. Save when all blocks are resolved → file auto-stages and the panel updates.</li>
+          <li><strong>3-pane merge tab</strong> — for tougher conflicts, click <em>Open 3-Way</em> to see ours / merged / theirs side by side. Side panes are read-only; the center pane is editable with synchronized line-aligned scrolling. Save → auto-stages.</li>
+          <li><strong>Per-file Ours / Theirs / Edit</strong> buttons in the conflicts section for whole-file resolutions.</li>
+        </ul>
+
+        <h3>GitHub and reliability</h3>
+        <ul>
+          <li><strong>GitHub integration</strong> — Open Repo, Open Branch, and Create PR buttons (auto-detected from your remote URL, works for SSH and HTTPS, including <code>git@github.com-alias:</code> ssh-config aliases)</li>
           <li><strong>Stash management</strong> — save, pop, apply, and drop stashes</li>
-          <li><strong>Cancellable network ops</strong> — push, pull, fetch, merge can be cancelled mid-operation</li>
+          <li><strong>Cancellable network ops</strong> — push, pull, fetch, merge can be cancelled mid-operation, even on a stalled TCP connection</li>
+          <li><strong>HTTPS-safe defaults</strong> — no interactive credential prompts (they'd hang forever in a GUI app with no TTY); SSH agent socket forwarded even when launched from Finder</li>
           <li><strong>Git cheatsheet</strong> — hit <kbd>?</kbd> for a plain-English explanation of git concepts</li>
         </ul>
 
