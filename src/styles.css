@@ -29,6 +29,20 @@
   --text-10: #ddd;
   --text-11: #e0e0e0;
   --text-12: #fff;
+
+  /* Accent palette — used for git status, file-type tints, focus rings,
+     and other affordances. Defined here so the file pane (and over time
+     the rest of the app) can theme together. Foundation audit's F12
+     anticipated this; the file-pane work is the first batch of
+     consumers — git panel and editor still use literal hex inline. */
+  --accent-blue:    #57c7ff;
+  --accent-green:   #5af78e;
+  --accent-red:     #ff5f56;
+  --accent-yellow:  #f3f99d;
+  --accent-warm:    #e5c07b;
+  --accent-cyan:    #9aedfe;
+  --accent-teal:    #7ed6df;
+  --accent-magenta: #ff6ac1;
 }
 
 [data-theme="light"] {
@@ -62,6 +76,17 @@
   --text-10: #2a2a2a;
   --text-11: #1a1a1a;
   --text-12: #000000;
+
+  /* Light-theme accents — slightly desaturated/darkened from the dark
+     palette so they read on a white background without burning. */
+  --accent-blue:    #1e88e5;
+  --accent-green:   #2da458;
+  --accent-red:     #d04040;
+  --accent-yellow:  #b89400;
+  --accent-warm:    #b27822;
+  --accent-cyan:    #18809f;
+  --accent-teal:    #128f9b;
+  --accent-magenta: #b73388;
 }
 
 * {
@@ -456,7 +481,7 @@ html, body, #app {
 }
 
 #file-search-input:focus {
-  border-color: #57c7ff;
+  border-color: var(--accent-blue);
 }
 
 /* File tree */
@@ -481,7 +506,61 @@ html, body, #app {
   background: var(--surface-8);
 }
 
+/* Keyboard focus ring — distinct from hover so a keyboard user knows
+   exactly where their place in the tree is. Uses :focus-visible so a
+   plain mouse click on a row doesn't draw the ring (the row gets the
+   roving tabindex but the user didn't request keyboard nav). */
+.file-entry:focus {
+  outline: none;
+  background: var(--surface-8);
+}
+.file-entry:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+}
+
+/* Multi-selection — distinct from hover (transient) and focus (single
+   row). The blue tint matches Finder / VS Code conventions for
+   selection. Combines with .git-* color classes since we only paint the
+   row background, not the file-name color. */
+.file-entry.selected {
+  background: color-mix(in srgb, var(--accent-blue) 20%, transparent);
+}
+.file-entry.selected:hover {
+  background: color-mix(in srgb, var(--accent-blue) 28%, transparent);
+}
+
+/* Drop-target highlight applied during dragover on a directory row that
+   accepts an internal file move. Distinct from selection / hover so the
+   user knows where the drop will land. */
+.file-entry.drop-target {
+  background: color-mix(in srgb, var(--accent-green) 22%, transparent);
+  outline: 1px dashed var(--accent-green);
+  outline-offset: -1px;
+}
+
 .file-entry.dir {
+  color: var(--text-11);
+}
+
+/* Twirl chevron — visual affordance for directory expandability. Always
+   present in the row layout (empty for files, search hits, and the
+   inline create placeholder) so the icon/name columns stay aligned
+   regardless of row type. The chevron itself is the explicit toggle
+   target; clicking elsewhere on a directory row also toggles, matching
+   VS Code defaults. */
+.file-chevron {
+  width: 12px;
+  text-align: center;
+  font-size: 9px;
+  flex-shrink: 0;
+  color: var(--text-2);
+  user-select: none;
+}
+.file-entry.dir > .file-chevron {
+  cursor: pointer;
+}
+.file-entry.dir > .file-chevron:hover {
   color: var(--text-11);
 }
 
@@ -506,14 +585,29 @@ html, body, #app {
   margin-left: auto;
 }
 
+/* Subtitle used by flat search results to show the parent directory of a
+   match, since multiple files in a project can share a basename. Right-
+   aligned so the basename column stays scannable. */
+.file-search-path {
+  font-size: 10px;
+  color: var(--text-0);
+  flex-shrink: 1;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 50%;
+  padding-left: 8px;
+}
+
 /* File type colors */
-.type-js .file-name { color: #f3f99d; }
-.type-py .file-name { color: #5af78e; }
-.type-rs .file-name { color: #ff6ac1; }
-.type-config .file-name { color: #9aedfe; }
+.type-js .file-name { color: var(--accent-yellow); }
+.type-py .file-name { color: var(--accent-green); }
+.type-rs .file-name { color: var(--accent-magenta); }
+.type-config .file-name { color: var(--accent-cyan); }
 .type-doc .file-name { color: var(--text-3); }
-.type-web .file-name { color: #ff5f56; }
-.dir .file-name { color: #57c7ff; }
+.type-web .file-name { color: var(--accent-red); }
+.dir .file-name { color: var(--accent-blue); }
 
 .dir-children {
   /* nested directory contents */
@@ -526,13 +620,80 @@ html, body, #app {
   font-style: italic;
 }
 
-/* Git status colors — override file type colors for changed files */
-.git-modified .file-name { color: #e5c07b !important; }
-.git-new .file-name { color: #5af78e !important; }
-.git-deleted .file-name { color: #ff5f56 !important; text-decoration: line-through; }
-.git-staged .file-name { color: #5af78e !important; }
-.git-conflict .file-name { color: #ff6ac1 !important; }
-.git-renamed .file-name { color: #9aedfe !important; }
+/* Empty-folder state shown at depth 0 when read_directory returns no
+   visible entries (after the hidden-files filter). Distinct from
+   .file-error which signals a read failure. */
+.file-empty-state {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-1);
+}
+.file-empty-title {
+  font-size: 12px;
+  margin-bottom: 4px;
+  color: var(--text-3);
+}
+.file-empty-hint {
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Inline rename input — appears in place of .file-name when the user picks
+   Rename from the context menu. .invalid is set live by JS while the input
+   contains an illegal filename component (slash, dot-dot, etc.). */
+.file-rename-input {
+  background: var(--surface-2);
+  border: 1px solid var(--border-3);
+  color: var(--text-11);
+  font: inherit;
+  padding: 1px 4px;
+  width: 100%;
+  outline: none;
+  border-radius: 2px;
+}
+.file-rename-input:focus {
+  border-color: var(--accent-blue);
+}
+.file-rename-input.invalid,
+.file-rename-input.invalid:focus {
+  border-color: var(--accent-red);
+}
+
+/* Git status colors — override file type colors for changed files.
+   Staged uses a different hue from untracked (was both green) so a file
+   that's been `git add`ed visibly differs from one that's never been
+   tracked. Color is the at-a-glance signal; the .file-git-badge below
+   carries the same information textually for monochrome / a11y. */
+.git-modified .file-name { color: var(--accent-warm) !important; }
+.git-new .file-name { color: var(--accent-green) !important; }
+.git-deleted .file-name { color: var(--accent-red) !important; text-decoration: line-through; }
+.git-staged .file-name { color: var(--accent-teal) !important; }
+.git-conflict .file-name { color: var(--accent-magenta) !important; }
+.git-renamed .file-name { color: var(--accent-cyan) !important; }
+
+/* Single-char git-status badge slot. Always present in the row layout
+   (empty when the file is clean) so toggling visibility doesn't shift
+   the file-size column. The badge color follows the .git-* class set on
+   the row, since it shares the parent's color via inheritance for the
+   most part — but we lock specific badge colors here so a yellow modified
+   doesn't get washed out against the same hue as the filename. */
+.file-git-badge {
+  display: inline-block;
+  width: 12px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  flex-shrink: 0;
+  margin-left: 4px;
+  color: var(--text-3);
+  font-family: "SF Mono", "Menlo", monospace;
+}
+.git-modified  .file-git-badge { color: var(--accent-warm); }
+.git-new       .file-git-badge { color: var(--accent-green); }
+.git-deleted   .file-git-badge { color: var(--accent-red); }
+.git-staged    .file-git-badge { color: var(--accent-teal); }
+.git-conflict  .file-git-badge { color: var(--accent-magenta); }
+.git-renamed   .file-git-badge { color: var(--accent-cyan); }
 
 /* Terminal */
 #terminal-container {

@@ -64,6 +64,23 @@ export async function fetchGitStatus(path) {
   }
 }
 
+// Single-character badges shown next to each file's name in the file pane.
+// Same vocabulary git itself uses (M/A/D/R/U) plus `?` for untracked and
+// `!` for conflict. Color (via the .git-* class) carries the same signal
+// for non-colorblind users; the badge gives an explicit, equally-visible
+// channel that works in monochrome and screen-reader contexts.
+const GIT_STATUS_BADGE = {
+  modified: "M",
+  new: "?",
+  deleted: "D",
+  conflict: "!",
+  renamed: "R",
+  index_new: "A",
+  index_modified: "M",
+  index_deleted: "D",
+  index_renamed: "R",
+};
+
 function applyGitColors() {
   if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return;
 
@@ -80,6 +97,11 @@ function applyGitColors() {
       "git-modified", "git-new", "git-deleted", "git-staged", "git-conflict", "git-renamed",
       "git-index_new", "git-index_modified", "git-index_deleted", "git-index_renamed"
     );
+    // Clear any prior badge before deciding whether to set a new one;
+    // otherwise a file that just transitioned modified→clean would keep
+    // its old badge.
+    const badge = el.querySelector(".file-git-badge");
+    if (badge) badge.textContent = "";
 
     const filePath = el.dataset.path;
     if (!filePath || !filePath.startsWith(rootWithSlash)) return;
@@ -106,6 +128,7 @@ function applyGitColors() {
       } else {
         el.classList.add(`git-${matched}`);
       }
+      if (badge) badge.textContent = GIT_STATUS_BADGE[matched] || "";
     }
   });
 }

@@ -1225,6 +1225,23 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+// Hand `path` off to the OS to open with the user's default application
+// for that file type — the macOS `open` CLI does this. PDF → Preview,
+// PNG → Preview, .xcodeproj → Xcode, etc. No-op for paths that don't
+// resolve; we surface the `open` command's exit status so the frontend
+// can show the actual error rather than a silent failure.
+#[tauri::command]
+fn open_in_default_app(path: String) -> Result<(), String> {
+    let output = std::process::Command::new("open")
+        .arg(&path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, String> {
     let limit = max_bytes.unwrap_or(8192);
@@ -3736,6 +3753,7 @@ pub fn run() {
             search_in_files,
             pick_directory,
             reveal_in_finder,
+            open_in_default_app,
             read_file_preview,
             write_file,
             create_file,
