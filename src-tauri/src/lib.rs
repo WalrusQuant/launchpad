@@ -2537,8 +2537,13 @@ fn git_rebase_interactive_apply(
     todo: Vec<RebaseTodoEntry>,
     state: State<AppState>,
 ) -> Result<RebaseResult, String> {
-    if !is_valid_git_oid(&base_oid) {
-        return Err("Invalid base oid".into());
+    // Accept either a literal OID or a rev expression (HEAD^, abc1234~2, a
+    // branch name). Validate via the ref/oid grammar (so shell metachars
+    // stay out), then revparse_single below to a concrete OID before
+    // shelling out. This lets the frontend pass `<oid>^` for "rebase from
+    // here" without needing a separate parent-resolution IPC.
+    if !is_valid_git_ref(&base_oid) && !is_valid_git_oid(&base_oid) {
+        return Err("Invalid base ref".into());
     }
     for entry in &todo {
         if !VALID_REBASE_ACTIONS.contains(&entry.action.as_str()) {
@@ -2548,6 +2553,22 @@ fn git_rebase_interactive_apply(
             return Err(format!("Invalid commit oid: {}", entry.oid));
         }
     }
+
+    // Resolve the (possibly rev-expression) base to a concrete OID up front
+    // — both for cleaner argv to `git rebase -i` and so the frontend gets
+    // a real OID back in `stopped_at` if anything goes wrong.
+    let resolved_base = {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        // Compute the OID inside the same scope as `repo` so the borrow
+        // graph (obj → repo) stays valid; only the resulting String escapes.
+        let oid = repo
+            .revparse_single(&base_oid)
+            .map_err(|e| format!("Resolve `{}`: {}", base_oid, e))?
+            .peel_to_commit()
+            .map_err(|e| format!("`{}` does not resolve to a commit: {}", base_oid, e))?
+            .id();
+        oid.to_string()
+    };
 
     // Hold the rebase_state lock across the in-progress check + tag/dir
     // creation + register, so two near-simultaneous IPC calls can't both
@@ -2580,7 +2601,7 @@ fn git_rebase_interactive_apply(
         (backup_tag, state_dir)
     };
 
-    let result = spawn_rebase(&path, &base_oid, &state_dir, &state);
+    let result = spawn_rebase(&path, &resolved_base, &state_dir, &state);
 
     // Inspect git's repo state to decide whether this was a terminal result
     // (rebase finished) or a pause (state files still on disk). Three cases
