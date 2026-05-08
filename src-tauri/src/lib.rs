@@ -13,6 +13,15 @@ use tauri::{Emitter, Manager, State};
 
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 
+// Tauri event names. Mirror src/events.js — keep both lists in sync, since
+// a typo on either side silently drops events. Centralizing here also makes
+// "what events does the backend emit?" answerable in one grep.
+mod events {
+    pub const PTY_OUTPUT: &str = "pty-output";
+    pub const PTY_EXIT: &str = "pty-exit";
+    pub const FS_CHANGED: &str = "fs-changed";
+}
+
 // Each tab has its own PTY writer and master
 struct PtyInstance {
     writer: Box<dyn Write + Send>,
@@ -32,12 +41,15 @@ struct AppState {
     ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
     fs_watcher: Arc<Mutex<HashMap<String, FsWatcher>>>,
-    // In-flight git network operation (push/pull/fetch). The slot is reserved
-    // BEFORE spawn so a cancel arriving in the window between spawn() and
-    // PID-record is still observed and applied. `op_id` (from git_op_counter)
-    // tags each op so cleanup can tell whether the slot still belongs to us
-    // or has been claimed by a later operation.
-    git_op_pid: Arc<Mutex<Option<GitOpSlot>>>,
+    // In-flight git network operations (push/pull/fetch/merge/cherry-pick/
+    // rebase), keyed by Tauri window label. Each window owns its own slot
+    // so two windows running concurrent agents can't clobber each other's
+    // cancellation state. The slot is reserved BEFORE spawn so a cancel
+    // arriving in the window between spawn() and PID-record is still
+    // observed and applied. `op_id` (from git_op_counter) tags each op so
+    // cleanup can tell whether the slot still belongs to us or has been
+    // claimed by a later operation in the same window.
+    git_op_slots: Arc<Mutex<GitOpSlots>>,
     git_op_counter: Arc<AtomicU64>,
     // Canonicalized project path → Tauri window label. Used by focus_project_window
     // to focus an existing window instead of opening a duplicate. Stale entries are
@@ -78,6 +90,48 @@ struct PtyExit {
 #[derive(Clone, Serialize)]
 struct FsChanged {
     path: String,
+    // Canonical paths of files/dirs that changed in this debounce batch,
+    // already filtered against the noise skip list (.git/, node_modules/,
+    // target/, etc.). The frontend uses this to scope the editor-tab
+    // re-read pass to only changed files instead of every open tab.
+    // Empty after filtering means the whole batch was noise — but in
+    // that case we don't emit at all, so consumers never see this empty.
+    changed_paths: Vec<String>,
+}
+
+// Names of directories whose internal churn should never trigger a UI
+// refresh — `git checkout`, `npm install`, `cargo build`, etc. produce
+// thousands of events inside these that are pure noise from the workspace's
+// perspective. Same skip list as `search_files` / `find_path_by_inode` so
+// "what the user sees" stays consistent across the file browser, search,
+// and live refresh.
+const FS_NOISE_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    "dist",
+    "build",
+];
+
+// Returns true when `event_path` should be ignored — i.e. it's inside one
+// of `FS_NOISE_DIRS` *relative to the watched root*. Components above the
+// root are not consulted (a user whose home dir happens to be named
+// `target` shouldn't have every event filtered out).
+fn fs_event_is_noise(event_path: &std::path::Path, root: &std::path::Path) -> bool {
+    let relative = match event_path.strip_prefix(root) {
+        Ok(r) => r,
+        // Outside the watched root — let it through; it shouldn't reach us
+        // anyway, but better to surface than to silently drop.
+        Err(_) => return false,
+    };
+    relative.components().any(|c| match c {
+        std::path::Component::Normal(name) => {
+            let s = name.to_string_lossy();
+            FS_NOISE_DIRS.iter().any(|noise| s == *noise)
+        }
+        _ => false,
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -180,7 +234,7 @@ fn spawn_pty(cwd: Option<String>, project_path: Option<String>, rows: Option<u16
     std::thread::spawn(move || {
         let _ = child.wait();
         let _ = ptys_clone.lock().map(|mut ptys| { ptys.remove(&tab_id); });
-        let _ = handle2.emit("pty-exit", PtyExit { tab_id });
+        let _ = handle2.emit(events::PTY_EXIT, PtyExit { tab_id });
     });
 
     Ok(SpawnResult { tab_id })
@@ -204,41 +258,47 @@ fn start_pty_reader(tab_id: u32, state: State<AppState>, app: tauri::AppHandle) 
 
     let handle = app.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut leftover = Vec::new();
-        loop {
-            // Flow control: sleep while the frontend signals backpressure.
-            // Data stays in the OS PTY buffer — nothing is lost.
-            while paused.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    leftover.extend_from_slice(&buf[..n]);
-                    let valid_up_to = match std::str::from_utf8(&leftover) {
-                        Ok(_) => leftover.len(),
-                        Err(e) => e.valid_up_to(),
-                    };
-                    if valid_up_to > 0 {
-                        let output = String::from_utf8(leftover[..valid_up_to].to_vec())
-                            .expect("valid_up_to guarantees valid UTF-8");
-                        let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
-                        leftover = leftover[valid_up_to..].to_vec();
-                    } else if leftover.len() > 64 * 1024 {
-                        // A valid UTF-8 continuation is at most 3 bytes; if we
-                        // have 64KB of invalid bytes with no valid prefix, the
-                        // stream is corrupted (binary garbage, crashed shell,
-                        // wrong encoding). Flush as replacement characters so
-                        // the buffer can't grow without bound.
-                        let output = String::from_utf8_lossy(&leftover).into_owned();
-                        let _ = handle.emit("pty-output", PtyOutput { tab_id, data: output });
-                        leftover.clear();
-                    }
+        // catch_unwind so a panic in the reader (e.g. inside Tauri's emit
+        // serialization, or a future addition that touches AppState mutexes)
+        // gets logged via the global panic hook instead of unwinding the
+        // thread and risking poisoning of any mutex it might hold.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut buf = [0u8; 4096];
+            let mut leftover = Vec::new();
+            loop {
+                // Flow control: sleep while the frontend signals backpressure.
+                // Data stays in the OS PTY buffer — nothing is lost.
+                while paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => break,
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        leftover.extend_from_slice(&buf[..n]);
+                        let valid_up_to = match std::str::from_utf8(&leftover) {
+                            Ok(_) => leftover.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid_up_to > 0 {
+                            let output = String::from_utf8(leftover[..valid_up_to].to_vec())
+                                .expect("valid_up_to guarantees valid UTF-8");
+                            let _ = handle.emit(events::PTY_OUTPUT, PtyOutput { tab_id, data: output });
+                            leftover = leftover[valid_up_to..].to_vec();
+                        } else if leftover.len() > 64 * 1024 {
+                            // A valid UTF-8 continuation is at most 3 bytes; if we
+                            // have 64KB of invalid bytes with no valid prefix, the
+                            // stream is corrupted (binary garbage, crashed shell,
+                            // wrong encoding). Flush as replacement characters so
+                            // the buffer can't grow without bound.
+                            let output = String::from_utf8_lossy(&leftover).into_owned();
+                            let _ = handle.emit(events::PTY_OUTPUT, PtyOutput { tab_id, data: output });
+                            leftover.clear();
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-        }
+        }));
     });
 
     Ok(())
@@ -1770,6 +1830,10 @@ struct GitOpSlot {
     cancelled: bool,
 }
 
+// Per-window git op tracking, keyed by `tauri::Window::label()`. At most one
+// entry per window; absent key means no in-flight op for that window.
+type GitOpSlots = HashMap<String, GitOpSlot>;
+
 // SIGKILL, not SIGTERM. A git process blocked on a stalled TCP recv() often
 // ignores SIGTERM — which is the exact situation cancel is supposed to
 // escape — so we skip the polite signal and go straight to -9.
@@ -1840,15 +1904,17 @@ fn apply_git_env(cmd: &mut std::process::Command) {
 }
 
 // Spawn a git child under an already-reserved slot (caller owns the
-// reservation and the final cleanup). Records the PID on the slot, honors a
-// cancel that arrived during the spawn window by killing immediately, and
-// on return clears the PID on the slot so a subsequent call under the same
-// reservation gets a fresh pid field and can't accidentally target the
-// wrong child. The cancelled flag persists across calls on the same slot.
+// reservation and the final cleanup). Records the PID on the per-window slot,
+// honors a cancel that arrived during the spawn window by killing
+// immediately, and on return clears the PID on the slot so a subsequent call
+// under the same reservation gets a fresh pid field and can't accidentally
+// target the wrong child. The cancelled flag persists across calls on the
+// same slot.
 fn spawn_git_under_slot(
     args: &[&str],
     path: &str,
-    pid_store: &Arc<Mutex<Option<GitOpSlot>>>,
+    slots: &Arc<Mutex<GitOpSlots>>,
+    label: &str,
     op_id: u64,
 ) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
@@ -1863,14 +1929,15 @@ fn spawn_git_under_slot(
     let pid = child.id();
 
     let kill_now = {
-        let mut guard = pid_store.lock().unwrap();
-        match guard.as_mut() {
+        let mut guard = slots.lock().unwrap();
+        match guard.get_mut(label) {
             Some(s) if s.op_id == op_id => {
                 s.pid = Some(pid);
                 s.cancelled
             }
-            // Slot was claimed by a later op (concurrent push/pull from two
-            // clicks). Treat as not-ours; the other op owns cancellation now.
+            // Slot for this window was claimed by a later op (concurrent
+            // push/pull from two clicks in the same window). Treat as
+            // not-ours; the other op owns cancellation now.
             _ => false,
         }
     };
@@ -1884,8 +1951,8 @@ fn spawn_git_under_slot(
     // another spawn under the same reservation (git_push's auto-upstream
     // retry does this), and we want the shared `cancelled` flag to persist.
     {
-        let mut guard = pid_store.lock().unwrap();
-        if let Some(s) = guard.as_mut() {
+        let mut guard = slots.lock().unwrap();
+        if let Some(s) = guard.get_mut(label) {
             if s.op_id == op_id {
                 s.pid = None;
             }
@@ -1901,34 +1968,40 @@ fn spawn_git_under_slot(
     }
 }
 
-// Reserve a slot, spawn a single git command, clean up. For multi-step ops
-// (e.g. push-then-retry-with-upstream) that need a cancel to span the full
-// sequence, reserve a slot manually and call spawn_git_under_slot directly.
+// Reserve a slot for `label`, spawn a single git command, clean up. For
+// multi-step ops (e.g. push-then-retry-with-upstream) that need a cancel to
+// span the full sequence, reserve a slot manually and call
+// spawn_git_under_slot directly.
 fn run_git_cancellable(
     args: &[&str],
     path: &str,
-    pid_store: &Arc<Mutex<Option<GitOpSlot>>>,
+    slots: &Arc<Mutex<GitOpSlots>>,
     counter: &Arc<AtomicU64>,
+    label: &str,
 ) -> Result<String, String> {
     // Reserve the slot BEFORE spawn. If cancel arrives in the window between
     // spawn() and PID-record, it sets `cancelled=true` on our slot, which
     // spawn_git_under_slot observes and acts on by killing the child.
     let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    *pid_store.lock().unwrap() = Some(GitOpSlot {
-        op_id,
-        pid: None,
-        cancelled: false,
-    });
+    slots.lock().unwrap().insert(
+        label.to_string(),
+        GitOpSlot {
+            op_id,
+            pid: None,
+            cancelled: false,
+        },
+    );
 
-    let result = spawn_git_under_slot(args, path, pid_store, op_id);
+    let result = spawn_git_under_slot(args, path, slots, label, op_id);
 
     // Only clear the slot if it still matches our op. A subsequent operation
-    // may already have replaced it — in that case leave it alone.
+    // in the same window may already have replaced it — in that case leave
+    // it alone.
     {
-        let mut guard = pid_store.lock().unwrap();
-        if let Some(ref s) = *guard {
+        let mut guard = slots.lock().unwrap();
+        if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
-                *guard = None;
+                guard.remove(label);
             }
         }
     }
@@ -1956,32 +2029,41 @@ fn git_upstream_status(path: &str) -> (bool, Option<String>) {
 }
 
 #[tauri::command]
-fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
-    let pid_store = Arc::clone(&state.git_op_pid);
+fn git_push(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
+    let slots = Arc::clone(&state.git_op_slots);
     let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label();
 
     let (has_upstream, branch) = git_upstream_status(&path);
 
     // Reserve ONE slot that spans both the initial push and the optional
     // auto-upstream retry. A cancel arriving in the window between the two
-    // attempts would otherwise find an empty pid_store and be lost — with
-    // one shared reservation, the cancelled flag persists and the retry's
-    // child is killed as soon as it's spawned.
+    // attempts would otherwise find an empty slot and be lost — with one
+    // shared reservation, the cancelled flag persists and the retry's child
+    // is killed as soon as it's spawned.
     let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    *pid_store.lock().unwrap() = Some(GitOpSlot {
-        op_id,
-        pid: None,
-        cancelled: false,
-    });
+    slots.lock().unwrap().insert(
+        label.to_string(),
+        GitOpSlot {
+            op_id,
+            pid: None,
+            cancelled: false,
+        },
+    );
 
     let result = if has_upstream {
-        spawn_git_under_slot(&["push"], &path, &pid_store, op_id)
+        spawn_git_under_slot(&["push"], &path, &slots, label, op_id)
     } else {
         match branch {
             Some(b) if !b.is_empty() => spawn_git_under_slot(
                 &["push", "--set-upstream", "origin", &b],
                 &path,
-                &pid_store,
+                &slots,
+                label,
                 op_id,
             ),
             _ => Err("Could not determine current branch for upstream push".to_string()),
@@ -1990,10 +2072,10 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
 
     // Release the reservation.
     {
-        let mut guard = pid_store.lock().unwrap();
-        if let Some(ref s) = *guard {
+        let mut guard = slots.lock().unwrap();
+        if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
-                *guard = None;
+                guard.remove(label);
             }
         }
     }
@@ -2002,36 +2084,46 @@ fn git_push(path: String, state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn git_pull(path: String, state: State<AppState>) -> Result<String, String> {
+fn git_pull(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
     run_git_cancellable(
         &["pull", "--prune"],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     )
 }
 
 #[tauri::command]
-fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
+fn git_fetch(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
     run_git_cancellable(
         &["fetch", "--all", "--prune"],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     )
 }
 
-// Mark the active git slot cancelled and return the PID (if any) that the
-// caller should kill. Split out so tests can exercise the state machine
-// without spawning a real git process.
+// Mark the active git slot for `label` cancelled and return the PID (if any)
+// that the caller should kill. Split out so tests can exercise the state
+// machine without spawning a real git process.
 //
-// Slot is intentionally NOT cleared here — run_git_cancellable's cleanup
-// only clears when its own op_id matches, so a stale cancel can't wipe a
+// Slot is intentionally NOT removed here — run_git_cancellable's cleanup
+// only removes when its own op_id matches, so a stale cancel can't wipe a
 // newer op's registration. The cancelled flag persists so a still-spawning
 // op can observe it after recording its PID.
-fn cancel_git_op_inner(pid_store: &Mutex<Option<GitOpSlot>>) -> Option<u32> {
-    let mut guard = pid_store.lock().unwrap();
-    if let Some(slot) = guard.as_mut() {
+fn cancel_git_op_inner(slots: &Mutex<GitOpSlots>, label: &str) -> Option<u32> {
+    let mut guard = slots.lock().unwrap();
+    if let Some(slot) = guard.get_mut(label) {
         slot.cancelled = true;
         return slot.pid;
     }
@@ -2039,8 +2131,8 @@ fn cancel_git_op_inner(pid_store: &Mutex<Option<GitOpSlot>>) -> Option<u32> {
 }
 
 #[tauri::command]
-fn cancel_git_op(state: State<AppState>) -> Result<(), String> {
-    if let Some(pid) = cancel_git_op_inner(&state.git_op_pid) {
+fn cancel_git_op(state: State<AppState>, window: tauri::Window) -> Result<(), String> {
+    if let Some(pid) = cancel_git_op_inner(&state.git_op_slots, window.label()) {
         kill_pid_hard(pid);
     }
     Ok(())
@@ -2076,6 +2168,7 @@ fn git_merge_branch(
     path: String,
     branch_name: String,
     state: State<AppState>,
+    window: tauri::Window,
 ) -> Result<String, String> {
     if !is_valid_git_ref(&branch_name) {
         return Err("Invalid branch name".into());
@@ -2086,8 +2179,9 @@ fn git_merge_branch(
     run_git_cancellable(
         &["merge", &branch_name],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     )
 }
 
@@ -2119,6 +2213,7 @@ fn git_cherry_pick(
     path: String,
     oid: String,
     state: State<AppState>,
+    window: tauri::Window,
 ) -> Result<CherryPickResult, String> {
     if !is_valid_git_oid(&oid) {
         return Err("Invalid commit OID".into());
@@ -2126,8 +2221,9 @@ fn git_cherry_pick(
     let result = run_git_cancellable(
         &["cherry-pick", &oid],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     );
     match result {
         Ok(_) => Ok(CherryPickResult { ok: true, conflicted_files: Vec::new() }),
@@ -2149,22 +2245,32 @@ fn git_cherry_pick(
 }
 
 #[tauri::command]
-fn git_cherry_pick_abort(path: String, state: State<AppState>) -> Result<String, String> {
+fn git_cherry_pick_abort(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
     run_git_cancellable(
         &["cherry-pick", "--abort"],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     )
 }
 
 #[tauri::command]
-fn git_cherry_pick_continue(path: String, state: State<AppState>) -> Result<String, String> {
+fn git_cherry_pick_continue(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
     run_git_cancellable(
         &["cherry-pick", "--continue"],
         &path,
-        &Arc::clone(&state.git_op_pid),
+        &Arc::clone(&state.git_op_slots),
         &Arc::clone(&state.git_op_counter),
+        window.label(),
     )
 }
 
@@ -2536,6 +2642,7 @@ fn git_rebase_interactive_apply(
     base_oid: String,
     todo: Vec<RebaseTodoEntry>,
     state: State<AppState>,
+    window: tauri::Window,
 ) -> Result<RebaseResult, String> {
     // Accept either a literal OID or a rev expression (HEAD^, abc1234~2, a
     // branch name). Validate via the ref/oid grammar (so shell metachars
@@ -2601,7 +2708,7 @@ fn git_rebase_interactive_apply(
         (backup_tag, state_dir)
     };
 
-    let result = spawn_rebase(&path, &resolved_base, &state_dir, &state);
+    let result = spawn_rebase(&path, &resolved_base, &state_dir, &state, window.label());
 
     // Inspect git's repo state to decide whether this was a terminal result
     // (rebase finished) or a pause (state files still on disk). Three cases
@@ -2671,16 +2778,20 @@ fn spawn_rebase(
     base_oid: &str,
     state_dir: &std::path::Path,
     state: &State<AppState>,
+    label: &str,
 ) -> Result<String, String> {
     // We can't reuse run_git_cancellable directly — it doesn't take env
     // overrides. Instead replicate its slot reservation pattern around a
     // bespoke spawn that sets the editor envs.
     let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
-    *state.git_op_pid.lock().unwrap() = Some(GitOpSlot {
-        op_id,
-        pid: None,
-        cancelled: false,
-    });
+    state.git_op_slots.lock().unwrap().insert(
+        label.to_string(),
+        GitOpSlot {
+            op_id,
+            pid: None,
+            cancelled: false,
+        },
+    );
 
     let result = (|| -> Result<String, String> {
         let mut command = std::process::Command::new("git");
@@ -2707,8 +2818,8 @@ fn spawn_rebase(
         let pid = child.id();
 
         let kill_now = {
-            let mut guard = state.git_op_pid.lock().unwrap();
-            match guard.as_mut() {
+            let mut guard = state.git_op_slots.lock().unwrap();
+            match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
                     s.cancelled
@@ -2723,8 +2834,8 @@ fn spawn_rebase(
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
         {
-            let mut guard = state.git_op_pid.lock().unwrap();
-            if let Some(s) = guard.as_mut() {
+            let mut guard = state.git_op_slots.lock().unwrap();
+            if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
                 }
@@ -2739,10 +2850,10 @@ fn spawn_rebase(
     })();
 
     {
-        let mut guard = state.git_op_pid.lock().unwrap();
-        if let Some(ref s) = *guard {
+        let mut guard = state.git_op_slots.lock().unwrap();
+        if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
-                *guard = None;
+                guard.remove(label);
             }
         }
     }
@@ -2767,17 +2878,21 @@ fn run_git_with_rebase_env(
     args: &[&str],
     path: &str,
     state: &State<AppState>,
+    label: &str,
 ) -> Result<String, String> {
     // Rebase --continue/--skip may invoke commit_editor.sh again (for the
     // next reword/squash entry), so we have to keep the env vars set.
     // Replicate run_git_cancellable's slot pattern with the env overrides.
     let info = state.rebase_state.lock().unwrap().clone();
     let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
-    *state.git_op_pid.lock().unwrap() = Some(GitOpSlot {
-        op_id,
-        pid: None,
-        cancelled: false,
-    });
+    state.git_op_slots.lock().unwrap().insert(
+        label.to_string(),
+        GitOpSlot {
+            op_id,
+            pid: None,
+            cancelled: false,
+        },
+    );
 
     let result = (|| -> Result<String, String> {
         let mut command = std::process::Command::new("git");
@@ -2799,8 +2914,8 @@ fn run_git_with_rebase_env(
         let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         let kill_now = {
-            let mut guard = state.git_op_pid.lock().unwrap();
-            match guard.as_mut() {
+            let mut guard = state.git_op_slots.lock().unwrap();
+            match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
                     s.cancelled
@@ -2814,8 +2929,8 @@ fn run_git_with_rebase_env(
 
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
         {
-            let mut guard = state.git_op_pid.lock().unwrap();
-            if let Some(s) = guard.as_mut() {
+            let mut guard = state.git_op_slots.lock().unwrap();
+            if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
                 }
@@ -2830,10 +2945,10 @@ fn run_git_with_rebase_env(
     })();
 
     {
-        let mut guard = state.git_op_pid.lock().unwrap();
-        if let Some(ref s) = *guard {
+        let mut guard = state.git_op_slots.lock().unwrap();
+        if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
-                *guard = None;
+                guard.remove(label);
             }
         }
     }
@@ -2842,8 +2957,12 @@ fn run_git_with_rebase_env(
 }
 
 #[tauri::command]
-fn git_rebase_continue(path: String, state: State<AppState>) -> Result<RebaseResult, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &state);
+fn git_rebase_continue(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<RebaseResult, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &state, window.label());
     let still_paused = rebase_in_progress(&path);
     let backup_tag = state
         .rebase_state
@@ -2881,8 +3000,12 @@ fn git_rebase_continue(path: String, state: State<AppState>) -> Result<RebaseRes
 }
 
 #[tauri::command]
-fn git_rebase_skip(path: String, state: State<AppState>) -> Result<RebaseResult, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--skip"], &path, &state);
+fn git_rebase_skip(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<RebaseResult, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--skip"], &path, &state, window.label());
     let still_paused = rebase_in_progress(&path);
     let backup_tag = state
         .rebase_state
@@ -2916,8 +3039,12 @@ fn git_rebase_skip(path: String, state: State<AppState>) -> Result<RebaseResult,
 }
 
 #[tauri::command]
-fn git_rebase_abort(path: String, state: State<AppState>) -> Result<String, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--abort"], &path, &state);
+fn git_rebase_abort(
+    path: String,
+    state: State<AppState>,
+    window: tauri::Window,
+) -> Result<String, String> {
+    let result = run_git_with_rebase_env(&["rebase", "--abort"], &path, &state, window.label());
     // Abort always cleans up — drop the tag too. Even on abort failure we
     // still try to drop the state dir (it's our temp resource), but leave
     // the tag in place so the user can recover manually if abort failed.
@@ -3338,17 +3465,32 @@ fn watch_directory(
         .to_string();
 
     let emit_path = canonical.clone();
+    let root_path = std::path::PathBuf::from(&canonical);
     let handle = app.clone();
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(300),
         move |events: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             if let Ok(events) = events {
-                if !events.is_empty() {
+                // Filter out noise (.git/, node_modules/, target/, ...) so a
+                // `git checkout`, `npm install`, or `cargo build` doesn't
+                // trigger a full UI refresh per batch. Also dedupes paths so
+                // a touch+modify+rename of the same file shows once.
+                let mut seen = std::collections::HashSet::new();
+                let changed_paths: Vec<String> = events
+                    .iter()
+                    .filter(|e| !fs_event_is_noise(&e.path, &root_path))
+                    .filter_map(|e| {
+                        let s = e.path.to_string_lossy().to_string();
+                        if seen.insert(s.clone()) { Some(s) } else { None }
+                    })
+                    .collect();
+                if !changed_paths.is_empty() {
                     let _ = handle.emit(
-                        "fs-changed",
+                        events::FS_CHANGED,
                         FsChanged {
                             path: emit_path.clone(),
+                            changed_paths,
                         },
                     );
                 }
@@ -3498,12 +3640,61 @@ fn focus_project_window(
     }
 }
 
+// Append a structured record of a panic to ~/.launchpad/panic.log so a crash
+// in any background thread (PTY reader, watcher, git driver) leaves a trace
+// the user can grab with /panic-log. Best-effort — if the write fails we
+// fall through to the default panic hook (stderr) and don't shadow it.
+fn write_panic_log(info: &std::panic::PanicHookInfo) {
+    let dir = launchpad_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("panic.log");
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+        .unwrap_or("<non-string panic payload>");
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "[{}] thread={} location={}\n  payload: {}\n",
+        ts, thread, location, payload
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 pub fn run() {
+    // Panic hook: log every panic to ~/.launchpad/panic.log and still call the
+    // default hook (stderr / process abort behavior unchanged). Installed
+    // before any threads spawn so background panics in the PTY reader,
+    // filesystem watcher, or git driver scripts get captured.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        write_panic_log(info);
+        default_hook(info);
+    }));
+
     let app_state = AppState {
         ptys: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(Mutex::new(0)),
         fs_watcher: Arc::new(Mutex::new(HashMap::new())),
-        git_op_pid: Arc::new(Mutex::new(None)),
+        git_op_slots: Arc::new(Mutex::new(HashMap::new())),
         git_op_counter: Arc::new(AtomicU64::new(0)),
         project_windows: Arc::new(Mutex::new(HashMap::new())),
         projects_file_lock: Arc::new(Mutex::new(())),
@@ -3990,7 +4181,7 @@ mod tests {
             ptys: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(0)),
             fs_watcher: Arc::new(Mutex::new(HashMap::new())),
-            git_op_pid: Arc::new(Mutex::new(None)),
+            git_op_slots: Arc::new(Mutex::new(HashMap::new())),
             git_op_counter: Arc::new(AtomicU64::new(0)),
             project_windows: Arc::new(Mutex::new(HashMap::new())),
             projects_file_lock: Arc::new(Mutex::new(())),
@@ -4723,12 +4914,18 @@ mod tests {
     // cancel_git_op_inner / GitOpSlot state machine tests
     // ═══════════════════════════════════════════════════════════════════════════
 
+    fn slots_with(label: &str, slot: GitOpSlot) -> Mutex<GitOpSlots> {
+        let mut map = GitOpSlots::new();
+        map.insert(label.to_string(), slot);
+        Mutex::new(map)
+    }
+
     #[test]
     fn test_cancel_op_no_slot_is_noop() {
-        let store: Mutex<Option<GitOpSlot>> = Mutex::new(None);
-        let pid = cancel_git_op_inner(&store);
+        let store: Mutex<GitOpSlots> = Mutex::new(GitOpSlots::new());
+        let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, None);
-        assert!(store.lock().unwrap().is_none());
+        assert!(store.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -4736,63 +4933,102 @@ mod tests {
         // Simulates the spawn-window race: cancel arrives AFTER the slot
         // is reserved but BEFORE spawn_git_under_slot has recorded a PID.
         // The flag must persist so the spawning op observes it post-spawn.
-        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+        let store = slots_with("main", GitOpSlot {
             op_id: 42,
             pid: None,
             cancelled: false,
-        }));
-        let pid = cancel_git_op_inner(&store);
+        });
+        let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, None, "no PID to kill yet");
 
         let guard = store.lock().unwrap();
-        let slot = guard.as_ref().expect("slot must NOT be cleared");
+        let slot = guard.get("main").expect("slot must NOT be cleared");
         assert!(slot.cancelled, "flag must be set so spawn-window cancel survives");
         assert_eq!(slot.op_id, 42, "op_id must be preserved");
     }
 
     #[test]
     fn test_cancel_op_returns_pid_when_recorded() {
-        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+        let store = slots_with("main", GitOpSlot {
             op_id: 7,
             pid: Some(99999),
             cancelled: false,
-        }));
-        let pid = cancel_git_op_inner(&store);
+        });
+        let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, Some(99999), "caller needs the PID to kill");
-        assert!(store.lock().unwrap().as_ref().unwrap().cancelled);
+        assert!(store.lock().unwrap().get("main").unwrap().cancelled);
     }
 
     #[test]
     fn test_cancel_op_idempotent() {
         // Double-click cancel: second call shouldn't change anything.
-        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+        let store = slots_with("main", GitOpSlot {
             op_id: 1,
             pid: Some(123),
             cancelled: false,
-        }));
-        assert_eq!(cancel_git_op_inner(&store), Some(123));
-        assert_eq!(cancel_git_op_inner(&store), Some(123));
+        });
+        assert_eq!(cancel_git_op_inner(&store, "main"), Some(123));
+        assert_eq!(cancel_git_op_inner(&store, "main"), Some(123));
         let guard = store.lock().unwrap();
-        let slot = guard.as_ref().unwrap();
+        let slot = guard.get("main").unwrap();
         assert!(slot.cancelled);
         assert_eq!(slot.pid, Some(123));
     }
 
     #[test]
     fn test_cancel_op_does_not_clear_slot() {
-        // The cleanup of the slot (setting it back to None) is owned by
+        // The cleanup of the slot (removing it) is owned by
         // run_git_cancellable / git_push, gated on op_id match. cancel
         // must NOT do it — otherwise a stale cancel races a new op.
-        let store: Mutex<Option<GitOpSlot>> = Mutex::new(Some(GitOpSlot {
+        let store = slots_with("main", GitOpSlot {
             op_id: 5,
             pid: None,
             cancelled: false,
-        }));
-        cancel_git_op_inner(&store);
+        });
+        cancel_git_op_inner(&store, "main");
         assert!(
-            store.lock().unwrap().is_some(),
+            store.lock().unwrap().contains_key("main"),
             "cancel must not wipe slot — cleanup is the spawning op's job"
         );
+    }
+
+    #[test]
+    fn test_cancel_op_isolates_per_window() {
+        // Two windows each with their own in-flight op. Cancelling window A
+        // must NOT touch window B's slot, and vice versa.
+        let mut map = GitOpSlots::new();
+        map.insert("window-a".into(), GitOpSlot {
+            op_id: 1,
+            pid: Some(1111),
+            cancelled: false,
+        });
+        map.insert("window-b".into(), GitOpSlot {
+            op_id: 2,
+            pid: Some(2222),
+            cancelled: false,
+        });
+        let store = Mutex::new(map);
+
+        let pid = cancel_git_op_inner(&store, "window-a");
+        assert_eq!(pid, Some(1111));
+
+        let guard = store.lock().unwrap();
+        assert!(guard.get("window-a").unwrap().cancelled, "A is cancelled");
+        assert!(!guard.get("window-b").unwrap().cancelled, "B must be untouched");
+        assert_eq!(guard.get("window-b").unwrap().pid, Some(2222));
+    }
+
+    #[test]
+    fn test_cancel_op_unknown_window_is_noop() {
+        let store = slots_with("main", GitOpSlot {
+            op_id: 1,
+            pid: Some(123),
+            cancelled: false,
+        });
+        let pid = cancel_git_op_inner(&store, "other-window");
+        assert_eq!(pid, None);
+        // Original window's slot untouched.
+        assert!(!store.lock().unwrap().get("main").unwrap().cancelled);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5460,5 +5696,74 @@ mod tests {
         assert!(result.ours.is_none());
         assert!(result.theirs.is_none());
         assert!(result.merged.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // fs_event_is_noise tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fs_noise_skips_git_internal_writes() {
+        let root = std::path::PathBuf::from("/projects/repo");
+        assert!(fs_event_is_noise(
+            &root.join(".git/index"),
+            &root,
+        ));
+        assert!(fs_event_is_noise(
+            &root.join(".git/refs/heads/main"),
+            &root,
+        ));
+    }
+
+    #[test]
+    fn test_fs_noise_skips_node_modules_and_target() {
+        let root = std::path::PathBuf::from("/projects/repo");
+        assert!(fs_event_is_noise(&root.join("node_modules/foo/index.js"), &root));
+        assert!(fs_event_is_noise(&root.join("target/debug/build/foo"), &root));
+        assert!(fs_event_is_noise(&root.join("__pycache__/x.pyc"), &root));
+        assert!(fs_event_is_noise(&root.join("dist/bundle.js"), &root));
+        assert!(fs_event_is_noise(&root.join("build/output.o"), &root));
+    }
+
+    #[test]
+    fn test_fs_noise_lets_user_files_through() {
+        let root = std::path::PathBuf::from("/projects/repo");
+        assert!(!fs_event_is_noise(&root.join("src/main.js"), &root));
+        assert!(!fs_event_is_noise(&root.join("README.md"), &root));
+        // .gitignore is a real user file even though its name starts with .git
+        assert!(!fs_event_is_noise(&root.join(".gitignore"), &root));
+    }
+
+    #[test]
+    fn test_fs_noise_only_checks_below_root() {
+        // A user whose home is /Users/target shouldn't have everything
+        // filtered out. The skip list is consulted only for path components
+        // below the watched root.
+        let root = std::path::PathBuf::from("/Users/target/proj");
+        assert!(!fs_event_is_noise(&root.join("src/file.rs"), &root));
+        // Still skips when the noise dir is BELOW the root.
+        assert!(fs_event_is_noise(&root.join("target/x"), &root));
+    }
+
+    #[test]
+    fn test_fs_noise_lets_outside_root_paths_through() {
+        // Defensive: notify shouldn't deliver paths outside the watched
+        // root, but if it does we surface them rather than silently drop.
+        let root = std::path::PathBuf::from("/projects/repo");
+        assert!(!fs_event_is_noise(
+            &std::path::PathBuf::from("/elsewhere/file.txt"),
+            &root,
+        ));
+    }
+
+    #[test]
+    fn test_fs_noise_nested_node_modules() {
+        // node_modules nested inside another package (npm workspaces):
+        // both levels are noise.
+        let root = std::path::PathBuf::from("/projects/repo");
+        assert!(fs_event_is_noise(
+            &root.join("packages/foo/node_modules/bar/index.js"),
+            &root,
+        ));
     }
 }
