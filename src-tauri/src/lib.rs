@@ -2937,6 +2937,62 @@ fn git_rebase_abort(path: String, state: State<AppState>) -> Result<String, Stri
 // End interactive rebase block
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone, Serialize)]
+struct ConflictVersions {
+    // Each version is None when the corresponding stage is missing (e.g.
+    // a file added on both sides has no base; deleted-by-us has no ours).
+    // Working tree's `merged` is None when the file isn't on disk.
+    base: Option<String>,
+    ours: Option<String>,
+    theirs: Option<String>,
+    merged: Option<String>,
+}
+
+// Reads index stages 1 (base), 2 (ours), 3 (theirs) for a conflicted file
+// and the working-tree contents (`merged`). Used by the 3-pane merge tab.
+// Stages encode their role in libgit2's index: 0 = normal, 1 = base,
+// 2 = ours, 3 = theirs. A file may be missing any of 1/2/3 depending on
+// which side added/deleted it.
+#[tauri::command]
+fn get_conflict_versions(path: String, file_path: String) -> Result<ConflictVersions, String> {
+    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    let index = repo.index().map_err(|e| e.to_string())?;
+
+    let path_bytes = file_path.as_bytes();
+    let mut base = None;
+    let mut ours = None;
+    let mut theirs = None;
+
+    for entry in index.iter() {
+        if entry.path != path_bytes {
+            continue;
+        }
+        // libgit2 packs stage in bits 12-13 of `flags`: GIT_IDXENTRY_STAGEMASK
+        // = 0x3000, shift = 12. Stage 0 = normal, 1 = base, 2 = ours, 3 = theirs.
+        let stage = ((entry.flags & 0x3000) >> 12) as i32;
+        let blob = match repo.find_blob(entry.id) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Blob content may not be UTF-8 (binary files, mixed encodings);
+        // for the merge UI we surface the lossy conversion so the user
+        // gets *something* instead of an opaque error. The 3-pane editor
+        // is text-only by design.
+        let content = String::from_utf8_lossy(blob.content()).into_owned();
+        match stage {
+            1 => base = Some(content),
+            2 => ours = Some(content),
+            3 => theirs = Some(content),
+            _ => {}
+        }
+    }
+
+    let abs_path = std::path::Path::new(&path).join(&file_path);
+    let merged = std::fs::read_to_string(&abs_path).ok();
+
+    Ok(ConflictVersions { base, ours, theirs, merged })
+}
+
 #[tauri::command]
 fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
     let mut checkout = std::process::Command::new("git");
@@ -3517,6 +3573,7 @@ pub fn run() {
             git_rebase_continue,
             git_rebase_skip,
             git_rebase_abort,
+            get_conflict_versions,
             git_resolve_ours,
             git_resolve_theirs,
             git_unstage_file,
@@ -5291,5 +5348,117 @@ mod tests {
 
         assert_eq!(envs.get("GIT_TERMINAL_PROMPT"), Some(&"0".to_string()));
         assert_eq!(envs.get("GIT_ASKPASS"), Some(&"echo".to_string()));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // get_conflict_versions tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Builds a real conflicted index by creating two divergent branches that
+    // edit the same line, then calling repo.merge_commits to leave conflict
+    // entries at stages 1/2/3. Avoids shelling out to system git.
+    fn setup_conflicted_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+        let sig = repo.signature().unwrap();
+
+        // base commit: file.txt with one line
+        fs::write(dir.path().join("file.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let base_oid = repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[]).unwrap();
+        let base_commit = repo.find_commit(base_oid).unwrap();
+
+        // Capture the ref HEAD points at after the first commit (could be
+        // refs/heads/main or refs/heads/master depending on git config).
+        // We come back to it for the ours commit + final merge.
+        let head_ref_name = repo.head().unwrap().name().unwrap().to_string();
+
+        // ours commit on the default branch: replace base line with "ours line"
+        fs::write(dir.path().join("file.txt"), "ours line\n").unwrap();
+        index.add_path(std::path::Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let ours_tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let _ours_oid = repo.commit(Some("HEAD"), &sig, &sig, "ours", &ours_tree, &[&base_commit]).unwrap();
+
+        // theirs commit on a sibling branch from base: replace with "theirs line"
+        let theirs_branch = repo.branch("theirs", &base_commit, false).unwrap();
+        let theirs_branch_ref = theirs_branch.get().name().unwrap().to_string();
+        repo.set_head(&theirs_branch_ref).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "theirs line\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let theirs_tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let theirs_oid = repo.commit(Some("HEAD"), &sig, &sig, "theirs", &theirs_tree, &[&base_commit]).unwrap();
+        let theirs_commit = repo.find_commit(theirs_oid).unwrap();
+
+        // Switch back to the default branch (ours) and merge theirs in.
+        repo.set_head(&head_ref_name).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+
+        let theirs_annotated = repo.find_annotated_commit(theirs_commit.id()).unwrap();
+        repo.merge(&[&theirs_annotated], None, None).unwrap();
+        // Working tree now has conflict markers, index has stages 1/2/3.
+        // Don't commit — we want to inspect the unresolved conflict state.
+
+        dir
+    }
+
+    #[test]
+    fn test_get_conflict_versions_returns_all_three_stages() {
+        let dir = setup_conflicted_repo();
+        let result = get_conflict_versions(
+            dir.path().to_string_lossy().to_string(),
+            "file.txt".into(),
+        )
+        .expect("get_conflict_versions should succeed on conflicted file");
+
+        assert_eq!(result.base.as_deref(), Some("base\n"));
+        assert_eq!(result.ours.as_deref(), Some("ours line\n"));
+        assert_eq!(result.theirs.as_deref(), Some("theirs line\n"));
+        // merged is the working tree — has conflict markers from libgit2's merge.
+        let merged = result.merged.expect("merged should be present");
+        assert!(merged.contains("<<<<<<<"), "merged should have conflict markers");
+        assert!(merged.contains("ours line"));
+        assert!(merged.contains("theirs line"));
+    }
+
+    #[test]
+    fn test_get_conflict_versions_clean_file_returns_none_stages() {
+        let dir = setup_git_repo();
+        let result = get_conflict_versions(
+            dir.path().to_string_lossy().to_string(),
+            "hello.txt".into(),
+        )
+        .expect("clean file lookup should not error");
+
+        // No conflict → no stages 1/2/3. merged still reads from working tree.
+        assert!(result.base.is_none());
+        assert!(result.ours.is_none());
+        assert!(result.theirs.is_none());
+        assert_eq!(result.merged.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_get_conflict_versions_missing_file_returns_all_none() {
+        let dir = setup_git_repo();
+        let result = get_conflict_versions(
+            dir.path().to_string_lossy().to_string(),
+            "does_not_exist.txt".into(),
+        )
+        .expect("missing file lookup should not error");
+
+        assert!(result.base.is_none());
+        assert!(result.ours.is_none());
+        assert!(result.theirs.is_none());
+        assert!(result.merged.is_none());
     }
 }

@@ -3840,3 +3840,76 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: var(--surface-8);
 }
 
+/* ===== 3-pane merge tab (PR7) ===== */
+.merge-instance {
+  display: none;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.merge-tab-header {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  background: var(--surface-2);
+}
+
+.merge-tab-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.merge-tab-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.merge-tab-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.merge-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+.merge-pane:last-child { border-right: none; }
+
+.merge-pane-label {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.merge-pane-ours .merge-pane-label   { color: #7ec3ff; }
+.merge-pane-theirs .merge-pane-label { color: #ff7eb6; }
+.merge-pane-merged .merge-pane-label { color: #5af78e; }
+
+.merge-pane-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+}
+.merge-pane-content > .cm-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
