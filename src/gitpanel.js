@@ -455,9 +455,43 @@ async function startAmendFlow(anchorEl, includeStaged) {
 }
 
 // Routes a Pending Operation banner button to the right backend command.
-// Rebase actions are wired but the rebase backend lands in PR4; until then
-// the rebase variant of this banner is exercised only via raw git CLI.
 async function runPendingOpAction(kind, action) {
+  // Rebase routes through the structured RebaseResult so we can re-open
+  // the next conflicted file when continue/skip pauses again. Handled
+  // separately from the generic merge / cherry-pick dispatcher below.
+  if (kind === "rebase") {
+    setInFlightOp(true);
+    try {
+      if (action === "abort") {
+        await invokeWithTimeout("git_rebase_abort", { path: currentPath });
+        showGitFeedback("Rebase aborted", "success");
+      } else {
+        const cmd = action === "skip" ? "git_rebase_skip" : "git_rebase_continue";
+        const result = await invokeWithTimeout(cmd, { path: currentPath });
+        if (result.completed) {
+          showGitFeedback(`Rebase complete. Backup: ${result.backup_tag}`, "success");
+        } else {
+          const conflicts = result.conflicted_files || [];
+          const n = conflicts.length;
+          const msg = n > 0
+            ? `Still paused — ${n} conflicted file${n === 1 ? "" : "s"}`
+            : "Paused at edit step — make changes and click Continue";
+          showGitFeedback(msg, n > 0 ? "error" : "success");
+          if (n > 0 && openFileInEditor) {
+            openFileInEditor(`${currentPath}/${conflicts[0]}`);
+          }
+        }
+      }
+    } catch (err) {
+      showGitFeedback(`${err}`, "error");
+    } finally {
+      setInFlightOp(false);
+      await refreshPanel(null, true);
+      refreshFileBrowser();
+    }
+    return;
+  }
+
   const cmds = {
     merge: {
       // No first-class continue/abort for merge yet — fall back to commit
@@ -469,13 +503,6 @@ async function runPendingOpAction(kind, action) {
     cherry_pick: {
       continue: () => invokeWithTimeout("git_cherry_pick_continue", { path: currentPath }),
       abort: () => invokeWithTimeout("git_cherry_pick_abort", { path: currentPath }),
-    },
-    rebase: {
-      // PR4 lands the cancellable rebase wrappers; for now the user can
-      // still use `git rebase --continue/--abort/--skip` from a terminal.
-      continue: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
-      abort: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
-      skip: () => Promise.reject(new Error("Rebase actions land in a later PR — use the terminal for now")),
     },
   };
   const handler = cmds[kind]?.[action];
