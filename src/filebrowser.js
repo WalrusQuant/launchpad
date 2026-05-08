@@ -1,5 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 import { pushEscape, popEscape } from "./main.js";
+import { PATH_RENAMED } from "./events.js";
 
 let currentPath = "";
 let projectRoot = ""; // set by initFileBrowser; navigation is capped at or within this
@@ -317,7 +318,7 @@ function showContextMenu(x, y, entry) {
             // editor tabs pointing at the old path, so Cmd+S doesn't
             // silently write to the stale filename).
             window.dispatchEvent(
-              new CustomEvent("launchpad:path-renamed", {
+              new CustomEvent(PATH_RENAMED, {
                 detail: { oldPath: entry.path, newPath, isDir: entry.is_dir },
               })
             );

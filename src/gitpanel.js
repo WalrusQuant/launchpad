@@ -3,6 +3,7 @@ import { setPanelTransitioning } from "./main.js";
 import { matches as keyMatches } from "./keymap.js";
 import { buildDiffHtml } from "./diffrender.js";
 import { inFlightOp, setInFlightOp, invokeWithTimeout, getPendingOp } from "./git.js";
+import { PANEL_TRANSITION_DONE } from "./events.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -90,7 +91,7 @@ export function togglePanel() {
     panel.addEventListener("transitionend", () => {
       setPanelTransitioning(false);
       // ResizeObserver was blocked during transition — emit event so main.js can refit
-      window.dispatchEvent(new CustomEvent("panel-transition-done"));
+      window.dispatchEvent(new CustomEvent(PANEL_TRANSITION_DONE));
     }, { once: true });
     panel.classList.remove("visible");
     btn.classList.remove("active");
