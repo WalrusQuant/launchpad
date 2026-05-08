@@ -2014,7 +2014,7 @@ fn git_pull(path: String, state: State<AppState>) -> Result<String, String> {
 #[tauri::command]
 fn git_fetch(path: String, state: State<AppState>) -> Result<String, String> {
     run_git_cancellable(
-        &["fetch", "--all"],
+        &["fetch", "--all", "--prune"],
         &path,
         &Arc::clone(&state.git_op_pid),
         &Arc::clone(&state.git_op_counter),
