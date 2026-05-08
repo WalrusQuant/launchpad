@@ -177,20 +177,36 @@ async function _doLoadDirectory(path, parentEl, depth = 0) {
     // Note: when searchQuery is non-empty we render via renderSearchResults
     // instead of this tree path, so no per-level filter is needed here.
 
-    // Fast path — if neither the directory listing NOR the set of expanded
-    // descendants changed since last render, the DOM is already correct.
-    // Skip the fragment build, the row-handler wiring, and the swap.
-    // Saves a chunk of work on bursty fs-changed events that don't reflect
-    // a user-visible change (metadata touches, .DS_Store flips, etc.).
+    // Fast path — if THIS level's listing + expansion set didn't change,
+    // the rows we'd build for it would be identical to the ones already in
+    // the DOM. Skip the fragment build and the swap. We still recurse
+    // into expanded children so a deep file change (modification three
+    // folders down) propagates — only THIS level's render is skipped.
+    // Saves a chunk of work on bursty fs-changed events that don't
+    // reflect a user-visible change at the current level (metadata
+    // touches, .DS_Store flips at root, etc.).
     const snapshot = computeDirectorySnapshot(filtered);
-    if (directorySnapshots.get(parentEl) === snapshot && parentEl.children.length > 0) {
-      // Still need to re-anchor roving tabindex / selection at depth 0
-      // because the focused row may have been removed by an earlier
-      // refresh that DID change the snapshot.
+    const canFastPath =
+      directorySnapshots.get(parentEl) === snapshot &&
+      parentEl.children.length > 0;
+    directorySnapshots.set(parentEl, snapshot);
+
+    if (canFastPath) {
+      const childPromises = [];
+      for (const entry of filtered) {
+        if (!entry.is_dir || !expandedDirs.has(entry.path)) continue;
+        const row = parentEl.querySelector(
+          `.file-entry[data-path="${CSS.escape(entry.path)}"]`
+        );
+        const childContainer = row?.nextElementSibling;
+        if (childContainer && childContainer.classList.contains("dir-children")) {
+          childPromises.push(loadDirectory(entry.path, childContainer, depth + 1));
+        }
+      }
+      await Promise.all(childPromises);
       if (depth === 0) applyRovingTabIndex();
       return;
     }
-    directorySnapshots.set(parentEl, snapshot);
 
     // Build new content in a fragment off-DOM to avoid flicker
     const fragment = document.createDocumentFragment();
