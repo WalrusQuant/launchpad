@@ -20,6 +20,7 @@ import { matches as keyMatches } from "./keymap.js";
 import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
+import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE } from "./events.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -1882,7 +1883,7 @@ function startTabRename(uiId, labelEl, index) {
 // Listen for PTY output — route by ptyId to correct pane.
 // Uses backpressure flow control: pauses the PTY reader when xterm.js falls
 // behind, resumes when drained. No gating or buffering needed.
-listen("pty-output", (event) => {
+listen(PTY_OUTPUT, (event) => {
   const { tab_id, data } = event.payload;
   const pane = paneMap.get(tab_id);
   if (!pane) {
@@ -1918,7 +1919,7 @@ listen("pty-output", (event) => {
 });
 
 // Listen for PTY exit — auto-close the tab when the shell process exits
-listen("pty-exit", (event) => {
+listen(PTY_EXIT, (event) => {
   const { tab_id } = event.payload;
   paneMap.delete(tab_id);
   for (const [uiId, tab] of tabs) {
@@ -1956,13 +1957,22 @@ listen("pty-exit", (event) => {
 let fsRefreshScheduled = false;
 let fsRefreshDirty = false; // coalesces events that arrive during in-flight work
 let watchedProjectPath = null; // canonical path returned by watch_directory
-listen("fs-changed", (event) => {
+// Paths accumulated across a debounce burst (and across in-flight work via
+// the dirty-flag re-run). Drained per refresh iteration so the editor-tab
+// scan only re-reads files whose paths actually changed.
+let pendingChangedPaths = new Set();
+listen(FS_CHANGED, (event) => {
   const project = getActiveProject();
   // Watcher is only started for the active project root, so a mismatch means
   // this event is from a stale watcher the frontend no longer cares about.
   // Compare against the canonical path watch_directory returned — symlinked
   // project roots make event.payload.path differ from project.path.
   if (!project || !watchedProjectPath || event.payload.path !== watchedProjectPath) return;
+  // Accumulate first so events arriving while a refresh is in flight still
+  // contribute their paths to the next iteration's tab scan.
+  if (Array.isArray(event.payload.changed_paths)) {
+    for (const p of event.payload.changed_paths) pendingChangedPaths.add(p);
+  }
   if (fsRefreshScheduled) {
     // An event arrived while we're mid-work. Don't drop it — set a dirty
     // flag and the IIFE will re-run the loop once the current pass ends.
@@ -1978,15 +1988,29 @@ listen("fs-changed", (event) => {
     try {
       do {
         fsRefreshDirty = false;
+        // Drain the pending set into a per-iteration view, then clear so
+        // the next iteration only sees newly-arrived paths.
+        const changedSet = pendingChangedPaths;
+        pendingChangedPaths = new Set();
         refreshFileBrowser();
         fetchGitStatus(project.path);
         refreshPanel(null, true);
 
-        // Check open editor tabs for external file changes
+        // Check open editor tabs for external file changes. Filter to tabs
+        // whose filePath actually appears in this batch's changedSet — for
+        // a 30-file refactor with 20 open tabs, this drops 20 sequential
+        // read_file_preview calls down to ~the count of changed editor
+        // files. Stale tabs are always rechecked so an external rename can
+        // still be recovered via the inode-relocation fallback.
         for (const [uiId, tab] of tabs) {
         if (tab.type !== "editor") continue;
+        if (!tab.stale && !changedSet.has(tab.filePath)) continue;
         try {
-          const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 10485760 });
+          // 1 MB cap on change-detection reads. Files larger than 1 MB
+          // simply won't auto-refresh on external change — multi-MB files
+          // aren't first-class editor citizens, and the explicit-open path
+          // (createEditorTab) keeps its higher 10 MB ceiling.
+          const diskContent = await invoke("read_file_preview", { path: tab.filePath, maxBytes: 1048576 });
           if (tab.stale) {
             tab.stale = false;
             renderTabBar();
@@ -2097,7 +2121,7 @@ listen("fs-changed", (event) => {
 // menu, update any open editor tab pointing at the old path (or a child
 // of it, if a directory was renamed) so Cmd+S doesn't silently create a
 // ghost file at the stale location.
-window.addEventListener("launchpad:path-renamed", (e) => {
+window.addEventListener(PATH_RENAMED, (e) => {
   const { oldPath, newPath, isDir } = e.detail || {};
   if (!oldPath || !newPath) return;
   let anyUpdated = false;
@@ -2142,7 +2166,7 @@ const resizeObserver = new ResizeObserver((entries) => {
 resizeObserver.observe(terminalContainer);
 
 // Refit terminal after git panel close transition (ResizeObserver is blocked during transition)
-window.addEventListener("panel-transition-done", () => {
+window.addEventListener(PANEL_TRANSITION_DONE, () => {
   const tab = tabs.get(activeTabUiId);
   if (tab?.type === "terminal") fitAllPanes(tab);
   if (isSplit && rightActiveTabUiId !== -1) {
