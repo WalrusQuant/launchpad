@@ -251,6 +251,13 @@ async function _doLoadDirectory(path, parentEl, depth = 0) {
           applyRovingTabIndex();
           await toggleDirectory(entry, row, depth);
         });
+        // Rapid expand→collapse on the chevron used to bubble a dblclick
+        // to the row, which navigates into the folder via setRoot — that
+        // clears expandedDirs and replaces the tree, looking from the
+        // user's POV like "random folders collapsed."
+        chevron.addEventListener("dblclick", (e) => {
+          e.stopPropagation();
+        });
       }
 
       const icon = document.createElement("span");
