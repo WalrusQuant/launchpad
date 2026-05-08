@@ -61,8 +61,10 @@
   projectpicker.js    # Project picker UI (welcome / recents)
   filebrowser.js      # File tree, context menu, DnD, git colors, CRUD
   editor.js           # CodeMirror factory — creates independent editor instances
-  git.js              # Git status polling, file status colors
-  gitpanel.js         # Full git panel UI
+  git.js              # Git status polling, file status colors, pending-op snapshot
+  gitpanel.js         # Full git panel UI (incl. amend, cherry-pick, rebase ctx menu)
+  diffrender.js       # Renders structured diffs for the diff tab + commit detail
+  conflictmarkers.js  # Conflict-marker parser + CodeMirror inline editor
   quickopen.js        # Cmd+P fuzzy file finder
   settings.js         # Persistent settings store (~/.launchpad/config.json)
   settingspanel.js    # Settings form UI
@@ -224,6 +226,48 @@ specs/                # Design specs (project model, agent model, etc.)</code></
           3-second poll. Module-level state
           (<code>expandedCommitOid</code>) persists across re-renders.
         </p>
+        <p>
+          <strong>Pending Operation banner.</strong>
+          <code>get_pending_op_state</code> is polled alongside
+          <code>get_git_status</code> (one round-trip per cycle). It detects
+          merge / cherry-pick / rebase pause via <code>.git/MERGE_HEAD</code>,
+          <code>CHERRY_PICK_HEAD</code>, and <code>rebase-merge|rebase-apply</code>
+          directories. The banner renders the right Continue / Skip / Abort
+          buttons per kind and is the single source of truth for "what state
+          is git in?"
+        </p>
+        <p>
+          <strong>Interactive rebase.</strong> Driver-script approach. A
+          <code>tempfile::Builder</code>-created temp dir (TOCTOU-safe; chmod
+          <code>0o700</code>) holds <code>seq_editor.sh</code> +
+          <code>commit_editor.sh</code> + <code>state.json</code> (chmod
+          <code>0o600</code>) keyed by <code>LAUNCHPAD_REBASE_STATE_DIR</code>.
+          The scripts read JSON and emit the desired todo / commit message,
+          decoupling the user's <code>$EDITOR</code> from the rebase. A
+          backup tag (<code>rebase-backup-&lt;branch&gt;-&lt;timestamp&gt;</code>)
+          survives success; abort drops it. <code>RebaseStateInfo</code>
+          on <code>AppState</code> centralizes cleanup so Continue / Skip /
+          Abort can release it idempotently. <code>revparse_single</code>
+          resolves rev expressions (<code>HEAD^</code>, <code>~2</code>) to
+          concrete OIDs server-side.
+        </p>
+        <p>
+          <strong>Conflict UX.</strong> The
+          <code>conflictExtension</code> in <code>conflictmarkers.js</code>
+          parses <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code> /
+          <code>|||||||</code> / <code>=======</code> /
+          <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code> blocks (strict — col 0,
+          exactly 7 chars, complete sequence; bails on nested), draws an
+          inline action bar with <em>Accept Ours / Theirs / Both</em>, and
+          tints the ours / base / theirs ranges. Save when
+          <code>parseConflictBlocks(content).length === 0</code> auto-stages
+          via <code>git_stage_file</code>. The 3-pane merge tab uses
+          <code>get_conflict_versions</code> (libgit2 index stages 1 / 2 / 3
+          + working tree) and renders three <code>CodeMirror 6</code> views
+          with <code>EditorState.readOnly</code> on the side panes. Scroll
+          listener pinned on the tab + detached in <code>doCloseTab</code>
+          before <code>view.destroy()</code> to avoid view-retention leaks.
+        </p>
 
         <h2 id="ipc">Tauri commands (Rust → JS IPC)</h2>
         <p>All commands live in <code>src-tauri/src/lib.rs</code>. A partial index:</p>
@@ -250,7 +294,10 @@ specs/                # Design specs (project model, agent model, etc.)</code></
           <li><code>git_stage_file</code>, <code>git_unstage_file</code>, <code>git_stage_all</code>, <code>git_unstage_all</code>, <code>git_discard_file</code></li>
           <li><code>git_commit</code>, <code>git_push</code>, <code>git_pull</code>, <code>git_fetch</code>, <code>git_merge_branch</code>, <code>cancel_git_op</code></li>
           <li><code>git_stash_save</code> / <code>pop</code> / <code>list</code> / <code>apply</code> / <code>drop</code></li>
-          <li><code>get_file_diff</code>, <code>get_commit_details</code>, <code>git_resolve_ours</code>, <code>git_resolve_theirs</code></li>
+          <li><code>get_file_diff</code>, <code>get_commit_details</code>, <code>get_diff_between_refs</code>, <code>git_resolve_ours</code>, <code>git_resolve_theirs</code></li>
+          <li><code>git_amend_commit</code>, <code>git_head_on_remote</code>, <code>git_cherry_pick</code> / <code>_continue</code> / <code>_abort</code>, <code>get_pending_op_state</code></li>
+          <li><code>get_rebase_candidate_commits</code>, <code>git_rebase_interactive_apply</code>, <code>git_rebase_continue</code> / <code>_skip</code> / <code>_abort</code></li>
+          <li><code>get_conflict_versions</code> — libgit2 index stages 1 / 2 / 3 + working tree, powers the 3-pane merge tab</li>
         </ul>
 
         <h3>Projects &amp; windows</h3>
