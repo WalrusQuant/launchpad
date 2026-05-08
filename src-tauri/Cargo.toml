@@ -20,6 +20,6 @@ git2 = "0.19"
 notify-debouncer-mini = "0.5"
 urlencoding = "2"
 regex = "1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
