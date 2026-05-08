@@ -13,6 +13,7 @@ let lastSnapshot = null;
 let expandedCommitOid = null;
 let openFileInEditor = null;
 let openDiffInTab = null;
+let openRebaseInTab = null;
 // Snapshot of branches from the last refresh; used by the "Compare…" popup
 // to populate its ref selectors. Updated each time refreshPanel runs.
 let lastBranches = [];
@@ -40,10 +41,11 @@ const STATUS_ICONS = {
 };
 
 // ─── Public API ────────────────────────────────────────────────────────────────
-export function initGitPanel(getPath, openFileCb, openDiffCb) {
+export function initGitPanel(getPath, openFileCb, openDiffCb, openRebaseCb) {
   currentPath = getPath();
   openFileInEditor = openFileCb || null;
   openDiffInTab = openDiffCb || null;
+  openRebaseInTab = openRebaseCb || null;
 
   const toggleBtn = document.getElementById("toggle-git-panel");
   toggleBtn.addEventListener("click", () => togglePanel());
@@ -546,6 +548,13 @@ function showCommitContextMenu(mouseEvent, oid) {
       label: "Cherry-pick onto HEAD",
       enabled: currentPendingOp.kind === "none",
       onClick: () => doCherryPick(oid),
+    },
+    {
+      // Rebase from here = make this commit's parent the new base, so the
+      // rebase tab populates with this commit and everything newer.
+      label: "Rebase from here…",
+      enabled: !!openRebaseInTab && currentPendingOp.kind === "none",
+      onClick: () => openRebaseInTab && openRebaseInTab({ baseOid: `${oid}^` }),
     },
     {
       label: "Copy OID",
