@@ -1729,15 +1729,19 @@ async function openAgentTab() {
     nextUiTabId: () => nextUiTabId++,
     switchTab,
     renderTabBar,
+    openSettings: openSettingsTab,
   });
 }
 
-// Settings tab
-function openSettingsTab() {
+// Settings tab. `opts.scrollTo` (e.g. "agent-section") scrolls that anchor
+// into view after mount and focuses the first empty input inside it — used
+// by the chat tab's first-run empty-state CTA.
+function openSettingsTab(opts = {}) {
   // Deduplicate
   for (const [uiId, tab] of tabs) {
     if (tab.type === "settings") {
       switchTab(uiId);
+      if (opts.scrollTo) scrollSettingsTo(tab.containerEl, opts.scrollTo);
       return;
     }
   }
@@ -1756,6 +1760,23 @@ function openSettingsTab() {
   tabs.set(uiId, tab);
   renderTabBar();
   switchTab(uiId);
+  if (opts.scrollTo) scrollSettingsTo(containerEl, opts.scrollTo);
+}
+
+function scrollSettingsTo(containerEl, anchorId) {
+  // The agent section is rendered async (renderAgentConfig awaits the
+  // provider preset list), so wait a frame before scrolling. Two rAFs is
+  // belt-and-suspenders for the case where layout settles after the awaited
+  // provider list resolves.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const target = containerEl.querySelector("#" + CSS.escape(anchorId));
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (anchorId === "agent-section") {
+      const apiKey = target.querySelector("#set-agentApiKey");
+      if (apiKey && !apiKey.value) apiKey.focus();
+    }
+  }));
 }
 
 function applySettingLive(key, value) {
@@ -3188,5 +3209,60 @@ async function enterWorkspace(project, settings) {
 export function setPanelTransitioning(value) {
   panelTransitioning = value;
 }
+
+// Launchpad-native agent tools fire `launchpad:agent-tool-action` to ask the
+// UI to do something on their behalf. Each event payload is `{ tool, payload }`
+// where `tool` is the lp_* tool name and `payload` carries tool-specific args.
+// Tools claim no project context — paths are absolute, refs are git refs.
+listen("launchpad:agent-tool-action", async (event) => {
+  const { tool, payload } = event.payload || {};
+  try {
+    switch (tool) {
+      case "lp_open_in_editor": {
+        const path = payload?.path;
+        if (!path) return;
+        const opts = {};
+        if (payload.line) opts.line = payload.line;
+        if (payload.column) opts.column = payload.column;
+        await createEditorTab(path, opts);
+        break;
+      }
+      case "lp_show_diff": {
+        const fromRef = payload?.from_ref;
+        const toRef = payload?.to_ref || "HEAD";
+        if (!fromRef) return;
+        await createDiffTab({ fromRef, toRef });
+        break;
+      }
+      case "lp_open_merge_tab": {
+        const filePath = payload?.file_path;
+        if (!filePath) return;
+        await createMergeTab({ filePath });
+        break;
+      }
+      case "lp_refresh_git_panel": {
+        const project = getActiveProject();
+        if (project?.path) {
+          await fetchGitStatus(project.path);
+          refreshPanel(project.path, true);
+        }
+        refreshFileBrowser();
+        break;
+      }
+      case "lp_reveal_in_finder": {
+        const path = payload?.path;
+        if (!path) return;
+        await invoke("reveal_in_finder", { path });
+        break;
+      }
+      default:
+        // Unknown native tool — ignore (forward-compat with later additions).
+        break;
+    }
+  } catch (err) {
+    console.error("agent-tool-action failed:", tool, err);
+    showToast(`Agent tool failed (${tool}): ${err}`, "error");
+  }
+});
 
 boot();

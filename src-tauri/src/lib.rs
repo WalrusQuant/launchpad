@@ -2157,7 +2157,7 @@ fn cancel_git_op(state: State<AppState>, window: tauri::Window) -> Result<(), St
     Ok(())
 }
 
-fn is_valid_git_ref(name: &str) -> bool {
+pub(crate) fn is_valid_git_ref(name: &str) -> bool {
     // Reject empties and leading `-` (option injection: `--no-verify`).
     // Reject `..` (git ref-format forbids it; also blocks range syntax sneaking through).
     // Allow [A-Za-z0-9._/-] plus `^` and `~` for parent/ancestor rev syntax
@@ -3823,6 +3823,7 @@ pub fn run() {
             agent::agent_skills_list,
             agent::agent_config_load,
             agent::agent_config_save,
+            agent::agent_is_configured,
             agent::agent_provider_presets,
             agent::agent_session_delete,
             agent::agent_session_deleted_ids

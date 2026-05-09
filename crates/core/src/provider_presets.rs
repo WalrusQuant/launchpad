@@ -105,6 +105,15 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             is_custom: false,
         },
         ProviderPreset {
+            id: "zai_coding",
+            display_name: "Z.ai (coding plan)",
+            wire_api: ProviderWireApi::OpenAIChatCompletions,
+            default_base_url: Some("https://api.z.ai/api/coding/paas/v4"),
+            api_key_env_vars: &["Z_AI_API_KEY", "LPA_API_KEY"],
+            description: "Z.ai coding plan — GLM-4.6 (flagship), GLM-4.5 family",
+            is_custom: false,
+        },
+        ProviderPreset {
             id: "custom",
             display_name: "Custom endpoint",
             wire_api: ProviderWireApi::OpenAIChatCompletions,
@@ -140,6 +149,7 @@ mod tests {
                 "together",
                 "mistral",
                 "ollama",
+                "zai_coding",
                 "custom",
             ]
         );

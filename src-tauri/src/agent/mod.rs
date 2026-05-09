@@ -8,6 +8,7 @@
 mod commands;
 mod config;
 mod host;
+mod native_tools;
 
 pub use commands::*;
 pub use config::*;

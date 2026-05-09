@@ -40,7 +40,7 @@ What we inherit by depending on these crates:
 
 - **Session / turn / streaming logic** — the genuinely hard part of any agent
 - **Provider abstraction** (`crates/provider`) — Anthropic, OpenAI, Gemini, OpenRouter, Groq, Together, Mistral, Ollama, plus presets for adding more
-- **Tool registry** (`crates/tools`) with built-in `Read`, `Write`, `Edit`, `ApplyPatch`, `Bash`, `Glob`, `Grep`, `Todo`, `Plan`, `Question`, `WebFetch`, `WebSearch`, `Lsp`
+- **Tool registry** (`crates/tools`) with built-in `bash`, `read`, `write`, `apply_patch`, `glob`, `grep`, `todowrite`, `update_plan`, `question`, `webfetch`, `websearch`, `skill` (plus `task` and `lsp` defined-but-not-registered as stubs)
 - **MCP support** (`crates/mcp`) — `StdMcpManager`, automatic tool registration, trust levels
 - **Skills system** — user + workspace skill discovery, the source for slash commands
 - **Approval policy** with `Once / Turn / Session / PathPrefix / Host / Tool` scopes
@@ -59,18 +59,20 @@ What we build in Launchpad is the **glue + the chat UI**. Everything below the p
 │  Frontend (JS)                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │ Chat tab (agentchat.js)                                             │  │
-│  │   send: invoke('agent_send_envelope', { json })                     │  │
-│  │   recv: listen('agent:event:<session_id>', payload => render(...))  │  │
+│  │   send: invoke('agent_send_message', { sessionId, text, ... })      │  │
+│  │   recv: listen('agent:event:<window_label>', envelope => route())   │  │
+│  │         (one global listener per window; routes by session_id to    │  │
+│  │          the right tab via sessionTabs Map)                         │  │
 │  └────────────────────────────────┬────────────────────────────────────┘  │
 │                                   │ Tauri IPC                              │
 │  Rust backend (src-tauri)         │                                        │
 │  ┌────────────────────────────────▼────────────────────────────────────┐  │
-│  │ agent::commands  →  AgentHost (per-window connection)               │  │
+│  │ agent::commands  →  AgentState (per-window connection)              │  │
 │  │   handle_incoming(conn_id, json)  →  Option<json>  (response)       │  │
-│  │   register_connection(.., sender) ─┐                                │  │
-│  │                                    │ mpsc<serde_json::Value>        │  │
-│  │   sender_task: while let Some(v) = rx.recv().await {                │  │
-│  │       window.emit("agent:event:<sid>", v)                           │  │
+│  │   register_connection(WebSocket, sender) ─┐                         │  │
+│  │                                           │ mpsc<serde_json::Value> │  │
+│  │   forwarder_task: while let Some(v) = rx.recv().await {             │  │
+│  │       app.emit("agent:event:<window_label>", v)                     │  │
 │  │   }                                                                 │  │
 │  └─────────────────────────────────┬───────────────────────────────────┘  │
 │                                    │ Rust function calls (no IPC)         │
@@ -99,9 +101,9 @@ The protocol boundary stays the same JSON envelope launchpad-agent already defin
 
 The dispatch handlers (`handle_session_start`, `handle_turn_start`, etc.) are private modules inside `crates/server/src/runtime.rs`. We could PR upstream to expose them as typed methods, but the JSON envelope is already a stable surface that costs essentially nothing in-process. The envelope buys us: stable contract, future cross-process compat if ever needed, identical wire shape to the TUI client (one set of bugs, not two).
 
-### Minor upstream PR needed
+### Transport label decision
 
-`ClientTransportKind` (passed to `register_connection`) likely has variants for `Stdio` and `WebSocket` but no `InProcess`. One-line PR upstream to add `InProcess`. Until merged, we pass `Stdio` as a label — the runtime doesn't read it for anything load-bearing.
+`ClientTransportKind` (passed to `register_connection`) has variants for `Stdio` and `WebSocket` but no `InProcess`. We use **`WebSocket`** because Stdio always delivers every event to every connection — that would leak events across windows. WebSocket gates delivery on explicit `events/subscribe` per session, which matches our per-window isolation model. Adding `InProcess` upstream is still the right long-term move (the label is mildly misleading) but isn't urgent.
 
 ---
 
@@ -109,13 +111,21 @@ The dispatch handlers (`handle_session_start`, `handle_turn_start`, etc.) are pr
 
 ```
 src-tauri/src/agent/
-  mod.rs        AgentState (per-window AgentHost map), Tauri commands
-  host.rs       AgentHost: builds ServerRuntime + ServerRuntimeDependencies
-  bootstrap.rs  Mirrors crates/server/src/bootstrap.rs::run_server_process,
-                  minus run_listeners() — constructs deps from Launchpad config
-  events.rs     mpsc → Tauri event fan-out per window
-  tools.rs      Launchpad-native tools registered into ToolRegistry
-  config.rs     Maps Launchpad's settings to launchpad-agent's AppConfig
+  mod.rs          Module exports
+  host.rs         AgentState: per-process ServerRuntime, per-window connections,
+                  mpsc → Tauri event fan-out, build_runtime mirrors lpa_server::
+                  run_server_process minus run_listeners(), starter-skills seeder
+  commands.rs     Tauri command surface (initialize / connect / send / interrupt /
+                  approve / session list/resume/delete / skills_list / config /
+                  reload)
+  config.rs       AgentConfig schema + atomic-write + LPA_* env apply,
+                  agent_is_configured pre-flight, agent_session_delete + hide-list
+  native_tools.rs Launchpad-native tools (lp_open_in_editor, lp_show_diff,
+                  lp_open_merge_tab, lp_refresh_git_panel, lp_reveal_in_finder)
+                  emitting Tauri events back to frontend
+src-tauri/starter-skills/<name>/SKILL.md
+                  Bundled SKILL.md files (commit, review, explain, plan)
+                  embedded via include_str! and seeded on first run
 ```
 
 ### `AgentState`
@@ -136,7 +146,7 @@ struct AgentConn {
 
 ### Lifecycle
 
-- **First chat tab anywhere** → `runtime` is built (mirrors `run_server_process` from `crates/server/src/bootstrap.rs` minus `run_listeners()`); `load_persisted_sessions().await` runs once
+- **First chat tab anywhere** → `runtime` is built (mirrors `lpa_server::run_server_process` minus the listener loop); `load_persisted_sessions().await` runs once
 - **First chat tab in a window** → `register_connection` is called for that window; the returned `connection_id` and the sender task get stored in `AgentState.connections[window_label]`
 - **Window closes** → `unregister_connection(connection_id)` is called; sender task drops; sessions persist (resumable in any future window)
 - **App quits** → MCP supervisors get `shutdown_all()` (mirroring the Ctrl+C path in `run_server_process`)
@@ -205,9 +215,14 @@ All commands take `tauri::Window` so they route to the right per-window connecti
 
 ```
 src/
-  agentchat.js      Chat tab factory, message store, composer, event listener
-  agentmsg.js       Message-type renderers
-  agentcomposer.js  Multiline input, @-mentions, slash commands, send/cancel
+  agentchat.js      Chat tab factory + global event router (per window),
+                    sessions sidebar, lazy session creation, empty-state CTA
+  agentmsg.js       Message + tool-card renderers (incl. specialized renderers
+                    for apply_patch and write that use diffparse + diffrender)
+  agentcomposer.js  Multiline input, @-mentions (search_files-backed),
+                    slash commands (skill picker), send/cancel
+  diffparse.js      Unified-diff parser (GNU + lpa "Apply Patch" envelope)
+                    used by the apply_patch tool-card renderer
   styles.css        New section: "Agent chat tab"
 ```
 
@@ -346,7 +361,7 @@ No new event plumbing needed for these — the existing FSEvents watcher does th
 
 ### Active integration (Launchpad-native tools registered into `ToolRegistry`)
 
-In `agent/tools.rs`, register Rust closures as additional `Tool` implementations. The agent calls them like any other tool, but they execute as same-process Rust:
+In `agent/native_tools.rs`, implement `lpa_tools::Tool` for each Launchpad-native tool. They run as same-process Rust and emit `launchpad:agent-tool-action` Tauri events with `{tool, payload}` so the frontend can route to the appropriate UI surface:
 
 | Tool name | Purpose |
 |-----------|---------|
@@ -373,7 +388,7 @@ Per-model parameters, MCP server config, and skills stay in launchpad-agent's ow
 
 ### Z.ai coding plan as a preset
 
-Wired as an **OpenAI-compatible** provider (same provider type as Groq, Together, Mistral, Ollama). One-file PR upstream to `launchpad-agent/crates/core/src/provider_presets.rs`:
+Wired as an **OpenAI-compatible** provider (same provider type as Groq, Together, Mistral, Ollama). Lives in-tree at `crates/core/src/provider_presets.rs::PRESETS` (id `zai_coding`):
 
 | Field | Value |
 |-------|-------|
@@ -381,8 +396,8 @@ Wired as an **OpenAI-compatible** provider (same provider type as Groq, Together
 | Base URL | `https://api.z.ai/api/coding/paas/v4` |
 | Auth | `Authorization: Bearer <key>` |
 | Env var | `Z_AI_API_KEY` |
-| Default model | `glm-5.1` |
-| Other available models | `glm-5-turbo`, `glm-5`, `glm-4.7`, `glm-4.7-flash`, `glm-4.7-flashx`, `glm-4.6`, `glm-4.5`, `glm-4.5-air`, `glm-4.5-x`, `glm-4.5-airx`, `glm-4.5-flash`, `glm-4-32b-0414-128k` |
+| Default model | `glm-4.6` (Z.ai's coding-plan flagship as of 2026-05) |
+| Other available models | `glm-4.5`, `glm-4.5-air` (lighter), `glm-4.5-flash` (fastest) |
 
 **Why not the Anthropic-compatible endpoint** (`https://api.z.ai/api/anthropic`): Z.ai built that endpoint as a porting convenience for tools that hard-code Anthropic Messages API (Claude Code, etc.). We are not such a tool — launchpad-agent's OpenAI-compatible provider already speaks to non-OpenAI backends (Groq, Together, OpenRouter), and the coding endpoint is what Z.ai's own coding-plan docs treat as primary.
 
@@ -398,7 +413,7 @@ Smoke test before merging the preset PR:
 curl -X POST https://api.z.ai/api/coding/paas/v4/chat/completions \
   -H "Authorization: Bearer $Z_AI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"glm-5.1","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
+  -d '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
 ```
 
 ### Mapping Launchpad settings → launchpad-agent config
@@ -409,12 +424,12 @@ curl -X POST https://api.z.ai/api/coding/paas/v4/chat/completions \
 
 ## 10. Distribution
 
-- launchpad-agent vendored as **git submodule** at `vendor/launchpad-agent`, pinned to a specific SHA
-- `src-tauri/Cargo.toml` adds path deps: `lpa-core`, `lpa-server`, `lpa-provider`, `lpa-tools`, `lpa-safety`, `lpa-mcp`, `lpa-protocol`, `lpa-utils`
+- launchpad-agent crates are **copied in-tree** under `crates/` (full source, not a submodule). The submodule design from earlier drafts was rejected — see the Architecture Deltas section below.
+- `Cargo.toml` at the repo root defines the workspace; `src-tauri/Cargo.toml` pulls in `lpa-core`, `lpa-server`, `lpa-provider`, `lpa-tools`, `lpa-safety`, `lpa-mcp`, `lpa-protocol`, `lpa-utils`, `lpa-client`, `lpa-tasks` via `workspace = true` path deps
+- `crates/LPA_LICENSE` carries the launchpad-agent Apache-2.0 license verbatim
 - `npx tauri build` compiles them as part of the normal build — no `build.rs`, no sidecar binary, no `bundle.externalBin`
 - Bundle size goes up by however much the agent crates compile to (roughly 10-20MB depending on provider SDK choices). Acceptable cost.
-- `vendor/launchpad-agent.version` file (SHA + date, human-readable) tracked in Launchpad's tree so reviewers see SHA bumps in PR diffs without expanding the submodule
-- SHA bump cadence: **manual on demand**. Alpha velocity on the agent side means automatic bumps would break Launchpad mid-week.
+- **Sync cadence: manual.** When upstream launchpad-agent ships something we want, copy the relevant files in by hand and run the test suite. Alpha velocity on the agent side means an automatic sync would break Launchpad mid-week. We're free to make Launchpad-specific edits to the vendored crates (e.g. the `default_base_instructions.txt` rewrite, the Z.ai preset entry) as long as they're documented and reviewable.
 
 ---
 
@@ -441,12 +456,12 @@ Most decisions from earlier drafts are resolved. Remaining:
 ## 13. Phased PR plan
 
 ### PR1 — Foundations (no UI)
-- Add `vendor/launchpad-agent` submodule pinned to a known-good SHA
-- Add path deps in `src-tauri/Cargo.toml`
-- New `src-tauri/src/agent/` module: `host.rs`, `bootstrap.rs` (mirrors `run_server_process`), `events.rs`, `mod.rs`
+- Copy launchpad-agent crates into `crates/` (in-tree port, not submodule); add `crates/LPA_LICENSE`
+- Add `Cargo.toml` workspace at repo root; add path deps in `src-tauri/Cargo.toml`
+- New `src-tauri/src/agent/` module: `mod.rs`, `host.rs` (mirrors `run_server_process`), `commands.rs`, `config.rs`
 - One `ServerRuntime` per process, lazily constructed
-- Per-window `register_connection` + sender task → Tauri events
-- Tauri commands: `agent_send_envelope`, `agent_session_start`, `agent_send_message`, `agent_interrupt_turn`, `agent_approve`, `agent_session_close`
+- Per-window `register_connection` + sender task → Tauri events on `agent:event:<window_label>`
+- Tauri commands: `agent_initialize`, `agent_connect`, `agent_disconnect`, `agent_send_envelope`, `agent_session_start` (auto-subscribes), `agent_send_message`, `agent_interrupt_turn`, `agent_approve`, `agent_subscribe_events`
 - Smoke test: from devtools, start a session, send "hello", see streaming events arrive in console
 
 **Done when:** can drive a full text-only conversation from the JS console.
@@ -515,7 +530,7 @@ Most decisions from earlier drafts are resolved. Remaining:
 
 ---
 
-## Status — 2026-05-09
+## Status — 2026-05-09 (regroup after live dogfooding)
 
 Snapshot of what's working in `main` vs. what's still on the punch list.
 Source of truth for "where are we" — update as PRs land.
@@ -526,16 +541,19 @@ Source of truth for "where are we" — update as PRs land.
 - **Transport: `WebSocket` placeholder, not `Stdio`.** Stdio always delivers every event to every connection, which would leak across windows. WebSocket gates delivery on explicit `events/subscribe` per session — `agent_session_start` auto-subscribes the new session before returning so the frontend can't miss the first delta. Adding `ClientTransportKind::InProcess` upstream is still the right long-term move; no longer urgent.
 - **Sessions sidebar + session delete** were not in the original spec but landed because the persistence is already there (RolloutStore JSONL files) and the cost of exposing it is low. Delete is filesystem + hide-list (`~/.launchpad/agent-deleted-sessions.json`) since the runtime has no in-memory delete primitive — a clean upstream API would let us drop the hide-list.
 - **Settings reachable from the projects picker** via an overlay (gear icon top-right). The agent config is global, so it must be configurable before any project is open.
-- **Save & reload** rebuilds the runtime in place — no app restart required to swap providers. Active turns are cancelled when their connection drops; tabs reconnect on next message.
+- **Save & reload** rebuilds the runtime in place — no app restart required to swap providers. Active turns are cancelled when their connection drops; tabs reconnect on next message. Verified live with K2.6 → Z.ai/GLM-5.1 mid-conversation switch.
+- **Sessions are lazy.** Opening a chat tab no longer calls `agent_session_start`; the runtime sees nothing until the user actually sends a message. Avoids cluttering the sessions list with empty "untitled" sessions when users open a tab and walk away.
+- **Skills inject SKILL.md content for real.** Picking a slash command sends a structured `InputItem::Skill { id }` (not just `/foo` text), so the runtime's `resolve_input_items` resolves the catalog and prepends `<skill>...</skill>` blocks ahead of the user's text. Four starter skills (`/commit`, `/review`, `/explain`, `/plan`) are bundled in `src-tauri/starter-skills/<name>/SKILL.md` and seeded into `~/.lpagent/skills/` on first run if the directory is missing — so the slash menu has something the moment a user opens a chat tab.
+- **System prompt rewritten for general use.** The original `crates/core/default_base_instructions.txt` was inherited from OpenAI Codex CLI: a 12KB single-line blob with literal `\n` escape sequences, references to `multi_tool_use.parallel` (an OpenAI-only tool that isn't registered here), and instructions to "send messages to the `commentary` and `final` channels" (codex-cli concepts that don't exist in this runtime). Under GLM-5.1 this caused observable retry loops — the model would write a file, fail to parse the success confirmation through the codex-shaped expectations, and call `write` again. Replaced with a 6.4KB model-agnostic prompt: real newlines, accurate tool list (including the `lp_*` native tools), explicit "trust tool results, do not retry to verify" rule, no fake channels, no frontend-design noise. Rebuilt prompt loads via the same `include_str!` path so the change rides whatever Cargo build picks it up.
 
 ### What's shipping (✅ done)
 
 **PR1 — Foundations**
 - Workspace Cargo.toml with all 10 lpa-* crate path deps
-- `src-tauri/src/agent/` — `host.rs`, `commands.rs`, `config.rs`
+- `src-tauri/src/agent/` — `host.rs`, `commands.rs`, `config.rs`, `native_tools.rs`
 - One `ServerRuntime` per process, lazily built under a `Mutex<Option<...>>` so reload can drop it
 - Per-window connection map keyed by Tauri window label; mpsc → `agent:event:<window_label>` Tauri events
-- Tauri command surface: `agent_initialize`, `agent_connect`, `agent_disconnect`, `agent_send_envelope`, `agent_session_start` (auto-subscribes), `agent_send_message`, `agent_interrupt_turn`, `agent_approve`, `agent_subscribe_events`, `agent_session_list`, `agent_session_resume`, `agent_skills_list`, `agent_config_load`, `agent_config_save`, `agent_provider_presets`, `agent_reload`, `agent_session_delete`, `agent_session_deleted_ids`
+- Tauri command surface: `agent_initialize`, `agent_connect`, `agent_disconnect`, `agent_send_envelope`, `agent_session_start` (auto-subscribes), `agent_send_message` (accepts `mentions` + `skills`), `agent_interrupt_turn`, `agent_approve`, `agent_subscribe_events`, `agent_session_list`, `agent_session_resume`, `agent_skills_list` (forwards `cwd`), `agent_config_load`, `agent_config_save`, `agent_is_configured`, `agent_provider_presets`, `agent_reload`, `agent_session_delete`, `agent_session_deleted_ids`
 
 **PR2 — Chat tab shell + streaming text**
 - New tab type `"agent"`; ✦ icon, Cmd+I shortcut, toolbar button
@@ -543,6 +561,7 @@ Source of truth for "where are we" — update as PRs land.
 - Streaming text deltas append plain; markdown rendered via `marked` on item completion (avoids per-delta re-render stutter)
 - Scroll-pinned auto-scroll
 - Conversation column max-width centered
+- First-run empty state — when `agent_is_configured` returns false, the chat tab renders an in-tab CTA pointing at Settings instead of bubbling the runtime's bootstrap error. Composer is disabled while in empty state. Listens for `launchpad:agent-reloaded` to recover into a real session in place after Save & reload.
 
 **PR3 — Tool cards, thinking, approval**
 - Generic tool cards for `tool_call`, `mcp_tool_call`, `command_execution`, `file_change`, `web_search`, `image_view`, `plan` — title extracted from `payload.input` (`bash · cargo check`, `read · path/...`)
@@ -552,56 +571,73 @@ Source of truth for "where are we" — update as PRs land.
 - Cancel button mid-turn → `agent_interrupt_turn`
 - Pulsing running dot, ✓ done / ✕ error glyph, three-dot "working…" indicator pinned at the bottom of the message stream
 - Tool card body visibility managed by JS `MutationObserver` setting a `tool-card-empty` class — replaces a brittle `:has()` CSS rule that didn't work consistently in WebKit
+- **Per-tool diff cards** for `apply_patch` (parses to structured hunks via `src/diffparse.js`, then `buildFileDiffSection` from the git panel's renderer) and `write` (path + line/char count + capped content preview).
+- **Cost / usage footer** — tiny muted line per turn showing `↑ in · ↓ out · cache hit/write · session totals`, updated in place per `turn/usage/updated`.
 
-**PR5 — Settings, persistence (partial)**
-- "Agent" section in the settings panel: Provider dropdown with all 9 presets (Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, Custom), auto-fill base URL on provider change, model, API key
+**PR4 — Cross-feature integration**
+- **Slash command picker** end-to-end: workspace skill discovery fixed (`host.rs` was discarding `workspace_roots`); `agent_skills_list` forwards `cwd` so per-project skills work; empty-state row in the popup with hints for `~/.lpagent/skills/<name>/SKILL.md` and `<project>/skills/<name>/SKILL.md`. Picking a skill sends a structured `InputItem::Skill` so the runtime injects the SKILL.md body. Four starter skills bundled + seeded on first run.
+- **`@`-file mentions** in composer, backed by `search_files`. Debounced (120ms) + stale-token guard. Submit only forwards mentions whose `@<rel-path>` token is still in the final text. Structured `InputItem::Mention` items forwarded.
+- **Launchpad-native tools** registered into `ToolRegistry`: `lp_open_in_editor`, `lp_show_diff`, `lp_open_merge_tab`, `lp_refresh_git_panel`, `lp_reveal_in_finder`. AppHandle plumbed into `build_runtime`; each tool emits a `launchpad:agent-tool-action` event that `main.js` routes to the right surface. All five marked `is_read_only` so the orchestrator skips approval round-trips.
+
+**PR5 — Settings, persistence, polish**
+- "Agent" section in the settings panel: Provider dropdown with all 10 presets (Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, **Z.ai (coding plan)**, Custom), auto-fill base URL on provider change, model, API key
 - Storage at `~/.launchpad/agent-config.json` chmod 0o600 via `atomic_write_with_mode`
 - LPA_* env vars applied before runtime construction; **always overwrite** so a save-then-reload actually picks up new values
-- **Save & reload** button — drops the runtime + all per-window connections, broadcasts a `launchpad:agent-reloaded` DOM event so open agent tabs reset their session state and start fresh on next message
+- **Save & reload** button — drops the runtime + all per-window connections, broadcasts a `launchpad:agent-reloaded` DOM event so open agent tabs reset their session state and start fresh on next message. Verified live mid-conversation.
 - Settings reachable from the picker (gear icon, modal overlay)
 - Session resume: full sidebar (☰ button → list of past sessions sorted by recency, click to resume, history replay via `SessionHistoryItem`)
 - Session delete: × per row (hover-discoverable), in-app confirm modal, deletes rollout file + hide-list
+- "Open Settings →" deep-link from the empty-state CTA scrolls to `#agent-section` and focuses the API key input
 
-**PR4 — Cross-feature integration (partial)**
-- Slash command picker wired into composer: `/` at start of line → popup of skills from `agent_skills_list`, ↑/↓/Enter/Tab to insert. **Currently appears empty** — likely no skills registered in the runtime's skill catalog yet, not a code bug. To verify: drop a stub at `~/.lpagent/skills/` and reload.
+### What's missing (❌ punch list, post-regroup)
 
-### What's missing (❌ punch list)
+#### Newly observed during dogfooding (priority order)
 
-**PR4 — Cross-feature integration**
-- ❌ `@`-file mentions in composer (backed by `search_files`)
-- ❌ Launchpad-native tools registered into `ToolRegistry`: `lp_open_in_editor`, `lp_show_diff`, `lp_open_merge_tab`, `lp_refresh_git_panel`, `lp_reveal_in_finder`. Wiring requires plumbing a `tauri::Window` handle into the tool closures so they can emit events back to the frontend (this is the "where do agent tools execute" gap from the original audit).
-- ❌ "Open in editor" links from `Read` / `Grep` / `Lsp` tool cards (depends on the native tool above OR a frontend-only listener that intercepts tool-card clicks)
-- ❌ Git panel refresh nudge after the agent runs `git commit` via `Bash`
-- ❌ Drag-drop image into composer for vision models (needs `InputItem::LocalImage` plumbing)
-- ⚠️ **Slash commands**: built but currently empty — needs verification + an empty-state CTA pointing at the skills folder
+1. **Provider switch doesn't auto-fill the Model field.** When the user picks a new provider preset, the base URL is reset but the model field stays as whatever was there before — caused a real Z.ai 400 ("Unknown Model") in dogfooding. Fix: when provider changes, populate the model field with a sensible default for that preset (add `default_model: Option<&'static str>` to `ProviderPreset`, fallback to first entry of preset's known models).
+2. **Spec listed speculative Z.ai model codes.** § 9 named `glm-5.1` as the default and listed several `glm-5*` variants — those are not real Z.ai coding-plan models. Verified-good codes are `glm-4.6` (flagship), `glm-4.5`, `glm-4.5-air`, `glm-4.5-flash`. Update § 9 and the preset's `default_model` accordingly.
+3. **Bash / read / grep / glob tool cards dump JSON args** instead of pretty rendering. We have specialized renderers for `apply_patch` and `write`; bash et al. fall through to the generic `appendArgs` JSON dump. Fix: add specialized renderers (e.g. `bash` → `$ <command>` + description; `read` → `path:line-line`; `grep`/`glob` → `<pattern> in <path>`).
+4. **Empty `tool_result` slots under tool_call cards.** Cards show DONE but the result body is empty in dogfooding under Z.ai. Two possibilities: the OpenAI-compat runtime path isn't emitting separate `tool_result` items the way Anthropic does, OR `tool_use_id` field naming differs and our index lookup misses. Diagnose first (temp `console.log` on incoming envelope methods + payload field shapes), then fix renderer or push fix into the lpa OpenAI provider. **Re-verify after the system-prompt rewrite** — the loop that surfaced this might have been masking the issue, or might have BEEN the issue.
+5. **Old chat tabs frozen with pre-fix DOM** don't re-render with new card logic — cosmetic, affects only sessions opened before the latest restart.
+6. **`AgentState::shutdown` is `dead_code`** — needs wiring to a Tauri window-close / app-exit hook so MCP supervisors get a chance to shut down cleanly.
 
-**PR5 — Polish**
-- ❌ Z.ai coding plan as a named preset (Custom endpoint covers it manually). Upstream PR to `launchpad-agent/crates/core/src/provider_presets.rs` is still proposed in § 9 above.
-- ❌ Default approval policy in settings (always prompts per-tool today; runtime supports `never` / `always` strings, no UI driver)
-- ❌ Sandbox mode toggle (`workspace-write` / `read-only` / `permissive`) — runtime has the policies, no UI
-- ❌ Per-project default model
-- ❌ Multi-session per window with header switcher (sidebar exists; a quick switcher pinned in the chat header would be friendlier than re-opening the sidebar each time)
-- ❌ Per-tool diff cards for Edit / Write / ApplyPatch using existing `diffrender.js`
-- ❌ Cost / usage footer per turn (data arrives via `turn/usage/updated`, not yet displayed)
-- ❌ First-run empty state — opening a chat tab before configuring a provider currently surfaces the runtime's bootstrap error verbatim instead of a friendly "Configure provider →" CTA
+#### Original punch list, still pending (not blocked)
 
-### Open issues seen during dogfooding
+- **Drag-drop image upload** for vision models (needs `InputItem::LocalImage` plumbing + Tauri file-drop handling).
+- **Multi-session per window with header switcher** — sidebar exists; a quick switcher pinned in the chat header would be friendlier than re-opening the sidebar each time.
+- **"Open in editor" links from `Read` / `Grep` / `Lsp` tool cards** — the `lp_open_in_editor` native tool covers the agent-driven path; click-to-open from the tool-card UI is still a separate frontend-only listener task.
+- **Git panel refresh nudge after `git commit` via `Bash`** — `lp_refresh_git_panel` exists; the agent has to choose to call it. A passive "watch for `git commit` in Bash output and auto-refresh" hook is still on the punch list.
+- **Per-project default model** — config schema ready, no UI driver yet.
+
+#### Blocked on vendored-crate runtime work
+
+- ⚠️ **Default approval policy in settings** — `crates/server/src/execution.rs:90` hardcodes `SessionConfig::default()` → `AutoApprove` with no override path; `SessionStartParams` doesn't carry `permission_mode`. The `RuleBasedPolicy` exists in `crates/safety/src/legacy_permissions.rs` but is never reached from a non-default config. Earlier "runtime supports `never`/`always` strings" note was wrong. Fix path: add `permission_mode` to `SessionStartParams` (or read `LPA_PERMISSION_MODE` in `execution.rs:90`), then wire UI dropdown.
+- ⚠️ **Sandbox mode toggle** — `SandboxPolicyRecord` exists in `lpa_safety` but isn't actually enforced anywhere — only persisted as a string in `crates/core/src/conversation/records.rs:42`. A UI today would be vaporware. Fix path: implement enforcement in the orchestrator's `is_read_only` / write paths first.
+
+### Open issues seen during dogfooding (carried forward)
 
 1. Old chat tabs frozen with pre-fix DOM structure don't always re-render with new card logic. Cosmetic — affects only sessions opened before the latest restart.
 2. Tool card expand/collapse went through several iterations (auto-collapse, `:empty`, `:has()`) before landing on JS-managed `tool-card-empty`. Watch for regressions when changing the tool card chrome.
 3. The `shutdown` method on `AgentState` still warns `dead_code` — needs to be wired to a Tauri window-close / app-exit hook so MCP supervisors get a chance to shut down cleanly.
+4. **Z.ai-specific shape divergence** observed in dogfooding (issue #4 above) — `tool_result` items not visible in the chat UI when the conversation runs against the Z.ai OpenAI-compatible endpoint. Suspect OpenAI provider's tool-call/tool-result handling needs verification against Z.ai's response shape (per § 9 known divergences). Untested: whether Anthropic / Claude Code shows results correctly with the same chat-tab build.
+
+### Lessons from this session (so we don't relearn them)
+
+- **Vendored prompts need a sniff test before shipping.** The default base instructions were lifted wholesale from OpenAI Codex CLI without anyone reading them — they referenced fake tools and non-existent IPC channels, costing real model behavior under non-OpenAI providers. Going forward, anything pulled from another agent CLI (prompts, tool schemas, system messages) gets a line-by-line read against this runtime's actual surface area before it lands.
+- **"Trust tool results" is a load-bearing prompt rule.** Without it, weaker models retry successful operations to "verify". The new prompt makes this explicit; if a future model still loops on writes, the prompt isn't strong enough — that's a prompt fix, not a UI fix.
+- **`include_str!` resources require a rebuild, not a hot reload.** When debugging future "I changed X but it didn't take", check whether X is `include_str!`-ed.
+- **Slow first-token latency is the model, not us.** GLM-5.1 with 26K input tokens: 5–15s before any deltas. Don't chase phantom streaming bugs without checking the model's own latency profile first.
 
 ### Re-plan — priority order from here
 
-In order of "biggest workflow win for least effort":
+Today's session shipped 13 items (the original 8-item re-plan list plus 5 gaps discovered during the work, including the system-prompt rewrite). Next pass, in order of biggest workflow win for least effort:
 
-1. **First-run empty state** — when no API key configured, in-chat CTA pointing at Settings instead of an opaque error. Cheap, big polish win.
-2. **Verify slash commands end-to-end** with a test skill; add an empty-state hint pointing to the skills folder.
-3. **`@`-file mentions** — small, high-impact for daily use.
-4. **Default approval policy + sandbox mode** in settings — runtime supports both; just adds two dropdowns.
-5. **Launchpad-native tools** (`lp_open_in_editor` etc.) — biggest "this is built for this app" feel; requires the `tauri::Window` handle plumbing.
-6. **Per-tool diff cards** for Edit / Write — pipeline (`diffrender.js`) already exists.
-7. **Cost / usage footer** — small, makes runs feel transparent.
-8. Z.ai preset, image upload, multi-session header switcher — nice-to-haves.
+1. **Re-verify the `tool_result` rendering issue** (was issue #4) after the system-prompt rewrite. The retry loop that surfaced this might have BEEN the issue — if so, no further fix needed. If results are still missing, fall back to the original diagnostic plan (temp `console.log` on incoming envelope methods + payload field shapes).
+2. **Provider switch auto-fills model field + correct Z.ai model codes** (issues #1 + #2 above) — 5-minute fix, eliminates the next user's first-run friction.
+3. **Specialized tool-card renderers for `bash` / `read` / `grep` / `glob`** (issue #3) — most visible polish gap on every conversation.
+4. **Drag-drop image upload** for vision models — opens up GPT-4V, Claude Sonnet vision, Gemini.
+5. **Multi-session header switcher** — friendlier than re-opening the sidebar each time.
+6. **Click-to-open from existing Read/Grep tool cards** — frontend-only listener, mirrors the agent-driven `lp_open_in_editor` path.
+7. **Wire `AgentState::shutdown` to app-exit hook** — clears the `dead_code` warning and gives MCP supervisors a clean exit.
+8. **Approval policy / sandbox mode** — only after the vendored-crate runtime work lands. See "Blocked" section.
 
 Update this section as items land.

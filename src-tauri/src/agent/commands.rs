@@ -67,7 +67,7 @@ pub async fn agent_send_envelope(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
     Ok(runtime.handle_incoming(connection_id, envelope).await)
 }
 
@@ -82,7 +82,7 @@ pub async fn agent_initialize(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let init = json!({
         "jsonrpc": "2.0",
@@ -121,7 +121,7 @@ pub async fn agent_session_start(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     // session/start requires `cwd` (PathBuf) and `ephemeral` (bool).
     // Falls back to the user's home dir if no project is open — the runtime
@@ -163,7 +163,18 @@ pub async fn agent_session_start(
     Ok(response)
 }
 
-/// Send a user-text turn. Returns the `turn/start` response.
+/// Send a user-text turn. `mentions` is an optional list of file paths the
+/// user @-referenced in the composer; each becomes a structured Mention input
+/// item so the agent can resolve them deterministically (the literal "@path"
+/// stays in the visible text for the user's own readability). `skills` is an
+/// optional list of skill ids the user picked via slash command; each becomes
+/// a structured Skill input item that the runtime resolves into the SKILL.md
+/// body and injects ahead of the text.
+///
+/// Order matters for context priming: skills first (instructions), then
+/// mentions (file context), then text (the actual user message).
+///
+/// Returns the `turn/start` response.
 #[tauri::command]
 pub async fn agent_send_message(
     app: AppHandle,
@@ -171,11 +182,35 @@ pub async fn agent_send_message(
     state: State<'_, AgentState>,
     session_id: String,
     text: String,
+    mentions: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
 ) -> Result<Option<Value>, String> {
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
+
+    let mut input: Vec<Value> = Vec::new();
+    if let Some(ids) = skills {
+        for id in ids.into_iter().filter(|s| !s.is_empty()) {
+            input.push(json!({ "type": "skill", "id": id }));
+        }
+    }
+    if let Some(paths) = mentions {
+        // Defense-in-depth: the JS composer only inserts paths that came
+        // from search_files (already project-scoped), but the IPC
+        // boundary is local-only and a future caller / test could pass
+        // anything. Reject paths with embedded NULs or non-absolute paths
+        // to prevent leaking arbitrary host files into the model context.
+        for p in paths.into_iter().filter(|s| !s.is_empty()) {
+            if p.contains('\0') {
+                tracing::warn!(path = %p, "agent_send_message: rejected mention with NUL byte");
+                continue;
+            }
+            input.push(json!({ "type": "mention", "path": p }));
+        }
+    }
+    input.push(json!({ "type": "text", "text": text }));
 
     let envelope = json!({
         "jsonrpc": "2.0",
@@ -183,9 +218,7 @@ pub async fn agent_send_message(
         "method": "turn/start",
         "params": {
             "session_id": session_id,
-            "input": [
-                { "type": "text", "text": text }
-            ]
+            "input": input,
         }
     });
     Ok(runtime.handle_incoming(connection_id, envelope).await)
@@ -204,7 +237,7 @@ pub async fn agent_interrupt_turn(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let mut params = serde_json::Map::new();
     params.insert("session_id".into(), Value::String(session_id));
@@ -237,7 +270,7 @@ pub async fn agent_approve(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let envelope = json!({
         "jsonrpc": "2.0",
@@ -265,7 +298,7 @@ pub async fn agent_subscribe_events(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let envelope = json!({
         "jsonrpc": "2.0",
@@ -286,7 +319,7 @@ pub async fn agent_session_list(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let envelope = json!({
         "jsonrpc": "2.0",
@@ -308,7 +341,7 @@ pub async fn agent_session_resume(
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
     let envelope = json!({
         "jsonrpc": "2.0",
@@ -320,22 +353,29 @@ pub async fn agent_session_resume(
 }
 
 /// List skills (slash commands + workspace skills) discovered by the runtime.
+/// `project_path`, when supplied, is forwarded as `cwd` so the catalog can
+/// also walk the project's per-workspace skill roots (default: `<cwd>/skills`).
 #[tauri::command]
 pub async fn agent_skills_list(
     app: AppHandle,
     window: Window,
     state: State<'_, AgentState>,
+    project_path: Option<String>,
 ) -> Result<Option<Value>, String> {
     let connection_id = require_connection_id(&state, &app, window.label())
         .await
         .map_err(err)?;
-    let runtime = state.runtime().await.map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
 
+    let mut params = serde_json::Map::new();
+    if let Some(p) = project_path.filter(|s| !s.is_empty()) {
+        params.insert("cwd".into(), Value::String(p));
+    }
     let envelope = json!({
         "jsonrpc": "2.0",
         "id": rpc_id(),
         "method": "skills/list",
-        "params": {}
+        "params": Value::Object(params),
     });
     Ok(runtime.handle_incoming(connection_id, envelope).await)
 }

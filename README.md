@@ -1,6 +1,6 @@
 # Launchpad
 
-A terminal-first macOS workspace. Terminal, file browser, git panel, and a simple code editor — scoped to one project per window.
+A terminal-first macOS workspace. Terminal, file browser, git panel, code editor, and a built-in chat agent — scoped to one project per window.
 
 ![Built with Tauri](https://img.shields.io/badge/Tauri-v2-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey) ![License](https://img.shields.io/badge/license-Apache_2.0-green)
 
@@ -135,6 +135,22 @@ Open with Cmd+G. A visual git workflow designed so you never have to remember gi
 - Toggle hidden files
 - Resizable sidebar
 
+### Built-in Agent (Cmd+I)
+A chat coding agent built into Launchpad as its own tab type, alongside terminal and editor tabs. Runs in-process — no sidecar binary, no stdio framing — by depending on the [launchpad-agent](https://github.com/WalrusQuant/launchpad-agent) crates directly.
+
+- **10 provider presets** — Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, Z.ai (coding plan), and a Custom OpenAI-compatible endpoint. Pick a provider, paste an API key, hit Save & Reload — no app restart, sessions reconnect on next message.
+- **Markdown streaming** with code-block highlighting; per-turn cost / token-usage footer.
+- **Tool cards** for every tool the agent calls — bash, read, write, apply_patch, glob, grep, web fetch / search, MCP tools — with collapsible result panes. `apply_patch` calls render an inline diff using the same diff renderer the git panel uses.
+- **`@`-file mentions** in the composer, backed by the same fuzzy index Cmd+P uses. Picked files become structured context the agent receives directly.
+- **Slash commands** — type `/` to pick a skill (a `SKILL.md` document under `~/.lpagent/skills/<name>/`). Picked skills inject their body into the next turn as system context. Four starter skills bundled and seeded on first run: `/commit`, `/review`, `/explain`, `/plan`.
+- **Approval cards** with six scopes (Once / Turn / Session / Path Prefix / Host / Tool) when a tool needs the user's permission.
+- **Launchpad-native tools** — the agent can call `lp_open_in_editor`, `lp_show_diff`, `lp_open_merge_tab`, `lp_refresh_git_panel`, `lp_reveal_in_finder` to drive the workspace UI directly (e.g. show you the file it just edited).
+- **Sessions are persistent** — past conversations sit in a sidebar (☰ icon), resumable in any window. Delete a session and its rollout file goes with it.
+- **API keys live at `~/.launchpad/agent-config.json`** with chmod 0o600 (owner read/write only).
+- **CLI agents still work too.** The built-in chat doesn't replace `claude`, `aider`, `goose`, or anything else you run in a terminal tab — they're complementary surfaces.
+
+Full architecture docs in [specs/agent-integration-spec.md](specs/agent-integration-spec.md).
+
 ### Quick Open (Cmd+P)
 Fuzzy file search across your project. Case-insensitive, ranked by path length. Skips hidden dirs, node_modules, target, and other noise. Arrow keys to navigate, Enter to open as editor tab.
 
@@ -145,8 +161,9 @@ All preferences in one place, applied live:
 - **Terminal** — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink
 - **Editor** — font size, tab size, word wrap
 - **Git** — auto-refresh interval, default commit prefix
+- **Agent** — provider preset, API key, default model, base URL. Save & Reload rebuilds the runtime in place.
 
-Settings saved to `~/.launchpad/config.json`. Project list saved to `~/.launchpad/projects.json`.
+Settings saved to `~/.launchpad/config.json`. Project list saved to `~/.launchpad/projects.json`. Agent config saved to `~/.launchpad/agent-config.json` (chmod 0o600).
 
 ### Toolbar
 A compact header bar with quick access to:
@@ -169,6 +186,7 @@ A compact header bar with quick access to:
 | Cmd+Option+Left/Right | Switch focus between groups |
 | Cmd+Shift+M | Move tab to other group |
 | Cmd+K | Clear terminal |
+| Cmd+I | New agent chat tab |
 | Cmd+P | Quick open (fuzzy file search) |
 | Cmd+G | Toggle git panel |
 | Cmd+F | Find in editor / search sidebar |
@@ -183,9 +201,11 @@ A compact header bar with quick access to:
 |-------|-----------|
 | Desktop shell | Tauri v2 |
 | Backend | Rust — PTY via portable-pty, git via libgit2 + system git for network ops |
+| Agent runtime | [launchpad-agent](https://github.com/WalrusQuant/launchpad-agent) crates (`lpa-core`, `lpa-server`, `lpa-provider`, `lpa-tools`, `lpa-safety`, `lpa-mcp`, `lpa-protocol`, `lpa-utils`) — copied in-tree under `crates/`, run in-process via mpsc → Tauri events |
 | Frontend | Vanilla JS |
 | Terminal | xterm.js 6 with WebGL renderer + Unicode 11 |
 | Editor | CodeMirror 6 |
+| Markdown | marked (chat tab rendering) |
 | Bundler | Vite |
 
 ## License

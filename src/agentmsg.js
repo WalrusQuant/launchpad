@@ -2,6 +2,9 @@
 // Plain DOM construction — no framework. Each function returns an element
 // suitable for appending to `.agent-messages`.
 
+import { buildFileDiffSection } from "./diffrender.js";
+import { parseUnifiedDiff, diffStats } from "./diffparse.js";
+
 export function renderMessage(kind, text, opts = {}) {
   const wrap = document.createElement("div");
   wrap.className = `agent-msg agent-msg-${kind}`;
@@ -287,7 +290,26 @@ function truncate(s, n) {
 function populateInitial(kind, body, payload) {
   if (!payload || typeof payload !== "object") return;
   if (kind === "tool_call" || kind === "mcp_tool_call") {
+    const toolName = (payload.tool_name || payload.name || "").toLowerCase();
     const args = payload.input || payload.arguments || payload.params;
+    // Specialized renderers for the file-mutation tools — better than dumping
+    // the JSON args verbatim. Falls back to appendArgs for anything else.
+    if (toolName === "apply_patch" && args && typeof args === "object") {
+      const patchText =
+        args.patchText || args.patch_text || args.patch || args.diff;
+      if (typeof patchText === "string" && patchText.length > 0) {
+        renderPatchPreview(body, patchText);
+        return;
+      }
+    }
+    if (toolName === "write" && args && typeof args === "object") {
+      const filePath = args.filePath || args.file_path || args.path;
+      const content = typeof args.content === "string" ? args.content : "";
+      if (filePath) {
+        renderWritePreview(body, filePath, content);
+        return;
+      }
+    }
     if (args !== undefined && args !== null) {
       appendArgs(body, args);
     }
@@ -317,6 +339,55 @@ function appendArgs(body, args) {
   const pre = document.createElement("pre");
   pre.className = "tool-args";
   pre.textContent = typeof args === "string" ? args : JSON.stringify(args, null, 2);
+  body.appendChild(pre);
+}
+
+// ─── Specialized tool-call previews ──────────────────────────────────────
+
+// apply_patch: parse the unified diff in patchText and render with the
+// shared diff renderer (same chrome the git panel uses). Adds a top-line
+// stats summary so collapsed cards still convey scale.
+function renderPatchPreview(body, patchText) {
+  const files = parseUnifiedDiff(patchText);
+  if (!files.length) {
+    // Couldn't parse — fall back to the raw text so nothing is hidden.
+    const pre = document.createElement("pre");
+    pre.className = "tool-output";
+    pre.textContent = patchText;
+    body.appendChild(pre);
+    return;
+  }
+  const stats = diffStats(files);
+  const summary = document.createElement("div");
+  summary.className = "tool-diff-summary";
+  summary.innerHTML = `${files.length} file${files.length === 1 ? "" : "s"} · <span class="diff-add-count">+${stats.added}</span> <span class="diff-del-count">−${stats.removed}</span>`;
+  body.appendChild(summary);
+  const wrap = document.createElement("div");
+  wrap.className = "tool-diff-body";
+  wrap.innerHTML = files.map((f) => buildFileDiffSection(f)).join("");
+  body.appendChild(wrap);
+}
+
+// write: show the destination path + a collapsible code preview of the
+// content (capped) instead of the raw JSON args dump.
+function renderWritePreview(body, filePath, content) {
+  const head = document.createElement("div");
+  head.className = "tool-write-head";
+  head.textContent = filePath;
+  body.appendChild(head);
+
+  const lineCount = content ? content.split("\n").length : 0;
+  const meta = document.createElement("div");
+  meta.className = "tool-write-meta";
+  meta.textContent = `${lineCount} line${lineCount === 1 ? "" : "s"} · ${content.length} chars`;
+  body.appendChild(meta);
+
+  if (!content) return;
+  const pre = document.createElement("pre");
+  pre.className = "tool-output tool-write-preview";
+  // Cap at 2000 chars to avoid blowing up the message list on giant writes.
+  const cap = 2000;
+  pre.textContent = content.length > cap ? content.slice(0, cap) + "\n…" : content;
   body.appendChild(pre);
 }
 

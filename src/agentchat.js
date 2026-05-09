@@ -73,9 +73,21 @@ async function installGlobalListener() {
   });
 }
 
-export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBar }) {
-  await ensureInitialized();
-  await installGlobalListener();
+export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBar, openSettings }) {
+  // First-run gate: if no provider/api-key configured, surface an in-tab
+  // CTA instead of bubbling the runtime's bootstrap error. Cheap pre-flight
+  // — no runtime construction.
+  let configured;
+  try {
+    configured = await invoke("agent_is_configured");
+  } catch (_) {
+    configured = false;
+  }
+
+  if (configured) {
+    await ensureInitialized();
+    await installGlobalListener();
+  }
 
   const project = getActiveProject();
   const uiId = nextUiTabId();
@@ -148,8 +160,13 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
 
   // Composer wired to send / cancel
   const composer = createComposer({
-    onSend: async (text) => {
+    onSend: async (text, mentions, skills) => {
       if (!text.trim()) return;
+      // Re-entry guard: a fast double-Enter could otherwise hit the lazy
+      // session-start block twice and create two sessions, with the first
+      // orphaned but still in sessionTabs.
+      if (tab._sending) return;
+      tab._sending = true;
       pushUserMessage(tab, text);
       try {
         // If the runtime was reloaded since this tab was opened, sessionId
@@ -180,6 +197,8 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
         const resp = await invoke("agent_send_message", {
           sessionId: tab.sessionId,
           text,
+          mentions: mentions && mentions.length ? mentions : null,
+          skills: skills && skills.length ? skills : null,
         });
         const turnId = resp?.result?.turn_id;
         if (turnId) tab.turnId = turnId;
@@ -187,6 +206,8 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
       } catch (err) {
         pushError(tab, String(err));
         composer.setTurnActive(false);
+      } finally {
+        tab._sending = false;
       }
     },
     onCancel: async () => {
@@ -213,7 +234,45 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
   renderTabBar();
   switchTab(uiId);
 
-  // Start the session
+  // Empty-state branch: show the first-run CTA, leave the composer disabled,
+  // and wait for `launchpad:agent-reloaded` (fired by Settings → Save & reload)
+  // to recover into a real session without forcing the user to close/reopen
+  // this tab.
+  if (!configured) {
+    renderUnconfiguredEmptyState(tab, openSettings);
+    const recover = async () => {
+      let nowConfigured = false;
+      try { nowConfigured = await invoke("agent_is_configured"); } catch (_) {}
+      if (!nowConfigured) return;
+      window.removeEventListener("launchpad:agent-reloaded", recover);
+      tab._recoverListener = null;
+      tab.emptyStateEl?.remove();
+      tab.emptyStateEl = null;
+      tab.composer?.setDisabled(false, "");
+      try {
+        await ensureInitialized();
+        await installGlobalListener();
+        // Resolve the project at recover time, not tab-creation time —
+        // the user may have switched projects while the tab sat idle.
+        await startInitialSession(tab, getActiveProject());
+      } catch (err) {
+        pushError(tab, `Failed to start session: ${err}`);
+      }
+    };
+    window.addEventListener("launchpad:agent-reloaded", recover);
+    tab._recoverListener = recover;
+    tab.composer?.setDisabled(true, "Configure a provider in Settings to start chatting…");
+    return tab;
+  }
+
+  // Configured but no session yet. Defer agent_session_start until the user
+  // actually sends a message — the onSend handler will lazy-start. This way
+  // opening a chat tab and walking away doesn't spawn an empty untitled
+  // session in the persisted sessions list.
+  return tab;
+}
+
+async function startInitialSession(tab, project) {
   try {
     const resp = await invoke("agent_session_start", {
       projectPath: project?.path || null,
@@ -225,24 +284,50 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
         resp?.error?.message ||
         (resp?.error ? JSON.stringify(resp.error) : "session/start returned no session_id");
       pushError(tab, errMsg);
-      return tab;
+      return;
     }
     tab.sessionId = sessionId;
     sessionTabs.set(sessionId, tab);
     const resolvedModel = resp?.result?.resolved_model;
     if (resolvedModel) {
       tab.modelSlug = resolvedModel;
-      modelLabel.textContent = resolvedModel;
+      tab.modelLabel.textContent = resolvedModel;
     }
   } catch (err) {
     pushError(tab, `Failed to start session: ${err}`);
   }
+}
 
-  return tab;
+function renderUnconfiguredEmptyState(tab, openSettings) {
+  const wrap = document.createElement("div");
+  wrap.className = "agent-empty-state";
+  wrap.innerHTML = `
+    <div class="agent-empty-state-icon">✦</div>
+    <h2 class="agent-empty-state-title">Set up your agent provider</h2>
+    <p class="agent-empty-state-body">
+      Choose a provider (Anthropic, OpenAI, Google, OpenRouter, Ollama, …) and
+      add your API key to start chatting. Settings are stored locally at
+      <code>~/.launchpad/agent-config.json</code>.
+    </p>
+    <button class="agent-empty-state-btn" type="button">Open Settings →</button>
+  `;
+  wrap.querySelector(".agent-empty-state-btn").addEventListener("click", () => {
+    if (typeof openSettings === "function") {
+      openSettings({ scrollTo: "agent-section" });
+    }
+  });
+  tab.listEl.appendChild(wrap);
+  tab.emptyStateEl = wrap;
 }
 
 export function closeAgentTab(tab) {
   if (tab.sessionId) sessionTabs.delete(tab.sessionId);
+  // Detach the recover listener so a later Save & reload doesn't fire on
+  // a closed tab and leak an orphan session into the runtime.
+  if (tab._recoverListener) {
+    window.removeEventListener("launchpad:agent-reloaded", tab._recoverListener);
+    tab._recoverListener = null;
+  }
   // Sessions persist on the runtime; closing the tab just drops the UI.
 }
 
@@ -262,6 +347,9 @@ function dispatchEvent(tab, env) {
       tab.turnId = params?.turn?.turn_id || tab.turnId;
       tab.composer?.setTurnActive(true);
       showThinkingIndicator(tab, true);
+      // New turn → drop the prior turn's usage footer reference so the next
+      // usage/updated event mounts a fresh one.
+      tab.currentTurnUsageEl = null;
       break;
     case "turn/completed":
     case "turn/interrupted":
@@ -274,7 +362,7 @@ function dispatchEvent(tab, env) {
       }
       break;
     case "turn/usage/updated":
-      // For now ignored — could surface a tiny footer line per turn.
+      handleUsageUpdated(tab, params);
       break;
     case "item/started":
       handleItemStarted(tab, params);
@@ -477,6 +565,53 @@ function pushUserMessage(tab, text) {
   autoscroll(tab, { force: true });
 }
 
+// Surfaces token/cache usage as a tiny muted footer at the bottom of the
+// message stream, updated in place on every usage/updated event. One footer
+// per turn — turn/started clears the reference so the next usage event mounts
+// a fresh row. The footer is appended (not pinned), so prior turns' usage
+// stays visible as the user scrolls back.
+function handleUsageUpdated(tab, params) {
+  const usage = params?.usage || {};
+  const totalIn = params?.total_input_tokens;
+  const totalOut = params?.total_output_tokens;
+
+  if (!tab.currentTurnUsageEl) {
+    const el = document.createElement("div");
+    el.className = "agent-turn-usage";
+    tab.listEl.appendChild(el);
+    tab.currentTurnUsageEl = el;
+  }
+  const el = tab.currentTurnUsageEl;
+
+  const inT = formatTokens(usage.input_tokens);
+  const outT = formatTokens(usage.output_tokens);
+  const cacheRead = usage.cache_read_input_tokens;
+  const cacheWrite = usage.cache_creation_input_tokens;
+  const cacheBits = [];
+  if (cacheRead) cacheBits.push(`cache hit ${formatTokens(cacheRead)}`);
+  if (cacheWrite) cacheBits.push(`cache write ${formatTokens(cacheWrite)}`);
+  const cacheStr = cacheBits.length ? ` · ${cacheBits.join(" · ")}` : "";
+  const totalStr =
+    totalIn != null && totalOut != null
+      ? ` · session ${formatTokens(totalIn)} in / ${formatTokens(totalOut)} out`
+      : "";
+  el.textContent = `↑ ${inT} in · ↓ ${outT} out${cacheStr}${totalStr}`;
+
+  // Keep the working… indicator below the usage line if it's still up.
+  if (tab.thinkingEl && tab.thinkingEl.parentElement === tab.listEl) {
+    tab.listEl.appendChild(tab.thinkingEl);
+  }
+  autoscroll(tab);
+}
+
+function formatTokens(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1000) return String(n);
+  if (n < 10_000) return (n / 1000).toFixed(2).replace(/\.?0+$/, "") + "K";
+  if (n < 1_000_000) return Math.round(n / 1000) + "K";
+  return (n / 1_000_000).toFixed(1) + "M";
+}
+
 function pushError(tab, msg) {
   const el = renderMessage("error", msg, {});
   tab.listEl.appendChild(el);
@@ -637,6 +772,10 @@ async function resumeSession(tab, sessionId) {
   tab.toolUseIndex.clear();
   tab.pendingApprovals.clear();
   tab.thinkingEl = null;
+  // Drop the prior turn's usage footer reference too — the DOM node was
+  // just removed by replaceChildren, but the JS reference would otherwise
+  // outlive it and cause stray usage events to update an orphan element.
+  tab.currentTurnUsageEl = null;
 
   const summary = resp.result.session;
   if (summary.resolved_model) {

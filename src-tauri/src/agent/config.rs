@@ -53,24 +53,44 @@ pub fn write_user_config(cfg: &AgentConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Process-wide lock serializing writes and reads of the LPA_* env vars.
+/// `apply_env_from_user_config` (writer) and `agent_is_configured` (reader)
+/// both take this so `std::env::set_var` can never overlap with
+/// `std::env::var` from another thread — that overlap is undefined behavior
+/// on POSIX (the `environ` pointer isn't atomic).
+///
+/// Held only across sync env operations; never across an await. Callers
+/// must not invoke async work while holding it.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read the on-disk config and set the LPA_* env vars that
 /// `lpa_server::load_server_provider` looks at. Always overwrites — so a
 /// reload after the user changes settings actually picks up the new values.
 /// (If we deferred to existing env, a saved-then-reloaded provider would
 /// silently keep the first run's values.)
-pub fn apply_env_from_user_config() {
+///
+/// Returns a guard that callers can keep alive across the immediately
+/// following sync env reads (e.g. `load_server_provider`) so a concurrent
+/// `agent_is_configured` can't see a half-written state. Drop the guard
+/// before any `.await` — `std::sync::MutexGuard` is not async-safe.
+#[must_use]
+pub fn apply_env_from_user_config<'a>() -> std::sync::MutexGuard<'a, ()> {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let cfg = read_user_config();
     apply_or_unset("LPA_PROVIDER", cfg.provider.as_deref());
     apply_or_unset("LPA_WIRE_API", cfg.wire_api.as_deref());
     apply_or_unset("LPA_MODEL", cfg.model.as_deref());
     apply_or_unset("LPA_BASE_URL", cfg.base_url.as_deref());
     apply_or_unset("LPA_API_KEY", cfg.api_key.as_deref());
+    guard
 }
 
 fn apply_or_unset(key: &str, value: Option<&str>) {
-    // Safety: env mutation is safe here because the agent runtime is
-    // strictly single-builder under a Mutex — no concurrent thread is
-    // reading these vars while we set them.
+    // Safety: ENV_LOCK is held by every Launchpad code path that touches
+    // these vars (writers via apply_env_from_user_config, readers via
+    // agent_is_configured). The remaining theoretical race is with
+    // load_server_provider's own env reads — callers keep the guard alive
+    // across that call so it observes the same lock.
     unsafe {
         match value.map(str::trim).filter(|s| !s.is_empty()) {
             Some(v) => std::env::set_var(key, v),
@@ -89,6 +109,40 @@ pub fn agent_config_load() -> Result<AgentConfig, String> {
 #[tauri::command]
 pub fn agent_config_save(cfg: AgentConfig) -> Result<(), String> {
     write_user_config(&cfg)
+}
+
+/// Pre-flight check used by the chat tab to decide whether to show the
+/// first-run empty-state CTA or attempt to boot a real session.
+///
+/// Returns `true` when *both* a provider is selected *and* the runtime has
+/// some way to authenticate against it: either an api_key in our config,
+/// one of the preset's documented env vars set in the process env, or the
+/// preset legitimately needs no key at all (Ollama).
+///
+/// Cheap — just file read + env lookup, no runtime construction.
+#[tauri::command]
+pub fn agent_is_configured() -> bool {
+    let cfg = read_user_config();
+    let Some(provider) = cfg.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if cfg.api_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    // Match the provider against a preset to learn which env vars count as
+    // valid auth. Unknown provider id (user typed something custom) → fall
+    // back to LPA_API_KEY.
+    let env_vars: Vec<&str> = match lpa_core::preset_by_id(provider) {
+        Some(p) if p.api_key_env_vars.is_empty() => return true, // e.g. Ollama
+        Some(p) => p.api_key_env_vars.to_vec(),
+        None => vec!["LPA_API_KEY"],
+    };
+    // Serialize against apply_env_from_user_config — std::env::set_var
+    // racing with std::env::var is UB on POSIX.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    env_vars
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 /// Curated provider presets from `lpa-core`. Each entry has the wire API
@@ -163,10 +217,17 @@ pub fn agent_session_deleted_ids() -> Vec<String> {
 
 /// Delete a session: remove every rollout file whose name contains the
 /// session_id and add the session_id to the hide-list. Idempotent.
+///
+/// `session_id` MUST look like a UUID — that's what the lpa runtime emits.
+/// Without this guard, a crafted call like `agent_session_delete(".")`
+/// would substring-match every rollout file in the tree.
 #[tauri::command]
 pub fn agent_session_delete(session_id: String) -> Result<(), String> {
-    if session_id.trim().is_empty() {
-        return Err("missing session_id".into());
+    if !is_uuid_like(&session_id) {
+        return Err(format!(
+            "invalid session_id: {} (expected UUID-shaped string)",
+            session_id
+        ));
     }
     let root = agent_data_root().join("sessions");
     if root.exists() {
@@ -181,6 +242,18 @@ pub fn agent_session_delete(session_id: String) -> Result<(), String> {
     set.insert(session_id);
     write_deleted_set(&set)?;
     Ok(())
+}
+
+/// Accepts canonical UUIDs (with or without hyphens, lowercase or uppercase),
+/// 32–36 chars, `[0-9a-fA-F-]` only. Strict enough to keep substring matches
+/// from sweeping unrelated files; tolerant enough to cover whatever shape
+/// future lpa-runtime versions emit.
+fn is_uuid_like(s: &str) -> bool {
+    let len = s.len();
+    if !(32..=36).contains(&len) {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn remove_files_with_marker(dir: &std::path::Path, marker: &str) -> std::io::Result<()> {

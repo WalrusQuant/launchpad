@@ -9,7 +9,7 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 
 ## Product Philosophy
 
-- **Terminal-first.** The terminal is the primary surface, not a sidebar. Every other surface (file browser, git panel, editor tabs) exists to serve work happening in the terminal. AI lives both in the terminal via CLI agents (Claude Code, Aider, OpenCode, goose) and as a chat tab via the integrated launchpad-agent (see `specs/agent-integration-spec.md`).
+- **Terminal-first.** The terminal is the primary surface, not a sidebar. Every other surface (file browser, git panel, editor tabs, agent chat tabs) exists to serve work happening at the terminal. AI lives both in the terminal via CLI agents (Claude Code, Aider, OpenCode, goose) and as a first-class chat tab via the in-process launchpad-agent integration (see `specs/agent-integration-spec.md`). Both surfaces are equal — neither replaces the other.
 - **Project-scoped, one window per project.** A project is just a root directory. No `.launchpad/` folder in the repo, no config files, no lock-in. Working on two projects? Two windows. The alternative — multi-project in one window — sounds cool but ends up rebuilding VS Code's multi-root workspace, which everyone hates. A window IS a project, not a project-spawner. This drives the picker UX (clicking a project takes over the current window; Cmd+Shift+N opens a fresh picker for a parallel project).
 - **CLI agents are first-class, not legacy.** The built-in agent complements them, doesn't replace them. Users who prefer Claude Code in a terminal tab keep using it. Launchpad's job is to make every agent (built-in or CLI) start in the right directory with the right env, undisrupted by accidental `cd`s. This is why the file browser writes nothing to PTYs — the old ⏎ "cd to this directory" button was removed precisely because it was the only file-browser control that could disrupt a running agent.
 - **Not an IDE.** Launchpad is a workspace. No scaffolding, no project templates, no debugger, no language-server-mediated cross-file rename. If you need those, use VS Code or Zed alongside.
@@ -25,7 +25,7 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 ## Project Structure
 ```
 src/                    # Frontend (JS/CSS/HTML)
-  main.js              # App entry, project-gated workspace init, unified tab management (terminal + editor + settings), split workspace, split panes, drag-to-move tabs, keyboard shortcuts, context menus
+  main.js              # App entry, project-gated workspace init, unified tab management (terminal + editor + settings + agent), split workspace, split panes, drag-to-move tabs, keyboard shortcuts, context menus, agent-tool-action listener
   projects.js           # Active project state + thin wrappers around project Tauri commands
   projectpicker.js      # Project picker UI (welcome state / recent list) shown before any workspace exists
   filebrowser.js        # File tree rooted at project.path, context menu, drag & drop, git status colors, CRUD operations
@@ -33,17 +33,34 @@ src/                    # Frontend (JS/CSS/HTML)
   git.js                # Git status polling, file status colors in tree
   gitpanel.js           # Full git panel UI (toolbar, staged/unstaged, commit + amend, branches, history with cherry-pick / rebase-from-here / compare context menu, pending-op banner, conflicts, cheatsheet)
   diffrender.js         # Renders structured diffs (file list + hunks) for the diff tab and commit-detail view
+  diffparse.js          # Unified-diff parser (GNU + lpa "Apply Patch" envelope formats) for agent apply_patch tool cards
   conflictmarkers.js    # Conflict-marker parser + CodeMirror extension (inline action bar, [Open 3-Way] hook)
   quickopen.js          # Cmd+P fuzzy file finder (uses search_files command, ranks by path length)
+  agentchat.js          # Agent chat tab factory + global event router; lazy session start; sessions sidebar; resume + delete
+  agentcomposer.js      # Composer with `@`-mention (search_files-backed) and `/`-skill picker; tracks insertedSkills + mentionedPaths sets; debounced + token-guarded
+  agentmsg.js           # Renderers for assistant text, thinking, tool cards (incl. specialized renderers for apply_patch + write), approval cards, tool_result nesting via tool_use_id
   settings.js           # Persistent settings store (~/.launchpad/config.json)
-  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections)
+  settingspanel.js      # Settings form UI (General, Terminal, Editor, Git, Agent sections)
   styles.css            # All styles (organized by section with comment headers)
 src-tauri/              # Rust backend
-  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings, projects)
-  Cargo.toml            # Rust dependencies
+  src/lib.rs            # Core Tauri commands (PTY, filesystem, git, settings, projects)
+  src/agent/
+    mod.rs              # Agent module exports
+    host.rs             # AgentState (per-process ServerRuntime, per-window connections, mpsc → Tauri events fan-out, reload), starter-skills seeder
+    commands.rs         # Tauri commands for the agent surface (initialize, connect, send, interrupt, approve, session list/resume/delete, skills list, config load/save, reload)
+    config.rs           # ~/.launchpad/agent-config.json schema + atomic-write + LPA_* env apply, agent_is_configured pre-flight
+    native_tools.rs     # Launchpad-native tools (lp_open_in_editor, lp_show_diff, lp_open_merge_tab, lp_refresh_git_panel, lp_reveal_in_finder) emitting Tauri events back to frontend
+  starter-skills/       # Bundled SKILL.md files seeded into ~/.lpagent/skills/ on first run (commit, review, explain, plan)
+  Cargo.toml            # Rust dependencies (path-deps to lpa-* crates in workspace)
   tauri.conf.json       # App configuration
+crates/                 # In-tree port of launchpad-agent (Apache-2.0). Workspace path-deps from src-tauri.
+                       # core, server, provider, tools, safety, mcp, protocol, utils, client, tasks
+                       # See crates/LPA_LICENSE. Manual sync from upstream — bump intentionally, not on a schedule.
+                       # crates/core/default_base_instructions.txt is the model-agnostic system prompt
+                       # (rewritten 2026-05-09 from the original codex-cli copypasta — see specs/agent-integration-spec.md
+                       # "Lessons" section).
 index.html              # Main HTML shell — picker-root + workspace-root sibling containers
-specs/                  # Design specs (project model, agent model, etc.)
+specs/                  # Design specs (project model, agent integration, foundation audit, etc.)
 ```
 
 ## Key Architecture Decisions
@@ -121,6 +138,26 @@ specs/                  # Design specs (project model, agent model, etc.)
 - **Cleanup**: `remove_project` best-effort-calls `forget_project_env` so deleted projects don't leave orphaned secrets behind. Re-adding the project starts with an empty env set.
 - **No keychain**: v1 stores values in the local JSON with `0o600`. Fine for single-user macOS. Revisit if a shared-machine or cross-device-sync story appears.
 
+### Agent (in-process launchpad-agent integration)
+Full design: `specs/agent-integration-spec.md`. The lpa-* crates are vendored under `crates/` (in-tree port, not a submodule) and pulled in as workspace path deps. Runtime runs in-process — no sidecar, no stdio framing. **Read the spec before changing anything in `crates/` — it's the authoritative source for every decision below.**
+
+- **One `ServerRuntime` per process**, lazy-built under `Mutex<Option<Arc<...>>>` so settings changes can drop and rebuild it. `AgentState::runtime(&AppHandle)` is the only constructor; reload tears down all per-window connections, drops the runtime, and the next caller rebuilds.
+- **Per-window connections**, keyed by Tauri window label. Each window registers its own `connection_id` against the shared runtime via `register_connection(ClientTransportKind::WebSocket, mpsc::UnboundedSender)`. WebSocket transport gates event delivery on explicit `events/subscribe` per session — Stdio would leak events across windows. `agent_session_start` auto-subscribes the new session before returning so the frontend can't miss the first delta.
+- **mpsc → Tauri events fan-out**: each connection's `mpsc::UnboundedReceiver<Value>` is drained by a forwarder task that emits `agent:event:<window_label>` events. Frontend installs ONE global listener per window (in `agentchat.js::installGlobalListener`) and routes envelopes to the right tab via the `sessionTabs: Map<session_id, tab>` index.
+- **Sessions are lazy.** `createAgentTab` does NOT call `agent_session_start`. The first user message in a tab triggers `onSend → agent_session_start → events/subscribe → agent_send_message`. Avoids spawning empty "untitled" sessions when users open a tab and walk away.
+- **Save & reload** in the settings panel calls `agent_reload` — drops the runtime + all connections + MCP supervisors. Frontend dispatches `launchpad:agent-reloaded` so open agent tabs reset (clear `sessionId`, mark composer not-active, append a "provider reloaded" notice). Next message in any tab lazy-rebuilds.
+- **First-run empty state**: chat tabs call `agent_is_configured` before initialize. False → in-tab CTA (`renderUnconfiguredEmptyState`) with "Open Settings →" deep-link that scrolls to `#agent-section` and focuses the API key input. Composer disabled until user configures + reloads.
+- **Provider config at `~/.launchpad/agent-config.json`** chmod 0o600 via `atomic_write_with_mode` (same pattern as `project-env.json`). Schema: `{ provider, wire_api, model, base_url, api_key, default_approval_policy }`. `apply_env_from_user_config` always overwrites the LPA_* env vars (never deferring to existing env) so a save-then-reload actually picks up new values. 10 provider presets via `lpa_core::all_presets()` exposed to the frontend through `agent_provider_presets`.
+- **Skills**: workspace skill discovery uses `config.skills.workspace_roots` (default `["skills"]`) joined against the project cwd at `skills/list` time — so per-project skills under `<project>/skills/<name>/SKILL.md` work. User skills come from `<lpa_home>/skills/<name>/SKILL.md`. `agent_skills_list` forwards `project_path` as `cwd` so the catalog walks both. The composer tracks skills picked from the slash menu in `insertedSkills: Set<string>` (parallel to `mentionedPaths`); on submit it forwards the IDs and `agent_send_message` builds `[Skill items..., Mention items..., Text]` so the runtime's `resolve_input_items` injects `<skill>...</skill>` blocks ahead of the user text.
+- **Starter skills bundled at compile time** via `include_str!` in `host.rs::STARTER_SKILLS` (commit / review / explain / plan). `seed_starter_skills_if_missing` runs once during `build_runtime`; if `<lpa_home>/skills/` doesn't exist, it creates the dir and writes the bundled SKILL.md files. Marker is the dir's existence — empty-but-present means the user deleted skills they don't want, do not re-seed.
+- **`@`-file mentions**: composer's `maybeOpenAtPopup` triggers when `@` follows whitespace/newline/start (not mid-word, so emails are safe). Backed by `search_files` with 120ms debounce + `atFetchToken` stale-token guard so fast typing doesn't fire dozens of RPCs. Inserts `@<rel-path>` literal in the textarea + records absolute path in `mentionedPaths`. On submit, only forwards mentions whose `@<rel>` token is still in the final text (so deleted picks don't leak structured mentions).
+- **Tool cards**: generic for `tool_call` / `mcp_tool_call` / `command_execution` / `file_change` / `web_search` / `image_view` / `plan` (titles extracted from `payload.input` like `bash · cargo check`, `read · path/...`). Specialized renderers in `agentmsg.js::populateInitial`: `apply_patch` parses `patchText` via `diffparse.js` and renders with `buildFileDiffSection` from the git panel's `diffrender.js` — same chrome the diff/compare tab uses. `write` shows path + line/char count + capped (2KB) content preview.
+- **`tool_result` nesting**: results link to their parent call by `tool_use_id` (the runtime emits `tool_use_id`, NOT `call_item_id`). `toolUseIndex: Map<tool_use_id, item_id>` lets `handleItemStarted` for `tool_result` find the parent's `.tool-result-slot`. Falls back to a free-floating result card if the call wasn't seen (e.g. on session resume mid-flight).
+- **Cost / usage footer**: `turn/usage/updated` populates a tiny muted line per turn showing `↑ in · ↓ out · cache hit/write · session totals`. `tab.currentTurnUsageEl` is reset on `turn/started` so each turn gets a fresh footer.
+- **Approval flow**: `approval/requested` events render an inline card with all six scopes (Once / Turn / Session / PathPrefix / Host / Tool). On response, calls `agent_approve` and the card collapses to a one-line summary. Note: today the runtime hardcodes `SessionConfig::default()` → `AutoApprove` (in `crates/server/src/execution.rs:90`) and there's no path to override it — so approval cards never actually fire in practice. Fix is in the vendored crate; see spec § "Blocked".
+- **Launchpad-native tools** in `src-tauri/src/agent/native_tools.rs`: `lp_open_in_editor`, `lp_show_diff`, `lp_open_merge_tab`, `lp_refresh_git_panel`, `lp_reveal_in_finder`. Each `Box<dyn Tool>` holds an `AppHandle` and emits a `launchpad:agent-tool-action` event with `{tool, payload}`. Frontend listener at the bottom of `main.js` routes each tool to `createEditorTab` / `createDiffTab` / `createMergeTab` / `fetchGitStatus + refreshPanel` / `reveal_in_finder` Tauri command. All five are `is_read_only` so the orchestrator skips approval round-trips.
+- **System prompt at `crates/core/default_base_instructions.txt`** is loaded into every turn via `include_str!`. Was originally codex-cli copypasta with fake tool references (`multi_tool_use.parallel`) and codex-only IPC concepts (`commentary` / `final` channels) — caused observable retry loops under non-OpenAI providers. Rewritten 2026-05-09 to be model-agnostic; rebuild required to pick up changes (it's `include_str!`-ed). When changing this file: keep it concise, list only the tools the registry actually has, never reference channels/concepts the runtime doesn't implement.
+
 ## Commands
 
 ### Development
@@ -153,6 +190,7 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 | Cmd+Option+Left/Right | Switch focused group |
 | Cmd+Shift+M | Move tab to other group |
 | Cmd+G | Toggle git panel |
+| Cmd+I | New agent chat tab |
 | Cmd+P | Quick open file |
 | Cmd+F | Find in editor / search file tree |
 | Cmd+H | Find and replace in editor |
@@ -237,6 +275,27 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - `save_project_env_vars(path, vars)` — validates each key against POSIX rules (`[A-Za-z_][A-Za-z0-9_]*`), writes `~/.launchpad/project-env.json` atomically with `0o600`. Empty `vars` removes the entry.
 - `forget_project_env(path)` — drops the entry for `path`. Called automatically from `remove_project`; exposed as a command for completeness. Missing / unparseable file succeeds silently.
 
+### Agent
+Defined in `src-tauri/src/agent/{commands.rs, config.rs}`. Two flavors: thin pass-through (`agent_send_envelope`) plus typed wrappers that build the JSON-RPC envelope server-side. All commands take `tauri::Window` so they route to the right per-window connection.
+
+- `agent_initialize` — initialize handshake; required once per connection before any other request. Window-level.
+- `agent_connect` / `agent_disconnect` — establish or tear down this window's connection to the runtime. `agent_connect` returns the `connection_id`. Most callers don't need this directly — `require_connection_id` lazy-connects on first use.
+- `agent_send_envelope(envelope)` — pass-through JSON-RPC. Used for anything without a typed wrapper.
+- `agent_session_start(project_path?, model?)` — `session/start` envelope. Auto-subscribes the new session to the calling connection so the frontend can't miss the first delta. Returns `{result: {session_id, resolved_model, ...}}`.
+- `agent_send_message(session_id, text, mentions?, skills?)` — `turn/start` envelope. Builds input as `[Skill items..., Mention items..., Text]` so the runtime resolves SKILL.md content and file mentions before the user's text. Returns `{result: {turn_id}}`.
+- `agent_interrupt_turn(session_id, turn_id?, reason?)` — `turn/interrupt` envelope; cancels the active turn for the session.
+- `agent_approve(session_id, approval_id, decision, scope?)` — `approval/respond` envelope. Scope is one of `once / turn / session / path_prefix / host / tool`.
+- `agent_subscribe_events(session_id)` — `events/subscribe` envelope. Idempotent server-side; called explicitly when resuming a session.
+- `agent_session_list()` — `session/list` envelope; returns persisted sessions.
+- `agent_session_resume(session_id)` — `session/resume` envelope. Returns `{session, history_items}`; frontend replays history into the chat surface.
+- `agent_skills_list(project_path?)` — `skills/list` envelope. `project_path` is forwarded as `cwd` so the catalog walks per-project workspace skill roots.
+- `agent_config_load() -> AgentConfig` / `agent_config_save(cfg)` — read/write `~/.launchpad/agent-config.json` (chmod 0o600).
+- `agent_is_configured() -> bool` — pre-flight used by the chat tab's first-run gate. Returns true when a provider is set AND we have a key (in config, in any of the preset's `api_key_env_vars`, OR the preset legitimately needs no key like Ollama).
+- `agent_provider_presets() -> Vec<ProviderPresetView>` — the 10 curated provider presets (Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, Z.ai coding plan, Custom). Settings dropdown is data-driven from this so adding a preset upstream auto-appears.
+- `agent_reload()` — drops the runtime + all per-window connections + MCP supervisors. Next `runtime()` call rebuilds with fresh env from `agent-config.json`.
+- `agent_session_delete(session_id)` — removes rollout files matching `<session_id>` from `<lpa_home>/sessions/` AND adds the id to `~/.launchpad/agent-deleted-sessions.json` hide-list (the in-memory runtime map keeps the entry until next reload, so the frontend filters by hide-list).
+- `agent_session_deleted_ids() -> Vec<String>` — read the hide-list. Frontend filters `agent_session_list` results by this set.
+
 ## Adding a New Rust Command
 1. Add the function with `#[tauri::command]` in `src-tauri/src/lib.rs`
 2. Register it in the `invoke_handler` in `run()`
@@ -250,9 +309,18 @@ cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 - Editor features → `editor.js`
 - Settings → `settingspanel.js` (UI) + `settings.js` (storage)
 - Project picker / project data → `projectpicker.js` (UI) + `projects.js` (state)
+- Agent chat tab → `agentchat.js` (factory + event router) + `agentmsg.js` (renderers) + `agentcomposer.js` (composer with `@` and `/` pickers)
+- Agent backend → `src-tauri/src/agent/` (split: `commands.rs` for Tauri surface, `host.rs` for AgentState/runtime/seeder, `config.rs` for `~/.launchpad/agent-config.json`, `native_tools.rs` for `lp_*` tools)
 - Styles → `styles.css` (organized by section with comment headers)
 
 **Project-scoped features rule**: when wiring a new feature that cares about "the current directory", use `getActiveProject().path` (or a closure over it) — **not** `getCurrentPath()` from the file browser. `getCurrentPath()` tracks sub-folder navigation; only the file browser itself should read it.
+
+**Agent integration rules**:
+- Anything that touches `crates/` (the vendored lpa runtime) — read `specs/agent-integration-spec.md` first. The crates are in-tree but treated as upstream code; bumps are intentional, not on a schedule.
+- New Tauri commands for the agent live in `src-tauri/src/agent/commands.rs`, not `lib.rs`. Register them in the `invoke_handler` block in `lib.rs::run()` alongside the existing `agent::*` entries.
+- Adding a Launchpad-native tool: implement `lpa_tools::Tool` in `native_tools.rs`, mark `is_read_only` if it doesn't mutate user state, register in `register_native_tools`. Mention it in `crates/core/default_base_instructions.txt` so the model knows it exists.
+- Frontend-side native tool routing lives at the bottom of `main.js` (`launchpad:agent-tool-action` listener). Add a new `case` per tool name.
+- Adding a starter skill: drop `src-tauri/starter-skills/<name>/SKILL.md`, then add a `(name, include_str!(...))` tuple to `STARTER_SKILLS` in `src-tauri/src/agent/host.rs`.
 
 ## Git Panel Architecture
 The git panel (`gitpanel.js`) rebuilds its innerHTML on every refresh but uses a snapshot comparison (`JSON.stringify`) to skip redundant re-renders during 3-second polling. Module-level state (`expandedCommitOid`) persists across re-renders.

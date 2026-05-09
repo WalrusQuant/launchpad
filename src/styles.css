@@ -4320,6 +4320,14 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   font-size: 12px;
   font-style: italic;
 }
+.agent-turn-usage {
+  align-self: stretch;
+  font-size: 11px;
+  color: var(--text-4);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 0 2px;
+  margin-top: -8px;
+}
 .agent-thinking-dot {
   width: 6px;
   height: 6px;
@@ -4334,6 +4342,56 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
   40% { opacity: 1; transform: translateY(-3px); }
 }
+
+/* First-run empty state — shown when no provider is configured. */
+.agent-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  margin: auto;
+  padding: 48px 24px;
+  max-width: 480px;
+  color: var(--text-7);
+}
+.agent-empty-state-icon {
+  font-size: 36px;
+  color: var(--accent-blue);
+  margin-bottom: 16px;
+  opacity: 0.85;
+}
+.agent-empty-state-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-11);
+  margin: 0 0 10px 0;
+}
+.agent-empty-state-body {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-5);
+  margin: 0 0 20px 0;
+}
+.agent-empty-state-body code {
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text-7);
+}
+.agent-empty-state-btn {
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+.agent-empty-state-btn:hover { filter: brightness(1.1); }
 .tool-card-toggle {
   background: none;
   border: none;
@@ -4395,6 +4453,44 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   color: var(--text-11);
   padding: 0 0 6px 0;
 }
+
+/* apply_patch / write previews. Reuses the diff classes from diffrender.js
+   (.diff-file-section / .diff-hunk-header / etc. are defined elsewhere). */
+.tool-diff-summary {
+  font-size: 12px;
+  color: var(--text-7);
+  padding: 0 0 6px 0;
+}
+.tool-diff-summary .diff-add-count { color: var(--accent-green); }
+.tool-diff-summary .diff-del-count { color: var(--accent-red); }
+.tool-diff-body {
+  border: 1px solid var(--border-1);
+  border-radius: 4px;
+  overflow: hidden;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.tool-diff-body .diff-file-section { margin: 0; }
+.tool-diff-body .diff-file-header {
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-1);
+  padding: 4px 8px;
+  font-size: 11.5px;
+  display: flex;
+  justify-content: space-between;
+}
+.tool-write-head {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text-11);
+  padding: 0 0 2px 0;
+}
+.tool-write-meta {
+  font-size: 11.5px;
+  color: var(--text-5);
+  padding: 0 0 6px 0;
+}
+.tool-write-preview { max-height: 360px; }
 
 /* Nested tool_result inside its parent tool_call — strip the outer chrome
    and show a subtle indent so it reads as "this call → this result". */
@@ -4612,6 +4708,9 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 }
 .agent-composer-btn:hover { filter: brightness(1.1); }
 .agent-composer-cancel { background: var(--accent-red); }
+.agent-composer-disabled { opacity: 0.55; }
+.agent-composer-disabled .agent-composer-btn { cursor: not-allowed; }
+.agent-composer-input:disabled { cursor: not-allowed; }
 
 /* Slash command picker — anchored above the composer input. */
 .agent-composer { position: relative; }
@@ -4649,6 +4748,37 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.agent-slash-empty {
+  padding: 12px 14px;
+  cursor: default;
+}
+.agent-slash-empty-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-11);
+  margin-bottom: 6px;
+}
+.agent-slash-empty-body {
+  font-size: 11.5px;
+  color: var(--text-5);
+  line-height: 1.5;
+}
+.agent-slash-empty-body code {
+  font-size: 11px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--text-7);
+}
+.agent-slash-empty-body kbd {
+  font-size: 10.5px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  padding: 0 5px;
+  border-radius: 3px;
+  font-family: inherit;
+  color: var(--text-9);
 }
 
 .settings-feedback {
