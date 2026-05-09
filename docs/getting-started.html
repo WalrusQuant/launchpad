@@ -93,6 +93,7 @@ npm run dev</code></pre>
           <li>The <strong>terminal</strong> on the right spawns at the project root.</li>
           <li>Press <kbd>⌘G</kbd> to open the <strong>git panel</strong> if the directory is a git repo.</li>
           <li>Press <kbd>⌘P</kbd> to <strong>fuzzy-search</strong> files in the project.</li>
+          <li>Press <kbd>⌘I</kbd> to open the <strong>built-in chat agent</strong>. First time, you'll be prompted to configure a provider in Settings (Anthropic, OpenAI, Z.ai, Ollama, ...).</li>
         </ul>
         <p>Open as many files as you like — each opens as an editor tab next to your terminal tabs in a single unified tab bar.</p>
 
@@ -110,12 +111,15 @@ npm run dev</code></pre>
         <p>The <kbd>←</kbd> button in the toolbar tears down the workspace and returns to the picker.</p>
 
         <h2 id="config">Config files</h2>
-        <p>Launchpad persists two files under <code>~/.launchpad/</code>:</p>
+        <p>Launchpad persists state under <code>~/.launchpad/</code>:</p>
         <ul>
-          <li><code>~/.launchpad/config.json</code> — settings (font, size, scrollback, git refresh interval, etc.)</li>
-          <li><code>~/.launchpad/projects.json</code> — your recent projects list</li>
+          <li><code>config.json</code> — settings (font, size, scrollback, git refresh interval, etc.)</li>
+          <li><code>projects.json</code> — your recent projects list</li>
+          <li><code>agent-config.json</code> — agent provider, model, API key (chmod 0o600)</li>
+          <li><code>project-env.json</code> — per-project environment variables (chmod 0o600)</li>
         </ul>
-        <p>Both are plain JSON. You can edit them by hand if you want — changes to <code>config.json</code> are picked up on app restart.</p>
+        <p>All plain JSON. You can edit them by hand if you want — changes to <code>config.json</code> are picked up on app restart; agent settings get a Save &amp; reload button so no restart needed.</p>
+        <p>Skills for the built-in agent live under <code>~/.lpagent/skills/&lt;name&gt;/SKILL.md</code>. Four are seeded on first run; add your own by dropping a new folder.</p>
         <p>Open the settings UI any time with <kbd>⌘,</kbd>.</p>
 
         <h2 id="troubleshooting">Troubleshooting</h2>

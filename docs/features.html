@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Features — Launchpad</title>
-  <meta name="description" content="Full feature reference for Launchpad: projects, terminals, editor, git panel, file browser, quick open, and settings." />
+  <meta name="description" content="Full feature reference for Launchpad: projects, terminals, editor, built-in chat agent, git panel, file browser, quick open, and settings." />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
 <body>
@@ -28,6 +28,7 @@
         <a href="#projects">Projects</a>
         <a href="#terminal">Terminal</a>
         <a href="#editor">Code editor</a>
+        <a href="#agent">Built-in agent</a>
         <a href="#git">Git panel</a>
         <a href="#filebrowser">File browser</a>
         <a href="#quickopen">Quick open</a>
@@ -116,6 +117,68 @@
           <li>Right-click context menu (Cut, Copy, Paste, Select All)</li>
           <li>Save with <kbd>⌘S</kbd></li>
         </ul>
+
+        <h2 id="agent">Built-in agent (⌘I)</h2>
+        <p>
+          A chat coding agent built into Launchpad as its own tab type, alongside
+          terminal and editor tabs. Runs in-process — no sidecar binary, no stdio
+          framing — by depending on the
+          <a href="https://github.com/WalrusQuant/launchpad-agent">launchpad-agent</a>
+          crates directly. CLI agents like <code>claude</code> and <code>aider</code>
+          still work in terminal tabs; this is a complementary surface, not a
+          replacement.
+        </p>
+
+        <div class="shot">
+          <div class="shot-frame">
+            <img src="media/agent.png" alt="Launchpad agent chat tab — apply_patch and read tool cards in a coding session" />
+          </div>
+        </div>
+
+        <h3>Providers and models</h3>
+        <ul>
+          <li><strong>10 provider presets</strong> — Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, Z.ai (coding plan), and a Custom OpenAI-compatible endpoint.</li>
+          <li><strong>Save &amp; reload</strong> — change provider or API key in settings, hit Save &amp; reload, no app restart. Open chat tabs reconnect on next message.</li>
+          <li><strong>API keys at <code>~/.launchpad/agent-config.json</code></strong> — chmod 0o600, owner read/write only.</li>
+        </ul>
+
+        <h3>Conversation surface</h3>
+        <ul>
+          <li><strong>Markdown streaming</strong> with code-block highlighting; tool cards collapse and expand for every action the agent takes.</li>
+          <li><strong>Per-tool diff cards</strong> for <code>apply_patch</code> — parses the unified diff and renders with the same renderer the git panel uses (file header, hunks, +/- counts, color coding). <code>write</code> shows path + line/char count + capped content preview.</li>
+          <li><strong>Cost / usage footer</strong> per turn — input/output tokens, cache hit/write, session totals.</li>
+          <li><strong>Approval cards</strong> for tools that need permission, with six scopes (Once / Turn / Session / Path Prefix / Host / Tool).</li>
+        </ul>
+
+        <h3>Composer</h3>
+        <ul>
+          <li><strong><code>@</code> file mentions</strong> — type <code>@</code> to fuzzy-search project files (same index <kbd>⌘P</kbd> uses). Picked files become structured context the agent receives directly.</li>
+          <li><strong><code>/</code> slash commands</strong> — type <code>/</code> to pick a skill, a <code>SKILL.md</code> document under <code>~/.lpagent/skills/&lt;name&gt;/</code> or <code>&lt;project&gt;/skills/&lt;name&gt;/</code>. The skill's body gets injected into the next turn as system context.</li>
+          <li><strong>Four starter skills bundled and seeded on first run:</strong> <code>/commit</code> (generate a conventional commit message), <code>/review</code> (review the staged diff), <code>/explain</code> (walk through code), <code>/plan</code> (break a feature into phased steps).</li>
+        </ul>
+
+        <h3>Workspace integration</h3>
+        <p>
+          The agent can drive Launchpad's UI directly through five Launchpad-native tools — so when it edits a file, it can show you the change without you having to find it.
+        </p>
+        <ul>
+          <li><code>lp_open_in_editor</code> — open a file in an editor tab (optionally at a line/column)</li>
+          <li><code>lp_show_diff</code> — open a diff tab between two git refs</li>
+          <li><code>lp_open_merge_tab</code> — open the 3-pane merge tab for a conflicted file</li>
+          <li><code>lp_refresh_git_panel</code> — force the git panel to refresh (called after <code>git commit</code>)</li>
+          <li><code>lp_reveal_in_finder</code> — reveal a file in macOS Finder</li>
+        </ul>
+
+        <h3>Sessions</h3>
+        <ul>
+          <li><strong>Persistent</strong> — past conversations sit in a sidebar (☰ button), resumable from any window.</li>
+          <li><strong>Lazy</strong> — opening a chat tab doesn't spawn a session. The runtime sees nothing until you send the first message, so empty tabs don't clutter the list.</li>
+          <li><strong>Per-row delete</strong> — × on hover removes the rollout file from disk and hides the session from the list.</li>
+        </ul>
+
+        <div class="callout">
+          <strong>In-process, not sidecar.</strong> The agent runtime is a set of Rust crates (<code>lpa-core</code>, <code>lpa-server</code>, <code>lpa-provider</code>, <code>lpa-tools</code>, <code>lpa-safety</code>, <code>lpa-mcp</code>, <code>lpa-protocol</code>, <code>lpa-utils</code>) compiled into the Tauri binary. Streaming text deltas are mpsc sends, not stdout reads. See <a href="architecture.html#agent">Architecture &rarr; Agent</a>.
+        </div>
 
         <h2 id="git">Git panel</h2>
         <p>
@@ -206,8 +269,11 @@
           <li><strong>Terminal</strong> — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink</li>
           <li><strong>Editor</strong> — font size, tab size, word wrap</li>
           <li><strong>Git</strong> — auto-refresh interval, default commit prefix</li>
+          <li><strong>Agent</strong> — provider preset, API key, default model, base URL. <em>Save &amp; reload</em> rebuilds the runtime in place — no app restart.</li>
         </ul>
-        <p>Settings saved to <code>~/.launchpad/config.json</code>. Project list saved to <code>~/.launchpad/projects.json</code>.</p>
+        <p>
+          Settings saved to <code>~/.launchpad/config.json</code>. Project list saved to <code>~/.launchpad/projects.json</code>. Agent config saved to <code>~/.launchpad/agent-config.json</code> (chmod 0o600).
+        </p>
 
         <hr/>
         <p>Keep going: <a href="shortcuts.html">keyboard shortcuts</a> · <a href="architecture.html">architecture</a>.</p>

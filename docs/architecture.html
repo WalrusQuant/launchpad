@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Architecture — Launchpad</title>
-  <meta name="description" content="How Launchpad is built: Tauri v2, Rust backend, vanilla JS frontend, PTY via portable-pty, git via libgit2 + system git." />
+  <meta name="description" content="How Launchpad is built: Tauri v2, Rust backend, vanilla JS frontend, PTY via portable-pty, git via libgit2 + system git, in-process launchpad-agent integration." />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
 <body>
@@ -32,6 +32,7 @@
         <a href="#pty">PTY lifecycle</a>
         <a href="#filebrowser">File browser</a>
         <a href="#git">Git backend</a>
+        <a href="#agent">Agent</a>
         <a href="#ipc">Tauri commands</a>
         <a href="#contributing">Contributing</a>
       </aside>
@@ -48,9 +49,11 @@
         <ul>
           <li><strong>Tauri v2</strong> — the native shell. Gives us a Swift / Objective-C free macOS window with a system WebView inside.</li>
           <li><strong>Rust</strong> — PTY management (<code>portable-pty</code>), filesystem ops, git via <code>git2</code> (libgit2 bindings) plus shelled-out system <code>git</code> for network operations. Filesystem watching via <code>notify</code> (FSEvents on macOS).</li>
+          <li><strong><a href="https://github.com/WalrusQuant/launchpad-agent">launchpad-agent</a> crates</strong> — <code>lpa-core</code>, <code>lpa-server</code>, <code>lpa-provider</code>, <code>lpa-tools</code>, <code>lpa-safety</code>, <code>lpa-mcp</code>, <code>lpa-protocol</code>, <code>lpa-utils</code>. Copied in-tree under <code>crates/</code> and pulled in as workspace path deps. Run in-process via mpsc → Tauri events.</li>
           <li><strong>Vanilla JS</strong> — all frontend logic, direct DOM manipulation.</li>
           <li><strong>xterm.js 6</strong> — the terminal emulator, with WebGL renderer and Unicode 11 width tables.</li>
           <li><strong>CodeMirror 6</strong> — the editor, with syntax highlighting, search, autocompletion, bracket matching, code folding.</li>
+          <li><strong>marked</strong> — markdown rendering for assistant messages in the chat tab.</li>
           <li><strong>Vite</strong> — frontend bundler.</li>
         </ul>
 
@@ -64,19 +67,37 @@
   git.js              # Git status polling, file status colors, pending-op snapshot
   gitpanel.js         # Full git panel UI (incl. amend, cherry-pick, rebase ctx menu)
   diffrender.js       # Renders structured diffs for the diff tab + commit detail
+  diffparse.js        # Unified-diff parser used by the apply_patch tool card
   conflictmarkers.js  # Conflict-marker parser + CodeMirror inline editor
   quickopen.js        # Cmd+P fuzzy file finder
+  agentchat.js        # Agent chat tab factory + global event router
+  agentcomposer.js    # Composer with @-mentions and /-skill picker
+  agentmsg.js         # Message + tool-card renderers (incl. apply_patch + write)
   settings.js         # Persistent settings store (~/.launchpad/config.json)
   settingspanel.js    # Settings form UI
   styles.css          # All styles, organized by section
 
 src-tauri/            # Rust backend
-  src/lib.rs          # All Tauri commands (PTY, fs, git, settings, projects)
-  Cargo.toml          # Rust deps
+  src/lib.rs          # Core Tauri commands (PTY, fs, git, settings, projects)
+  src/agent/          # Agent module
+    mod.rs              # Module exports
+    host.rs             # AgentState (per-process runtime, per-window connections,
+                        # mpsc → Tauri events, starter-skills seeder)
+    commands.rs         # Tauri commands for the agent surface
+    config.rs           # ~/.launchpad/agent-config.json + LPA_* env apply
+    native_tools.rs     # lp_open_in_editor, lp_show_diff, lp_open_merge_tab,
+                        # lp_refresh_git_panel, lp_reveal_in_finder
+  starter-skills/     # Bundled SKILL.md (commit, review, explain, plan)
+  Cargo.toml          # Rust deps (workspace path-deps to lpa-* crates)
   tauri.conf.json     # App config
 
+crates/               # In-tree port of launchpad-agent (Apache-2.0)
+                      # core, server, provider, tools, safety, mcp,
+                      # protocol, utils, client, tasks
+                      # Manual sync from upstream — see crates/LPA_LICENSE
+
 index.html            # HTML shell — picker-root + workspace-root siblings
-specs/                # Design specs (project model, agent model, etc.)</code></pre>
+specs/                # Design specs (project model, agent integration, etc.)</code></pre>
 
         <h2 id="projects">Projects model</h2>
         <p>
@@ -125,11 +146,14 @@ specs/                # Design specs (project model, agent model, etc.)</code></
 
         <h2 id="tabs">Tab system &amp; split workspace</h2>
         <p>
-          <strong>Unified tab bar.</strong> Terminal tabs, editor tabs, and the
-          settings tab share one tab bar. Each tab has a <code>type</code> field
-          (<code>"terminal"</code>, <code>"editor"</code>, or <code>"settings"</code>)
-          and tab-type guards protect terminal-specific code (fitAllPanes, PTY
-          writes, split panes).
+          <strong>Unified tab bar.</strong> Terminal tabs, editor tabs, agent
+          chat tabs, the settings tab, and the diff / rebase / merge tabs all
+          share one tab bar. Each tab has a <code>type</code> field
+          (<code>"terminal"</code>, <code>"editor"</code>, <code>"agent"</code>,
+          <code>"settings"</code>, <code>"diff"</code>, <code>"rebase"</code>,
+          or <code>"merge"</code>) and tab-type guards protect type-specific
+          code (fitAllPanes, PTY writes, split panes for terminals;
+          editor-specific Cmd+S also handles merge).
         </p>
         <p>
           <strong>Split workspace.</strong> <kbd>⌘\</kbd> toggles a vertical
@@ -269,8 +293,96 @@ specs/                # Design specs (project model, agent model, etc.)</code></
           before <code>view.destroy()</code> to avoid view-retention leaks.
         </p>
 
+        <h2 id="agent">Agent</h2>
+        <p>
+          The chat tab is backed by an in-process integration of
+          <a href="https://github.com/WalrusQuant/launchpad-agent">launchpad-agent</a>.
+          The lpa crates are vendored in-tree under <code>crates/</code> (full
+          source, not a git submodule) and pulled in as workspace path deps.
+          Same Rust binary, no sidecar, no stdio framing.
+        </p>
+
+        <h3>Runtime + connections</h3>
+        <p>
+          One <code>ServerRuntime</code> per process, lazy-built under
+          <code>Mutex&lt;Option&lt;Arc&lt;...&gt;&gt;&gt;</code> so settings
+          changes can drop and rebuild it. Each Tauri window registers its own
+          <code>connection_id</code> against the shared runtime; outbound JSON
+          envelopes are forwarded as Tauri events on
+          <code>agent:event:&lt;window_label&gt;</code>. Frontend installs ONE
+          listener per window and routes envelopes by <code>session_id</code>
+          to the right tab.
+        </p>
+        <p>
+          Transport label is <code>WebSocket</code> (not <code>Stdio</code>)
+          because Stdio always delivers every event to every connection — would
+          leak across windows. WebSocket gates delivery on explicit
+          <code>events/subscribe</code> per session;
+          <code>agent_session_start</code> auto-subscribes the new session
+          before returning.
+        </p>
+
+        <h3>Save &amp; reload</h3>
+        <p>
+          Settings panel's <em>Save &amp; reload</em> button calls
+          <code>agent_reload</code> — drops every per-window connection, shuts
+          down MCP supervisors, drops the runtime. Frontend dispatches a
+          <code>launchpad:agent-reloaded</code> DOM event so open chat tabs
+          reset session state. The next message lazy-rebuilds against the new
+          provider.
+        </p>
+
+        <h3>Sessions are lazy</h3>
+        <p>
+          <code>createAgentTab</code> does NOT call
+          <code>agent_session_start</code>. The first message in a tab triggers
+          <code>onSend → agent_session_start → events/subscribe →
+          agent_send_message</code>. Avoids spawning empty "untitled" sessions
+          when users open a tab and walk away.
+        </p>
+
+        <h3>Skills</h3>
+        <p>
+          Skill picker (<kbd>/</kbd> in composer) sends a structured
+          <code>InputItem::Skill { id }</code> on submit so the runtime
+          resolves the SKILL.md body from
+          <code>~/.lpagent/skills/&lt;name&gt;/SKILL.md</code> or
+          <code>&lt;project&gt;/skills/&lt;name&gt;/SKILL.md</code> and
+          prepends <code>&lt;skill&gt;...&lt;/skill&gt;</code> blocks ahead of
+          the user's text. Four starter skills (<code>commit</code>,
+          <code>review</code>, <code>explain</code>, <code>plan</code>) are
+          bundled at compile time via <code>include_str!</code> and seeded
+          into the user's skills folder on first run if it doesn't exist.
+        </p>
+
+        <h3>Launchpad-native tools</h3>
+        <p>
+          <code>src-tauri/src/agent/native_tools.rs</code> registers five
+          <code>Box&lt;dyn Tool&gt;</code> entries into the registry alongside
+          the lpa builtins. Each holds an <code>AppHandle</code> and emits a
+          <code>launchpad:agent-tool-action</code> Tauri event with
+          <code>{ tool, payload }</code>. Frontend listener at the bottom of
+          <code>main.js</code> routes each tool to the right surface
+          (<code>createEditorTab</code>, <code>createDiffTab</code>,
+          <code>createMergeTab</code>, <code>refreshPanel</code>,
+          <code>reveal_in_finder</code>). All five marked
+          <code>is_read_only</code> so the orchestrator skips approval
+          round-trips.
+        </p>
+
+        <div class="callout">
+          <strong>System prompt is model-agnostic.</strong>
+          <code>crates/core/default_base_instructions.txt</code> is loaded into
+          every turn via <code>include_str!</code>. Originally inherited from
+          OpenAI Codex CLI (referenced fake tools and codex-only IPC channels),
+          which caused observable retry loops under non-OpenAI providers. Now
+          rewritten to list only the registered tools, match the actual
+          runtime behavior, and tell the model "trust tool results — do not
+          retry to verify."
+        </div>
+
         <h2 id="ipc">Tauri commands (Rust → JS IPC)</h2>
-        <p>All commands live in <code>src-tauri/src/lib.rs</code>. A partial index:</p>
+        <p>Core commands live in <code>src-tauri/src/lib.rs</code>; agent commands in <code>src-tauri/src/agent/</code>. A partial index:</p>
 
         <h3>PTY</h3>
         <ul>
@@ -305,6 +417,22 @@ specs/                # Design specs (project model, agent model, etc.)</code></
           <li><code>load_projects</code>, <code>add_project</code>, <code>remove_project</code>, <code>rename_project</code>, <code>touch_project</code></li>
           <li><code>focus_project_window</code>, <code>register_project_window</code>, <code>unregister_project_window</code></li>
           <li><code>open_new_window(path?)</code> — creates a new Tauri window (with path: URL <code>?folder=&lt;path&gt;</code>; without: boots into picker)</li>
+        </ul>
+
+        <h3>Agent</h3>
+        <ul>
+          <li><code>agent_initialize</code>, <code>agent_connect</code>, <code>agent_disconnect</code> — handshake + per-window connection lifecycle</li>
+          <li><code>agent_send_envelope(envelope)</code> — JSON-RPC pass-through</li>
+          <li><code>agent_session_start(project_path?, model?)</code> — auto-subscribes the new session before returning</li>
+          <li><code>agent_send_message(session_id, text, mentions?, skills?)</code> — builds input as <code>[Skill items..., Mention items..., Text]</code></li>
+          <li><code>agent_interrupt_turn(session_id, turn_id?, reason?)</code></li>
+          <li><code>agent_approve(session_id, approval_id, decision, scope?)</code></li>
+          <li><code>agent_subscribe_events(session_id)</code></li>
+          <li><code>agent_session_list</code>, <code>agent_session_resume(session_id)</code>, <code>agent_session_delete(session_id)</code>, <code>agent_session_deleted_ids</code></li>
+          <li><code>agent_skills_list(project_path?)</code> — forwards <code>cwd</code> so per-project workspace skills are discovered</li>
+          <li><code>agent_config_load</code>, <code>agent_config_save(cfg)</code>, <code>agent_is_configured</code> — pre-flight used by the chat tab's first-run gate</li>
+          <li><code>agent_provider_presets</code> — the 10 curated presets</li>
+          <li><code>agent_reload</code> — drops runtime + connections + MCP supervisors; next call rebuilds</li>
         </ul>
 
         <h2 id="contributing">Contributing</h2>

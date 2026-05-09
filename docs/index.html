@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Launchpad — terminal-first macOS workspace</title>
-  <meta name="description" content="A native macOS workspace for running Claude Code and other CLI coding agents. Terminal, file browser, git panel, and a simple code editor — all scoped to a project. Apache 2.0 licensed." />
+  <meta name="description" content="A native macOS workspace for running Claude Code, Aider, and other CLI coding agents — plus a built-in chat agent. Terminal, file browser, git panel, code editor, all scoped to a project. Apache 2.0 licensed." />
   <meta property="og:title" content="Launchpad — terminal-first macOS workspace" />
-  <meta property="og:description" content="A native macOS workspace for running CLI coding agents. Terminal, file browser, git panel, simple editor — scoped to one project per window." />
+  <meta property="og:description" content="A native macOS workspace for running CLI coding agents — plus a built-in chat agent. Terminal, file browser, git panel, editor — scoped to one project per window." />
   <meta property="og:image" content="media/landing.png" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
@@ -30,9 +30,10 @@
       <h1>Your terminal,<br/><span class="accent">with everything around it.</span></h1>
       <p class="lede">
         A native macOS workspace for running Claude Code, Aider, and other CLI
-        coding agents. A real PTY terminal up front, with the visual tools you
-        actually want around it — a file browser, a git panel, and a simple
-        code editor.
+        coding agents — plus a built-in chat agent. A real PTY terminal up front,
+        with the visual tools you actually want around it: a file browser, a git
+        panel, a simple code editor, and an in-process AI chat tab that ships
+        with 10 provider presets.
       </p>
       <div class="cta-row">
         <a href="https://github.com/WalrusQuant/launchpad/releases/latest" class="btn btn-primary">Download for macOS →</a>
@@ -73,6 +74,16 @@
               signal handling, 256 colors, Unicode 11 widths, WebGL rendering.
               Run <code>claude</code>, <code>aider</code>, or anything else you
               normally run in a terminal.
+            </p>
+          </div>
+          <div class="card">
+            <h3>// built-in agent</h3>
+            <p>
+              A chat coding agent as its own tab type. 10 provider presets
+              (Anthropic, OpenAI, Google, Z.ai, Ollama, ...). Streaming
+              markdown, tool cards with inline diffs, <code>@</code>-file
+              mentions, <code>/</code>-skills with four bundled to start. CLI
+              agents still work — this is a complementary surface.
             </p>
           </div>
           <div class="card">
@@ -160,12 +171,29 @@ cp -R src-tauri/target/release/bundle/macos/Launchpad.app /Applications/</code><
         <table class="kbd-table">
           <tr><td><kbd>⌘P</kbd></td><td>Quick open file (fuzzy search across the project)</td></tr>
           <tr><td><kbd>⌘T</kbd> / <kbd>⌘W</kbd></td><td>New terminal tab / close tab</td></tr>
+          <tr><td><kbd>⌘I</kbd></td><td>New agent chat tab</td></tr>
           <tr><td><kbd>⌘D</kbd></td><td>Split terminal pane (two PTYs in one tab)</td></tr>
           <tr><td><kbd>⌘\</kbd></td><td>Split workspace into left/right groups</td></tr>
           <tr><td><kbd>⌘G</kbd></td><td>Toggle git panel</td></tr>
           <tr><td><kbd>⌘⇧N</kbd></td><td>New window (opens a fresh project picker)</td></tr>
           <tr><td><kbd>⌘,</kbd></td><td>Settings</td></tr>
         </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <h2>The agent, at home in the workspace</h2>
+        <p class="subtitle">
+          Picks up the project. Calls real tools (bash, read, apply_patch).
+          Renders inline diffs. Drives the workspace UI directly through
+          Launchpad-native tools — when it edits a file, it can show you.
+        </p>
+      </div>
+      <div class="shot">
+        <div class="shot-frame">
+          <img src="media/agent.png" alt="Launchpad agent chat tab in a coding session, with apply_patch and read tool cards" />
+        </div>
       </div>
     </section>
 
