@@ -7,3 +7,6 @@ tasks/
 *.swo
 .env
 .env.*
+
+# Claude Code local state (settings, scheduled task locks, etc.)
+.claude/
