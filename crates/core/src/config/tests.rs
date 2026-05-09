@@ -1,0 +1,291 @@
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use pretty_assertions::assert_eq;
+
+use super::{
+    AppConfig, AppConfigLoader, ContextManageConfig, FileSystemAppConfigLoader, LogRotation,
+    LoggingConfig, SafetyPolicyModelSelection, SummaryModelSelection,
+};
+use crate::SkillsConfig;
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("lpa-{name}-{nanos}"));
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+#[test]
+fn loader_merges_user_project_and_cli_layers() {
+    let root = unique_temp_dir("config-merge");
+    let home = root.join("home").join(".lpagent");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::create_dir_all(workspace.join(".lpagent")).expect("workspace config dir");
+
+    std::fs::write(
+        home.join("config.toml"),
+        "default_model = 'ignored'\n[anthropic]\nmodel = 'also-ignored'\n[context]\npreserve_recent_turns = 5\n[logging]\nlevel = 'debug'\n[logging.file]\nmax_files = 30\n",
+    )
+    .expect("write user config");
+    std::fs::write(
+        workspace.join(".lpagent").join("config.toml"),
+        "enable_auxiliary_model = true\nproject_root_markers = ['.git', 'Cargo.toml']\n[context]\nauto_compact_percent = 80\n[logging]\njson = true\n[logging.file]\ndirectory = 'diagnostics'\nfilename_prefix = 'agent'\n[skills]\nenabled = true\nworkspace_roots = ['project-skills']\nwatch_for_changes = false\n",
+    )
+    .expect("write project config");
+
+    let cli_overrides: toml::Value = r#"
+enable_auxiliary_model = false
+summary_model = "UseAxiliaryModel"
+safety_policy_model = "UseTurnModel"
+project_root_markers = [".workspace"]
+
+[server]
+listen = ["stdio://"]
+
+[logging]
+level = "trace"
+
+[logging.file]
+directory = "cli-logs"
+rotation = "Hourly"
+max_files = 2
+
+[skills]
+enabled = false
+user_roots = ["custom-user-skills"]
+"#
+    .parse()
+    .expect("parse cli overrides");
+
+    let loader = FileSystemAppConfigLoader::new(home).with_cli_overrides(cli_overrides);
+    let config = loader.load(Some(&workspace)).expect("load config");
+
+    assert_eq!(
+        config,
+        AppConfig {
+            enable_auxiliary_model: false,
+            summary_model: SummaryModelSelection::UseAxiliaryModel,
+            safety_policy_model: SafetyPolicyModelSelection::UseTurnModel,
+            context: ContextManageConfig {
+                preserve_recent_turns: 5,
+                auto_compact_percent: Some(80),
+                manual_compaction_enabled: true,
+            },
+            server: super::ServerConfig {
+                listen: vec!["stdio://".into()],
+                max_connections: 32,
+                event_buffer_size: 1024,
+                idle_session_timeout_secs: 1800,
+                persist_ephemeral_sessions: false,
+            },
+            logging: LoggingConfig {
+                level: "trace".into(),
+                json: true,
+                redact_secrets_in_logs: true,
+                file: super::LoggingFileConfig {
+                    directory: Some(PathBuf::from("cli-logs")),
+                    filename_prefix: "agent".into(),
+                    rotation: LogRotation::Hourly,
+                    max_files: 2,
+                },
+            },
+            skills: SkillsConfig {
+                enabled: false,
+                user_roots: vec![PathBuf::from("custom-user-skills")],
+                workspace_roots: vec![PathBuf::from("project-skills")],
+                watch_for_changes: false,
+            },
+            mcp: super::McpConfig::default(),
+            project_root_markers: vec![".workspace".into()],
+        }
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_rejects_invalid_context_thresholds() {
+    let root = unique_temp_dir("config-validation");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::write(
+        home.join("config.toml"),
+        "[context]\npreserve_recent_turns = 0\n",
+    )
+    .expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let result = loader.load(None);
+
+    assert!(matches!(
+        result,
+        Err(super::AppConfigError::Validation { .. })
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_loads_mcp_servers_from_toml() {
+    let root = unique_temp_dir("config-mcp-load");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::write(
+        home.join("config.toml"),
+        r#"
+[mcp]
+auto_start = true
+
+[[mcp.servers]]
+id = "github"
+display_name = "GitHub MCP"
+startup_policy = "lazy"
+enabled = true
+trust_level = "trusted"
+
+[mcp.servers.transport]
+kind = "stdio"
+command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+"#,
+    )
+    .expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let config = loader.load(None).expect("load config");
+
+    assert_eq!(config.mcp.servers.len(), 1);
+    let server = &config.mcp.servers[0];
+    assert_eq!(server.id, super::McpServerId("github".into()));
+    assert_eq!(server.display_name, "GitHub MCP");
+    assert_eq!(server.trust_level, super::TrustLevel::Trusted);
+    match &server.transport {
+        super::McpTransportConfig::Stdio { command, .. } => {
+            assert_eq!(
+                command,
+                &vec![
+                    "npx".to_string(),
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-github".to_string(),
+                ]
+            );
+        }
+        other => panic!("expected stdio transport, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_rejects_duplicate_mcp_server_ids() {
+    let root = unique_temp_dir("config-mcp-dup");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::write(
+        home.join("config.toml"),
+        r#"
+[[mcp.servers]]
+id = "dup"
+display_name = "A"
+startup_policy = "lazy"
+enabled = true
+
+[mcp.servers.transport]
+kind = "stdio"
+command = ["echo"]
+
+[[mcp.servers]]
+id = "dup"
+display_name = "B"
+startup_policy = "lazy"
+enabled = true
+
+[mcp.servers.transport]
+kind = "stdio"
+command = ["echo"]
+"#,
+    )
+    .expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let result = loader.load(None);
+    assert!(matches!(
+        result,
+        Err(super::AppConfigError::Validation { .. })
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_rejects_empty_stdio_command() {
+    let root = unique_temp_dir("config-mcp-empty");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::write(
+        home.join("config.toml"),
+        r#"
+[[mcp.servers]]
+id = "empty"
+display_name = "Empty"
+startup_policy = "lazy"
+enabled = true
+
+[mcp.servers.transport]
+kind = "stdio"
+command = []
+"#,
+    )
+    .expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let result = loader.load(None);
+    assert!(matches!(
+        result,
+        Err(super::AppConfigError::Validation { .. })
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_defaults_leave_mcp_servers_empty() {
+    let root = unique_temp_dir("config-mcp-defaults");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    // Write a minimal config with no [mcp] section.
+    std::fs::write(home.join("config.toml"), "").expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let config = loader.load(None).expect("load config");
+    assert!(config.mcp.servers.is_empty());
+    assert!(config.mcp.auto_start); // default is true
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn loader_rejects_duplicate_skill_roots() {
+    let root = unique_temp_dir("config-skill-roots");
+    let home = root.join("home").join(".lpagent");
+    std::fs::create_dir_all(&home).expect("home config dir");
+    std::fs::write(
+        home.join("config.toml"),
+        "[skills]\nuser_roots = ['skills', 'skills']\n",
+    )
+    .expect("write user config");
+
+    let loader = FileSystemAppConfigLoader::new(home);
+    let result = loader.load(None);
+
+    assert!(matches!(
+        result,
+        Err(super::AppConfigError::Validation { .. })
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}

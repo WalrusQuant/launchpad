@@ -1,0 +1,2 @@
+- Query the language server for definitions, references, hover information, and symbols.
+- Use this when you need editor-grade source navigation rather than text search.

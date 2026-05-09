@@ -4,6 +4,7 @@
   "windows": ["main", "window-*"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-title",
     "shell:allow-open"
   ]
 }

@@ -1,5 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 import { loadProjects, addProject, removeProject, renameProject, focusProjectWindow, openProjectWindow } from "./projects.js";
+import { createSettingsPanel } from "./settingspanel.js";
+import { loadSettings, getSettings, saveSetting } from "./settings.js";
 
 const pickerRoot = document.getElementById("picker-root");
 let homeDir = null;
@@ -179,6 +181,20 @@ export async function showPicker(onOpen) {
     const shell = document.createElement("div");
     shell.className = "picker-shell";
 
+    // Top-right: settings gear so users can configure the agent / general
+    // settings before opening any project. The settings tab itself is
+    // workspace-bound, so from the picker we route through a dedicated
+    // overlay (showPickerSettings) instead.
+    const topbar = document.createElement("div");
+    topbar.className = "picker-topbar";
+    const settingsBtn = document.createElement("button");
+    settingsBtn.className = "picker-settings-btn";
+    settingsBtn.title = "Settings";
+    settingsBtn.textContent = "⚙";
+    settingsBtn.addEventListener("click", () => showPickerSettings());
+    topbar.appendChild(settingsBtn);
+    shell.appendChild(topbar);
+
     if (projects.length === 0) {
       shell.innerHTML = `
         <div class="picker-welcome">
@@ -264,4 +280,50 @@ export async function showPicker(onOpen) {
 export function hidePicker() {
   pickerRoot.hidden = true;
   pickerRoot.innerHTML = "";
+}
+
+// Settings overlay opened from the projects page. The main settings tab
+// lives inside the workspace, but the agent provider config is a global
+// app concern — users need to set it before opening a project. So we host
+// the same settings panel inside a modal here.
+async function showPickerSettings() {
+  // Make sure settings module is initialized so getSettings() works.
+  try { await loadSettings(); } catch (_) {}
+
+  document.querySelector(".picker-settings-overlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "picker-settings-overlay";
+
+  const dialog = document.createElement("div");
+  dialog.className = "picker-settings-dialog";
+
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "picker-settings-close";
+  closeBtn.title = "Close";
+  closeBtn.textContent = "×";
+  dialog.appendChild(closeBtn);
+
+  const panelHost = document.createElement("div");
+  panelHost.className = "picker-settings-host";
+  dialog.appendChild(panelHost);
+
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  createSettingsPanel(panelHost, getSettings(), (key, value) => {
+    saveSetting(key, value);
+  });
+
+  const dismiss = () => overlay.remove();
+  closeBtn.addEventListener("click", dismiss);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
+  document.addEventListener(
+    "keydown",
+    function onKey(e) {
+      if (e.key === "Escape") {
+        dismiss();
+        document.removeEventListener("keydown", onKey);
+      }
+    },
+  );
 }

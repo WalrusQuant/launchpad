@@ -1,0 +1,12 @@
+[package]
+name = "lpa-utils"
+description = "Shared filesystem and path helpers for runtime bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+tempfile = { workspace = true }

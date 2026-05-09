@@ -20,6 +20,7 @@ import { matches as keyMatches } from "./keymap.js";
 import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
+import { createAgentTab, closeAgentTab } from "./agentchat.js";
 import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE } from "./events.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -497,6 +498,8 @@ function switchTab(uiId) {
     setTimeout(() => tab.editorView.focus(), 10);
   } else if (tab.type === "merge") {
     setTimeout(() => tab.mergedView.focus(), 10);
+  } else if (tab.type === "agent") {
+    setTimeout(() => tab.composer?.focus(), 10);
   }
 
   renderTabBar();
@@ -571,6 +574,7 @@ async function doCloseTab(uiId) {
   // Now clean up resources
   try {
     if (tab.type === "editor") tab.editorView.destroy();
+    else if (tab.type === "agent") closeAgentTab(tab);
     else if (tab.type === "terminal") tab.panes.forEach(destroyPane);
     else if (tab.type === "merge") {
       // Detach the scroll listener BEFORE view.destroy() — CodeMirror
@@ -1712,6 +1716,22 @@ async function saveEditorTab(uiId) {
   }
 }
 
+// Agent chat tab — opens a new agent session in this window. Multiple agent
+// tabs are allowed (one session each). Sessions are project-scoped: cwd is
+// taken from the active project at creation time.
+async function openAgentTab() {
+  if (!getActiveProject()) {
+    showToast("Open a project before starting an agent session.", "info");
+    return;
+  }
+  await createAgentTab({
+    tabs,
+    nextUiTabId: () => nextUiTabId++,
+    switchTab,
+    renderTabBar,
+  });
+}
+
 // Settings tab
 function openSettingsTab() {
   // Deduplicate
@@ -1801,7 +1821,7 @@ function renderTabBar() {
     // Icon
     const icon = document.createElement("span");
     icon.className = "tab-icon";
-    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : "◆";
+    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : tab.type === "agent" ? "✦" : "◆";
     tabEl.appendChild(icon);
 
     const label = document.createElement("span");
@@ -1825,6 +1845,8 @@ function renderTabBar() {
     } else if (tab.type === "merge") {
       label.textContent = tab.fileName;
       label.title = `3-way merge: ${tab.filePath}`;
+    } else if (tab.type === "agent") {
+      label.textContent = tab.modelSlug ? `Agent · ${tab.modelSlug}` : "Agent";
     } else {
       label.textContent = tab.fileName;
     }
@@ -2339,6 +2361,11 @@ document.addEventListener("keydown", (e) => {
     openSettingsTab();
     return;
   }
+  if (keyMatches(e, "openAgent")) {
+    e.preventDefault();
+    openAgentTab();
+    return;
+  }
   if (keyMatches(e, "saveFile")) {
     e.preventDefault();
     if (isEditorTab) {
@@ -2629,6 +2656,9 @@ document.getElementById("open-new-window").addEventListener("click", () => invok
 // Settings button
 document.getElementById("open-settings").addEventListener("click", () => openSettingsTab());
 
+// Agent chat button (⌘I)
+document.getElementById("open-agent").addEventListener("click", () => openAgentTab());
+
 // Debug capture toolbar button — toggles NDJSON capture of PTY/xterm events.
 document.getElementById("debug-capture").addEventListener("click", () => {
   if (debugCaptureActive) stopDebugCapture();
@@ -2669,7 +2699,7 @@ function renderRightTabBar() {
 
     const icon = document.createElement("span");
     icon.className = "tab-icon";
-    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : "◆";
+    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : tab.type === "agent" ? "✦" : "◆";
     tabEl.appendChild(icon);
 
     const label = document.createElement("span");
@@ -2688,6 +2718,8 @@ function renderRightTabBar() {
     } else if (tab.type === "merge") {
       label.textContent = tab.fileName;
       label.title = `3-way merge: ${tab.filePath}`;
+    } else if (tab.type === "agent") {
+      label.textContent = tab.modelSlug ? `Agent · ${tab.modelSlug}` : "Agent";
     } else {
       label.textContent = tab.fileName;
     }

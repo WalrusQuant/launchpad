@@ -164,6 +164,41 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       <button type="button" class="settings-btn env-add-btn" id="env-add-btn">+ Add variable</button>
     </div>
 
+    <div class="settings-section" id="agent-section">
+      <h3 class="settings-section-title">Agent</h3>
+      <div class="settings-env-help">
+        Provider settings for the built-in chat agent. Stored at
+        <code>~/.launchpad/agent-config.json</code> (chmod 0o600).
+      </div>
+      <div class="settings-env-note">
+        <span class="settings-env-note-icon">ⓘ</span>
+        <span>Provider changes take effect <strong>after restart</strong>. The runtime is built once per app launch.</span>
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentProvider">Provider</label>
+        <select class="settings-select" id="set-agentProvider">
+          <option value="">— select —</option>
+        </select>
+      </div>
+      <div id="agent-provider-desc" class="settings-env-help" style="margin-top:-6px"></div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentModel">Default model</label>
+        <input class="settings-input" id="set-agentModel" type="text" placeholder="e.g. claude-sonnet-4-20250514" />
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentBaseUrl">Base URL</label>
+        <input class="settings-input" id="set-agentBaseUrl" type="text" placeholder="auto-filled from provider" />
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentApiKey">API key</label>
+        <input class="settings-input" id="set-agentApiKey" type="password" placeholder="sk-..." autocomplete="off" />
+      </div>
+      <input type="hidden" id="set-agentWireApi" />
+      <button type="button" class="settings-btn" id="agent-save-btn">Save</button>
+      <button type="button" class="settings-btn" id="agent-save-reload-btn">Save &amp; reload</button>
+      <span id="agent-save-feedback" class="settings-feedback"></span>
+    </div>
+
     <div class="settings-section">
       <h3 class="settings-section-title">Keybindings</h3>
       <div id="keybindings-list"></div>
@@ -177,6 +212,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   containerEl.appendChild(content);
   renderKeybindings(content.querySelector("#keybindings-list"));
   renderProjectEnv(content);
+  renderAgentConfig(content);
 
   // Wire up all inputs
   wireInput("appTheme", "change", (v) => v);
@@ -286,6 +322,130 @@ function escapeAttr(str) {
 // re-validates on save so the JSON file can never contain bad keys.
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+async function renderAgentConfig(content) {
+  const providerSel = content.querySelector("#set-agentProvider");
+  const wireHidden = content.querySelector("#set-agentWireApi");
+  const descEl = content.querySelector("#agent-provider-desc");
+  const modelInput = content.querySelector("#set-agentModel");
+  const baseUrlInput = content.querySelector("#set-agentBaseUrl");
+  const apiKeyInput = content.querySelector("#set-agentApiKey");
+  const saveBtn = content.querySelector("#agent-save-btn");
+  const feedback = content.querySelector("#agent-save-feedback");
+  if (!saveBtn) return;
+
+  // Load presets and current config in parallel.
+  let presets = [];
+  let cfg = {};
+  try {
+    [presets, cfg] = await Promise.all([
+      invoke("agent_provider_presets"),
+      invoke("agent_config_load"),
+    ]);
+  } catch (_) {}
+
+  // Build the provider dropdown.
+  for (const p of presets) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.display_name;
+    opt.dataset.wireApi = p.wire_api;
+    opt.dataset.baseUrl = p.default_base_url || "";
+    opt.dataset.description = p.description || "";
+    opt.dataset.envVars = (p.api_key_env_vars || []).join(",");
+    providerSel.appendChild(opt);
+  }
+
+  function applyProvider(id, { resetBaseUrl } = {}) {
+    const opt = providerSel.querySelector(`option[value="${id}"]`);
+    if (!opt) {
+      descEl.textContent = "";
+      return;
+    }
+    wireHidden.value = opt.dataset.wireApi || "";
+    descEl.textContent = opt.dataset.description || "";
+    if (resetBaseUrl) {
+      baseUrlInput.value = opt.dataset.baseUrl || "";
+    }
+    const envVars = opt.dataset.envVars ? opt.dataset.envVars.split(",") : [];
+    apiKeyInput.placeholder =
+      cfg.api_key && cfg.provider === id
+        ? "•••••• (saved — overwrite to change)"
+        : envVars.length
+        ? `paste here, or set ${envVars[0]} in your shell`
+        : "no API key required";
+  }
+
+  // Restore saved values.
+  if (cfg.provider) providerSel.value = cfg.provider;
+  if (cfg.model) modelInput.value = cfg.model;
+  if (cfg.base_url) baseUrlInput.value = cfg.base_url;
+  applyProvider(providerSel.value, { resetBaseUrl: !cfg.base_url });
+
+  // When the user picks a different provider, replace the base URL with the
+  // preset default and clear the API key field (key is provider-specific).
+  providerSel.addEventListener("change", () => {
+    apiKeyInput.value = "";
+    applyProvider(providerSel.value, { resetBaseUrl: true });
+  });
+
+  const reloadBtn = content.querySelector("#agent-save-reload-btn");
+
+  function showFeedback(msg, kind) {
+    feedback.textContent = msg;
+    feedback.classList.toggle("settings-feedback-ok", kind === "ok");
+    feedback.classList.toggle("settings-feedback-err", kind === "err");
+    setTimeout(() => {
+      feedback.textContent = "";
+      feedback.classList.remove("settings-feedback-ok", "settings-feedback-err");
+    }, 4000);
+  }
+
+  async function saveCurrent() {
+    const next = {
+      provider: providerSel.value || null,
+      wire_api: wireHidden.value || null,
+      model: modelInput.value.trim() || null,
+      base_url: baseUrlInput.value.trim() || null,
+      // Only overwrite api_key if the user typed something. Otherwise keep
+      // the saved one (only when the provider hasn't changed).
+      api_key:
+        apiKeyInput.value.trim() ||
+        (cfg.provider === providerSel.value ? cfg.api_key : null) ||
+        null,
+    };
+    await invoke("agent_config_save", { cfg: next });
+    cfg = next;
+    apiKeyInput.value = "";
+    applyProvider(next.provider, { resetBaseUrl: false });
+    return next;
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    try {
+      await saveCurrent();
+      showFeedback("Saved. Open or reopen an agent tab to use the new settings.", "ok");
+    } catch (err) {
+      showFeedback(`Failed: ${err}`, "err");
+    }
+  });
+
+  reloadBtn.addEventListener("click", async () => {
+    reloadBtn.disabled = true;
+    try {
+      await saveCurrent();
+      await invoke("agent_reload");
+      // Notify any open agent tabs in this window so they can drop their
+      // stale session_id and reconnect on next message.
+      window.dispatchEvent(new CustomEvent("launchpad:agent-reloaded"));
+      showFeedback("Reloaded. Active agent tabs will reconnect on next message.", "ok");
+    } catch (err) {
+      showFeedback(`Reload failed: ${err}`, "err");
+    } finally {
+      reloadBtn.disabled = false;
+    }
+  });
+}
 
 async function renderProjectEnv(content) {
   const section = content.querySelector("#env-section");

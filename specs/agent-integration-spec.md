@@ -1,5 +1,17 @@
 # Launchpad — launchpad-agent Integration Spec (in-process)
 
+> **Status — 2026-05-09**
+>
+> The integration approach changed from "vendored submodule" to **full in-tree
+> port**: every agent crate (`core`, `protocol`, `server`, `provider`,
+> `tools`, `safety`, `mcp`, `utils`, `client`, `tasks`) is copied into
+> `crates/` at the Launchpad repo root and pulled in as workspace path deps.
+> No submodule, no sidecar, no separate binary. The original launchpad-agent
+> repo lives independently for CLI/TUI work; bumping is now a manual sync.
+>
+> See **§ Status** at the bottom for what's shipping today and what's still
+> on the punch list.
+
 ## Context
 
 We are building a built-in chat coding agent inside Launchpad by integrating [launchpad-agent](https://github.com/WalrusQuant/launchpad-agent) (Apache-2.0, Rust, our own project) **in-process** as a Cargo workspace dependency. The agent runs as async tasks inside Launchpad's existing Rust binary — no child process, no stdio framing, no separate `lpagent` binary.
@@ -500,3 +512,96 @@ Most decisions from earlier drafts are resolved. Remaining:
 - **Tool card design is the highest-bandwidth UI.** Plan to iterate after PR3 ships — first version will not be the right version. Budget time for a polish PR after dogfooding
 - **First-run UX.** User opens chat tab, has no API key. Settings panel must handle this with empty-state CTA, not a cryptic error
 - **Foundation Audit findings may reorder this.** If the audit (per `specs/foundation-audit-spec.md`) flags must-fix items, those land as PR0 before PR1 starts here
+
+---
+
+## Status — 2026-05-09
+
+Snapshot of what's working in `main` vs. what's still on the punch list.
+Source of truth for "where are we" — update as PRs land.
+
+### Architecture deltas from the original spec
+
+- **In-tree port**, not submodule. `vendor/launchpad-agent` was rejected; crates were copied verbatim into `crates/` and the launchpad-agent `LICENSE` carried in as `crates/LPA_LICENSE`. Repo is now a Cargo workspace; `src-tauri` depends on `lpa-*` crates via `workspace = true`.
+- **Transport: `WebSocket` placeholder, not `Stdio`.** Stdio always delivers every event to every connection, which would leak across windows. WebSocket gates delivery on explicit `events/subscribe` per session — `agent_session_start` auto-subscribes the new session before returning so the frontend can't miss the first delta. Adding `ClientTransportKind::InProcess` upstream is still the right long-term move; no longer urgent.
+- **Sessions sidebar + session delete** were not in the original spec but landed because the persistence is already there (RolloutStore JSONL files) and the cost of exposing it is low. Delete is filesystem + hide-list (`~/.launchpad/agent-deleted-sessions.json`) since the runtime has no in-memory delete primitive — a clean upstream API would let us drop the hide-list.
+- **Settings reachable from the projects picker** via an overlay (gear icon top-right). The agent config is global, so it must be configurable before any project is open.
+- **Save & reload** rebuilds the runtime in place — no app restart required to swap providers. Active turns are cancelled when their connection drops; tabs reconnect on next message.
+
+### What's shipping (✅ done)
+
+**PR1 — Foundations**
+- Workspace Cargo.toml with all 10 lpa-* crate path deps
+- `src-tauri/src/agent/` — `host.rs`, `commands.rs`, `config.rs`
+- One `ServerRuntime` per process, lazily built under a `Mutex<Option<...>>` so reload can drop it
+- Per-window connection map keyed by Tauri window label; mpsc → `agent:event:<window_label>` Tauri events
+- Tauri command surface: `agent_initialize`, `agent_connect`, `agent_disconnect`, `agent_send_envelope`, `agent_session_start` (auto-subscribes), `agent_send_message`, `agent_interrupt_turn`, `agent_approve`, `agent_subscribe_events`, `agent_session_list`, `agent_session_resume`, `agent_skills_list`, `agent_config_load`, `agent_config_save`, `agent_provider_presets`, `agent_reload`, `agent_session_delete`, `agent_session_deleted_ids`
+
+**PR2 — Chat tab shell + streaming text**
+- New tab type `"agent"`; ✦ icon, Cmd+I shortcut, toolbar button
+- `agentchat.js` (factory + global event router), `agentmsg.js` (renderers), `agentcomposer.js` (composer)
+- Streaming text deltas append plain; markdown rendered via `marked` on item completion (avoids per-delta re-render stutter)
+- Scroll-pinned auto-scroll
+- Conversation column max-width centered
+
+**PR3 — Tool cards, thinking, approval**
+- Generic tool cards for `tool_call`, `mcp_tool_call`, `command_execution`, `file_change`, `web_search`, `image_view`, `plan` — title extracted from `payload.input` (`bash · cargo check`, `read · path/...`)
+- `tool_result` cards nested under their parent via `tool_use_id` index (the runtime emits `tool_use_id`, not `call_item_id`)
+- Reasoning items render as collapsible "thinking" blocks
+- Approval card with all six scopes (Once / Turn / Session / PathPrefix / Host / Tool); responds via `agent_approve`
+- Cancel button mid-turn → `agent_interrupt_turn`
+- Pulsing running dot, ✓ done / ✕ error glyph, three-dot "working…" indicator pinned at the bottom of the message stream
+- Tool card body visibility managed by JS `MutationObserver` setting a `tool-card-empty` class — replaces a brittle `:has()` CSS rule that didn't work consistently in WebKit
+
+**PR5 — Settings, persistence (partial)**
+- "Agent" section in the settings panel: Provider dropdown with all 9 presets (Anthropic, OpenAI, Google, OpenRouter, Groq, Together, Mistral, Ollama, Custom), auto-fill base URL on provider change, model, API key
+- Storage at `~/.launchpad/agent-config.json` chmod 0o600 via `atomic_write_with_mode`
+- LPA_* env vars applied before runtime construction; **always overwrite** so a save-then-reload actually picks up new values
+- **Save & reload** button — drops the runtime + all per-window connections, broadcasts a `launchpad:agent-reloaded` DOM event so open agent tabs reset their session state and start fresh on next message
+- Settings reachable from the picker (gear icon, modal overlay)
+- Session resume: full sidebar (☰ button → list of past sessions sorted by recency, click to resume, history replay via `SessionHistoryItem`)
+- Session delete: × per row (hover-discoverable), in-app confirm modal, deletes rollout file + hide-list
+
+**PR4 — Cross-feature integration (partial)**
+- Slash command picker wired into composer: `/` at start of line → popup of skills from `agent_skills_list`, ↑/↓/Enter/Tab to insert. **Currently appears empty** — likely no skills registered in the runtime's skill catalog yet, not a code bug. To verify: drop a stub at `~/.lpagent/skills/` and reload.
+
+### What's missing (❌ punch list)
+
+**PR4 — Cross-feature integration**
+- ❌ `@`-file mentions in composer (backed by `search_files`)
+- ❌ Launchpad-native tools registered into `ToolRegistry`: `lp_open_in_editor`, `lp_show_diff`, `lp_open_merge_tab`, `lp_refresh_git_panel`, `lp_reveal_in_finder`. Wiring requires plumbing a `tauri::Window` handle into the tool closures so they can emit events back to the frontend (this is the "where do agent tools execute" gap from the original audit).
+- ❌ "Open in editor" links from `Read` / `Grep` / `Lsp` tool cards (depends on the native tool above OR a frontend-only listener that intercepts tool-card clicks)
+- ❌ Git panel refresh nudge after the agent runs `git commit` via `Bash`
+- ❌ Drag-drop image into composer for vision models (needs `InputItem::LocalImage` plumbing)
+- ⚠️ **Slash commands**: built but currently empty — needs verification + an empty-state CTA pointing at the skills folder
+
+**PR5 — Polish**
+- ❌ Z.ai coding plan as a named preset (Custom endpoint covers it manually). Upstream PR to `launchpad-agent/crates/core/src/provider_presets.rs` is still proposed in § 9 above.
+- ❌ Default approval policy in settings (always prompts per-tool today; runtime supports `never` / `always` strings, no UI driver)
+- ❌ Sandbox mode toggle (`workspace-write` / `read-only` / `permissive`) — runtime has the policies, no UI
+- ❌ Per-project default model
+- ❌ Multi-session per window with header switcher (sidebar exists; a quick switcher pinned in the chat header would be friendlier than re-opening the sidebar each time)
+- ❌ Per-tool diff cards for Edit / Write / ApplyPatch using existing `diffrender.js`
+- ❌ Cost / usage footer per turn (data arrives via `turn/usage/updated`, not yet displayed)
+- ❌ First-run empty state — opening a chat tab before configuring a provider currently surfaces the runtime's bootstrap error verbatim instead of a friendly "Configure provider →" CTA
+
+### Open issues seen during dogfooding
+
+1. Old chat tabs frozen with pre-fix DOM structure don't always re-render with new card logic. Cosmetic — affects only sessions opened before the latest restart.
+2. Tool card expand/collapse went through several iterations (auto-collapse, `:empty`, `:has()`) before landing on JS-managed `tool-card-empty`. Watch for regressions when changing the tool card chrome.
+3. The `shutdown` method on `AgentState` still warns `dead_code` — needs to be wired to a Tauri window-close / app-exit hook so MCP supervisors get a chance to shut down cleanly.
+
+### Re-plan — priority order from here
+
+In order of "biggest workflow win for least effort":
+
+1. **First-run empty state** — when no API key configured, in-chat CTA pointing at Settings instead of an opaque error. Cheap, big polish win.
+2. **Verify slash commands end-to-end** with a test skill; add an empty-state hint pointing to the skills folder.
+3. **`@`-file mentions** — small, high-impact for daily use.
+4. **Default approval policy + sandbox mode** in settings — runtime supports both; just adds two dropdowns.
+5. **Launchpad-native tools** (`lp_open_in_editor` etc.) — biggest "this is built for this app" feel; requires the `tauri::Window` handle plumbing.
+6. **Per-tool diff cards** for Edit / Write — pipeline (`diffrender.js`) already exists.
+7. **Cost / usage footer** — small, makes runs feel transparent.
+8. Z.ai preset, image upload, multi-session header switcher — nice-to-haves.
+
+Update this section as items land.

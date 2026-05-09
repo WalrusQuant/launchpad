@@ -1,0 +1,42 @@
+[package]
+name = "lpa-server"
+description = "Transport-neutral runtime protocol types and server contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "lpa-server"
+path = "src/main.rs"
+
+[dependencies]
+lpa-core = { workspace = true }
+lpa-protocol = { workspace = true }
+lpa-client = { workspace = true }
+lpa-provider = { workspace = true }
+lpa-safety = { workspace = true }
+lpa-tools = { workspace = true }
+lpa-utils = { workspace = true }
+lpa-mcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+smol_str = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+toml = { workspace = true }
+tokio-tungstenite = "0.28"
+
+[dev-dependencies]
+async-trait = { workspace = true }
+pretty_assertions = "1"
+tempfile = "3"

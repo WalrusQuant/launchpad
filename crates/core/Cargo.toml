@@ -1,0 +1,44 @@
+[package]
+name = "lpa-core"
+description = "Message model, session state, and agent main loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lpa-protocol = { workspace = true }
+lpa-tools = { workspace = true }
+lpa-provider = { workspace = true }
+lpa-safety = { workspace = true }
+lpa-utils = { workspace = true }
+lpa-mcp = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+smol_str = { workspace = true }
+iana-time-zone = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+lpa-provider = { workspace = true }
+lpa-tools = { workspace = true }
+lpa-safety = { workspace = true }

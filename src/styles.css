@@ -4024,12 +4024,12 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 .merge-tab-title {
   font-weight: 600;
   font-size: 13px;
-  color: var(--text-primary);
+  color: var(--text-11);
 }
 
 .merge-tab-hint {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--text-5);
 }
 
 .merge-tab-body {
@@ -4054,7 +4054,7 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-secondary);
+  color: var(--text-5);
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
 }
@@ -4073,4 +4073,658 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   flex: 1 1 auto;
   min-width: 0;
 }
+
+/* ─── Agent chat tab ──────────────────────────────────────────────────── */
+
+.agent-tab-instance {
+  background: var(--surface-3);
+  color: var(--text-11);
+  position: relative;
+}
+
+.agent-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-1);
+  background: var(--surface-4);
+  font-size: 12px;
+}
+.agent-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.agent-header-sessions-btn {
+  background: transparent;
+  border: 1px solid var(--border-2);
+  color: var(--text-5);
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.agent-header-sessions-btn:hover {
+  color: var(--text-11);
+  background: var(--surface-6);
+}
+.agent-header-title {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-11);
+}
+.agent-header-model {
+  color: var(--text-5);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  background: var(--surface-6);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.agent-messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px max(20px, calc((100% - 820px) / 2));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* User message — readable contrast, right-aligned, soft bubble */
+.agent-msg { display: flex; flex-direction: column; }
+.agent-msg-user { align-items: flex-end; }
+.agent-msg-bubble {
+  max-width: 78%;
+  background: var(--surface-7);
+  color: var(--text-11);
+  padding: 10px 14px;
+  border-radius: 14px 14px 4px 14px;
+  border: 1px solid var(--border-1);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Assistant message — full width, markdown-rendered */
+.agent-msg-content {
+  max-width: 100%;
+  white-space: normal;
+  word-wrap: break-word;
+  line-height: 1.65;
+  font-size: 14px;
+  color: var(--text-11);
+}
+.agent-msg-content p { margin: 0 0 0.8em 0; }
+.agent-msg-content p:last-child { margin-bottom: 0; }
+.agent-msg-content ul,
+.agent-msg-content ol { margin: 0.4em 0 0.8em 0; padding-left: 1.4em; }
+.agent-msg-content li { margin: 0.2em 0; }
+.agent-msg-content h1,
+.agent-msg-content h2,
+.agent-msg-content h3 { margin: 0.8em 0 0.4em 0; line-height: 1.3; }
+.agent-msg-content blockquote {
+  border-left: 3px solid var(--border-3);
+  padding: 2px 0 2px 12px;
+  margin: 0.4em 0;
+  color: var(--text-5);
+}
+.agent-msg-content pre {
+  background: var(--surface-1);
+  border: 1px solid var(--border-1);
+  border-radius: 6px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 0.6em 0;
+}
+.agent-msg-content code {
+  background: var(--surface-6);
+  color: var(--accent-warm);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+.agent-msg-content pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+}
+.agent-msg-content a { color: var(--accent-blue); text-decoration: none; }
+.agent-msg-content a:hover { text-decoration: underline; }
+/* Suppress markdown horizontal rules entirely — models commonly emit
+   `---` between sections and they read as visual noise / get confused
+   with tool-card outlines. If we ever want them back, replace with a
+   centered "···" via ::before. */
+.agent-msg-content hr { display: none; }
+
+.agent-msg-thinking-toggle {
+  font-style: italic;
+  color: var(--text-4);
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+}
+.agent-msg-thinking-toggle:hover { color: var(--text-5); }
+.agent-msg-thinking .agent-msg-content {
+  color: var(--text-5);
+  font-size: 12.5px;
+  border-left: 2px solid var(--border-2);
+  padding-left: 10px;
+  margin-top: 6px;
+}
+
+.agent-msg-error {
+  background: rgba(220, 90, 90, 0.12);
+  border: 1px solid rgba(220, 90, 90, 0.4);
+  color: #f0a5a5;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.agent-msg-system {
+  color: var(--text-4);
+  font-size: 12px;
+  font-style: italic;
+  text-align: center;
+  padding: 4px 0;
+}
+
+/* Tool cards — compact, secondary visual weight, auto-collapse on success */
+.tool-card {
+  border: 1px solid var(--border-1);
+  border-radius: 6px;
+  background: var(--surface-4);
+  font-size: 12.5px;
+  overflow: hidden;
+  /* Safety net: a card is never less than the height of its header so we
+     can never collapse to an invisible 2px border line. */
+  min-height: 32px;
+}
+.tool-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: var(--surface-5);
+  cursor: pointer;
+  user-select: none;
+}
+.tool-card-header:hover { background: var(--surface-6); }
+.tool-card-icon {
+  width: 14px;
+  text-align: center;
+  color: var(--text-4);
+  font-size: 11px;
+}
+.tool-card-title {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-11);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tool-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+.tool-card-status-running { color: var(--accent-blue); }
+.tool-card-status-done { color: var(--accent-green); }
+.tool-card-status-error { color: var(--accent-red); }
+.tool-card-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: tool-card-pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+.tool-card-status-glyph {
+  font-size: 12px;
+  line-height: 1;
+}
+@keyframes tool-card-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+/* Bottom-of-list "working…" indicator while a turn is running */
+.agent-thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px;
+  align-self: flex-start;
+  color: var(--text-5);
+  font-size: 12px;
+  font-style: italic;
+}
+.agent-thinking-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-4);
+  animation: agent-thinking-bounce 1.2s ease-in-out infinite;
+}
+.agent-thinking-dot:nth-child(2) { animation-delay: 0.15s; }
+.agent-thinking-dot:nth-child(3) { animation-delay: 0.3s; }
+.agent-thinking-label { margin-left: 6px; }
+@keyframes agent-thinking-bounce {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-3px); }
+}
+.tool-card-toggle {
+  background: none;
+  border: none;
+  color: var(--text-4);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  width: 16px;
+}
+.tool-card-body { padding: 10px 12px; }
+.tool-card-collapsed .tool-card-body,
+.tool-card-collapsed .tool-result-slot { display: none; }
+/* Visibility of body and result-slot is managed from JS via
+   .tool-card-empty (set when there are no children). Avoids the
+   `:has()` selector which has spotty support in older WebKit. */
+.tool-card-body.tool-card-empty,
+.tool-result-slot.tool-card-empty { display: none; }
+
+.tool-output {
+  background: var(--surface-1);
+  border: 1px solid var(--border-1);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 6px 0 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-10);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 360px;
+  overflow-y: auto;
+  /* Visible scrollbar so the user knows there's more content to scroll. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-3) transparent;
+}
+.tool-output::-webkit-scrollbar { width: 8px; }
+.tool-output::-webkit-scrollbar-track { background: transparent; }
+.tool-output::-webkit-scrollbar-thumb {
+  background: var(--border-3);
+  border-radius: 4px;
+}
+.tool-output::-webkit-scrollbar-thumb:hover { background: var(--border-4); }
+.tool-output:first-child { margin-top: 0; }
+.tool-args {
+  background: var(--surface-1);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--text-10);
+  border: 1px solid var(--border-1);
+}
+.tool-cmd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text-11);
+  padding: 0 0 6px 0;
+}
+
+/* Nested tool_result inside its parent tool_call — strip the outer chrome
+   and show a subtle indent so it reads as "this call → this result". */
+.tool-result-slot {
+  border-top: 1px solid var(--border-1);
+  background: var(--surface-3);
+}
+.tool-result-slot .tool-card {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.tool-result-slot .tool-card-header {
+  background: transparent;
+  padding-left: 28px;
+  position: relative;
+}
+.tool-result-slot .tool-card-header::before {
+  content: "↳";
+  position: absolute;
+  left: 12px;
+  color: var(--text-4);
+}
+.tool-result-slot .tool-card-icon { display: none; }
+
+/* Approval card */
+.agent-msg-approval { align-items: stretch; }
+.approval-card {
+  border: 1px solid #d3a23b;
+  background: rgba(211, 162, 59, 0.08);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.approval-title { font-weight: 600; color: var(--text-11); }
+.approval-justification { color: var(--text-5); font-size: 12px; line-height: 1.5; }
+.approval-controls { display: flex; gap: 8px; align-items: center; }
+.approval-scope {
+  background: var(--surface-5);
+  border: 1px solid var(--border-2);
+  color: var(--text-11);
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.approval-btn {
+  border: 1px solid var(--border-2);
+  background: var(--surface-5);
+  color: var(--text-11);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.approval-btn:hover { background: var(--surface-6); }
+.approval-approve { background: #2c6e3f; border-color: #2c6e3f; color: #fff; }
+.approval-deny    { background: #6e2c2c; border-color: #6e2c2c; color: #fff; }
+.approval-resolved {
+  font-size: 12px;
+  color: var(--text-5);
+  font-style: italic;
+}
+
+/* Sessions sidebar — overlay anchored to the chat tab; lists past
+   sessions from the rollout store, click to resume. */
+.agent-sessions-panel {
+  position: absolute;
+  top: 50px;
+  left: 12px;
+  width: 320px;
+  max-height: calc(100% - 80px);
+  background: var(--surface-4);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+  overflow: hidden;
+}
+.agent-sessions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-1);
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-11);
+}
+.agent-sessions-close {
+  background: none;
+  border: none;
+  color: var(--text-5);
+  font-size: 18px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+}
+.agent-sessions-close:hover { color: var(--text-11); }
+.agent-sessions-body {
+  overflow-y: auto;
+  flex: 1;
+}
+.agent-sessions-loading,
+.agent-sessions-empty {
+  padding: 16px 14px;
+  color: var(--text-5);
+  font-size: 12px;
+  font-style: italic;
+}
+.agent-sessions-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 8px 14px;
+  border-bottom: 1px solid var(--border-1);
+  transition: background 0.1s ease;
+  cursor: pointer;
+  user-select: none;
+}
+.agent-sessions-row:hover { background: var(--surface-5); }
+.agent-sessions-row-active { background: var(--surface-6); }
+.agent-sessions-row-main {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+.agent-sessions-row-main * { cursor: pointer; }
+.agent-sessions-row-title {
+  font-size: 13px;
+  color: var(--text-11);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 2px;
+}
+.agent-sessions-row-meta {
+  font-size: 11px;
+  color: var(--text-5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-sessions-row-delete {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: 1px solid var(--border-2);
+  color: var(--text-5);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.1s ease, background 0.1s ease, border-color 0.1s ease;
+}
+.agent-sessions-row-delete:hover {
+  color: #fff;
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+}
+
+/* Composer */
+.agent-composer-wrap {
+  border-top: 1px solid var(--border-1);
+  background: var(--surface-4);
+  padding: 12px max(12px, calc((100% - 820px) / 2));
+}
+.agent-composer {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  padding: 8px 8px 8px 14px;
+  transition: border-color 0.15s ease;
+}
+.agent-composer:focus-within {
+  border-color: var(--accent-blue);
+}
+.agent-composer-input {
+  flex: 1;
+  resize: none;
+  background: transparent;
+  border: none;
+  color: var(--text-11);
+  padding: 6px 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.agent-composer-input:focus { outline: none; }
+.agent-composer-input::placeholder { color: var(--text-3); }
+.agent-composer-btn {
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  align-self: flex-end;
+  transition: filter 0.15s ease, background 0.15s ease;
+}
+.agent-composer-btn:hover { filter: brightness(1.1); }
+.agent-composer-cancel { background: var(--accent-red); }
+
+/* Slash command picker — anchored above the composer input. */
+.agent-composer { position: relative; }
+.agent-slash-popup {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--surface-4);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  z-index: 80;
+}
+.agent-slash-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-1);
+}
+.agent-slash-item:last-child { border-bottom: none; }
+.agent-slash-item-active,
+.agent-slash-item:hover { background: var(--surface-6); }
+.agent-slash-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text-11);
+  font-weight: 500;
+}
+.agent-slash-desc {
+  font-size: 11.5px;
+  color: var(--text-5);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-feedback {
+  display: inline-block;
+  margin-left: 12px;
+  font-size: 12px;
+  color: var(--text-5);
+}
+.settings-feedback-ok { color: #6fcf97; }
+.settings-feedback-err { color: #f0a5a5; }
+
+/* Settings entry from the picker page. */
+.picker-topbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 4px 0 4px;
+}
+.picker-settings-btn {
+  background: none;
+  border: 1px solid var(--border-2);
+  color: var(--text-5);
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.picker-settings-btn:hover {
+  color: var(--text-11);
+  background: var(--surface-5);
+}
+.picker-settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+.picker-settings-dialog {
+  position: relative;
+  width: min(720px, 92vw);
+  max-height: 88vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-4);
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+.picker-settings-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-5);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+  z-index: 1;
+}
+.picker-settings-close:hover {
+  color: var(--text-11);
+  background: var(--surface-5);
+}
+.picker-settings-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 

@@ -1,3 +1,5 @@
+mod agent;
+
 use git2::{BranchType, Repository, StatusOptions};
 use notify_debouncer_mini::{new_debouncer, notify};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -1299,7 +1301,7 @@ fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 // relevant (e.g. project-env.json at 0o600): if we rename first and
 // chmod after, the file briefly exists at the default umask (0o644)
 // and a concurrent reader on a shared machine could snapshot secrets.
-fn atomic_write_with_mode(
+pub(crate) fn atomic_write_with_mode(
     dest: &std::path::Path,
     data: &[u8],
     explicit_mode: Option<u32>,
@@ -3721,6 +3723,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
+        .manage(agent::AgentState::new())
         .invoke_handler(tauri::generate_handler![
             spawn_pty,
             start_pty_reader,
@@ -3804,7 +3807,25 @@ pub fn run() {
             focus_project_window,
             register_project_window,
             unregister_project_window,
-            unregister_window_label
+            unregister_window_label,
+            agent::agent_reload,
+            agent::agent_connect,
+            agent::agent_disconnect,
+            agent::agent_send_envelope,
+            agent::agent_initialize,
+            agent::agent_session_start,
+            agent::agent_send_message,
+            agent::agent_interrupt_turn,
+            agent::agent_approve,
+            agent::agent_subscribe_events,
+            agent::agent_session_list,
+            agent::agent_session_resume,
+            agent::agent_skills_list,
+            agent::agent_config_load,
+            agent::agent_config_save,
+            agent::agent_provider_presets,
+            agent::agent_session_delete,
+            agent::agent_session_deleted_ids
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3820,7 +3841,7 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 // `LAUNCHPAD_HOME` IS the directory (not its parent), so a test can
 // `std::env::set_var("LAUNCHPAD_HOME", tempdir.path())` and immediately
 // read/write files there.
-fn launchpad_dir() -> std::path::PathBuf {
+pub(crate) fn launchpad_dir() -> std::path::PathBuf {
     if let Some(override_path) = std::env::var_os("LAUNCHPAD_HOME") {
         return std::path::PathBuf::from(override_path);
     }

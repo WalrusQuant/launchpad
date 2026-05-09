@@ -1,0 +1,757 @@
+use std::{
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures::stream;
+use pretty_assertions::assert_eq;
+use serde_json::json;
+use tempfile::TempDir;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+
+use lpa_core::{FileSystemSkillCatalog, PresetModelCatalog, SkillsConfig};
+use lpa_protocol::{
+    ModelRequest, ModelResponse, RequestContent, ResponseContent, ResponseMetadata, StopReason,
+    StreamEvent, Usage,
+};
+use lpa_provider::{ModelProviderSDK, ProviderError};
+use lpa_server::{
+    ClientTransportKind, ErrorResponse, ProtocolErrorCode, ServerRuntime,
+    ServerRuntimeDependencies, SkillChangedResult, SkillListResult, SkillRecord, SkillSource,
+    SuccessResponse,
+};
+use lpa_tools::{Tool, ToolOutput, ToolRegistry};
+
+fn canon(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[derive(Default)]
+struct CapturingProvider {
+    stream_requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelProviderSDK for CapturingProvider {
+    async fn completion(&self, _request: ModelRequest) -> Result<ModelResponse, ProviderError> {
+        Ok(ModelResponse {
+            id: "title-1".into(),
+            content: vec![ResponseContent::Text("Generated skill title".into())],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage::default(),
+            metadata: ResponseMetadata::default(),
+        })
+    }
+
+    async fn completion_stream(
+        &self,
+        request: ModelRequest,
+    ) -> Result<
+        Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
+        ProviderError,
+    > {
+        self.stream_requests
+            .lock()
+            .expect("stream request lock")
+            .push(request);
+        Ok(Box::pin(stream::iter(vec![
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "Skill acknowledged.".into(),
+            }),
+            Ok(StreamEvent::MessageDone {
+                response: ModelResponse {
+                    id: "resp-1".into(),
+                    content: vec![ResponseContent::Text("Skill acknowledged.".into())],
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Usage::default(),
+                    metadata: ResponseMetadata::default(),
+                },
+            }),
+        ])))
+    }
+
+    fn name(&self) -> &str {
+        "capturing-test-provider"
+    }
+}
+
+fn create_skill(root: &Path, name: &str, content: &str) -> PathBuf {
+    let skill_dir = root.join(name);
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, content).expect("write skill");
+    skill_path
+}
+
+fn build_runtime(
+    data_root: &Path,
+    user_skill_root: PathBuf,
+    workspace_root: Option<PathBuf>,
+    provider: Arc<dyn ModelProviderSDK>,
+) -> Arc<ServerRuntime> {
+    build_runtime_with_registry(
+        data_root,
+        user_skill_root,
+        workspace_root,
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+}
+
+fn build_runtime_with_registry(
+    data_root: &Path,
+    user_skill_root: PathBuf,
+    workspace_root: Option<PathBuf>,
+    provider: Arc<dyn ModelProviderSDK>,
+    registry: Arc<ToolRegistry>,
+) -> Arc<ServerRuntime> {
+    let workspace_skill_roots = workspace_root
+        .iter()
+        .map(|root| root.join(".lpagent").join("skills"))
+        .collect::<Vec<_>>();
+    let mcp_manager: Arc<dyn lpa_mcp::McpManager> =
+        Arc::new(lpa_mcp::StdMcpManager::from_config(&lpa_mcp::McpConfig::default()).unwrap());
+    ServerRuntime::new(
+        data_root.to_path_buf(),
+        ServerRuntimeDependencies::new(
+            provider,
+            registry,
+            "test-model".to_string(),
+            Arc::new(PresetModelCatalog::default()),
+            workspace_root,
+            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
+                enabled: true,
+                user_roots: vec![user_skill_root],
+                workspace_roots: workspace_skill_roots,
+                watch_for_changes: false,
+            })),
+            mcp_manager,
+            Vec::new(),
+        ),
+    )
+}
+
+async fn initialize_connection(
+    runtime: &Arc<ServerRuntime>,
+) -> Result<(u64, mpsc::UnboundedReceiver<serde_json::Value>)> {
+    let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
+    let connection_id = runtime
+        .register_connection(ClientTransportKind::Stdio, notifications_tx)
+        .await;
+    let initialize_response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "client_name": "test",
+                    "client_version": "1.0.0",
+                    "transport": "stdio",
+                    "supports_streaming": true,
+                    "supports_binary_images": false,
+                    "opt_out_notification_methods": []
+                }
+            }),
+        )
+        .await
+        .context("initialize response")?;
+    let response: SuccessResponse<lpa_server::InitializeResult> =
+        serde_json::from_value(initialize_response)?;
+    assert_eq!(response.result.server_name, "lpa-server");
+
+    let _ = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "method": "initialized"
+            }),
+        )
+        .await;
+    Ok((connection_id, notifications_rx))
+}
+
+async fn start_session(
+    runtime: &Arc<ServerRuntime>,
+    connection_id: u64,
+    cwd: &Path,
+) -> Result<lpa_core::SessionId> {
+    let response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 2,
+                "method": "session/start",
+                "params": {
+                    "cwd": cwd,
+                    "ephemeral": false,
+                    "title": "Skills integration",
+                    "model": "test-model"
+                }
+            }),
+        )
+        .await
+        .context("session/start response")?;
+    let result: SuccessResponse<lpa_server::SessionStartResult> = serde_json::from_value(response)?;
+    Ok(result.result.session_id)
+}
+
+async fn wait_for_turn_completed(
+    notifications_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        while let Some(value) = notifications_rx.recv().await {
+            if value.get("method") == Some(&serde_json::json!("turn/completed")) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("notification channel closed before turn/completed")
+    })
+    .await
+    .context("timed out waiting for turn/completed")??;
+    Ok(())
+}
+
+fn user_request_text(request: &ModelRequest) -> Result<String> {
+    let text = all_user_request_texts(request).join("\n");
+    (!text.is_empty())
+        .then_some(text)
+        .context("expected a user text request payload")
+}
+
+fn all_user_request_texts(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .flat_map(|message| {
+            message.content.iter().filter_map(|content| match content {
+                RequestContent::Text { text } => Some(text.clone()),
+                RequestContent::ToolUse { .. } | RequestContent::ToolResult { .. } => None,
+            })
+        })
+        .collect()
+}
+
+struct BlockingReadOnlyTool {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for BlockingReadOnlyTool {
+    fn name(&self) -> &str {
+        "blocking_wait"
+    }
+
+    fn description(&self) -> &str {
+        "Blocks until the integration test releases it."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &lpa_tools::ToolContext,
+        _input: serde_json::Value,
+    ) -> Result<ToolOutput> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(ToolOutput::success("released"))
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Default)]
+struct SteerCapturingProvider {
+    stream_requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelProviderSDK for SteerCapturingProvider {
+    async fn completion(&self, _request: ModelRequest) -> Result<ModelResponse, ProviderError> {
+        Ok(ModelResponse {
+            id: "title-1".into(),
+            content: vec![ResponseContent::Text("Generated skill title".into())],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage::default(),
+            metadata: ResponseMetadata::default(),
+        })
+    }
+
+    async fn completion_stream(
+        &self,
+        request: ModelRequest,
+    ) -> Result<
+        Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
+        ProviderError,
+    > {
+        let request_number = {
+            let mut requests = self.stream_requests.lock().expect("stream request lock");
+            requests.push(request);
+            requests.len()
+        };
+        let events = if request_number == 1 {
+            vec![
+                Ok(StreamEvent::ToolCallStart {
+                    index: 0,
+                    id: "tool-1".into(),
+                    name: "blocking_wait".into(),
+                    input: json!({}),
+                }),
+                Ok(StreamEvent::ToolCallInputDelta {
+                    index: 0,
+                    partial_json: "{}".into(),
+                }),
+                Ok(StreamEvent::MessageDone {
+                    response: ModelResponse {
+                        id: "resp-1".into(),
+                        content: vec![ResponseContent::ToolUse {
+                            id: "tool-1".into(),
+                            name: "blocking_wait".into(),
+                            input: json!({}),
+                        }],
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Usage::default(),
+                        metadata: ResponseMetadata::default(),
+                    },
+                }),
+            ]
+        } else {
+            vec![
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Steer applied.".into(),
+                }),
+                Ok(StreamEvent::MessageDone {
+                    response: ModelResponse {
+                        id: "resp-2".into(),
+                        content: vec![ResponseContent::Text("Steer applied.".into())],
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Usage::default(),
+                        metadata: ResponseMetadata::default(),
+                    },
+                }),
+            ]
+        };
+
+        Ok(Box::pin(stream::iter(events)))
+    }
+
+    fn name(&self) -> &str {
+        "steer-capturing-provider"
+    }
+}
+
+#[tokio::test]
+async fn skills_list_returns_user_and_workspace_skills() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let user_skill_root = temp_dir.path().join("user-skills");
+    let workspace_root = temp_dir.path().join("workspace");
+    let workspace_skill_root = workspace_root.join(".lpagent").join("skills");
+
+    let rust_skill_path =
+        create_skill(&user_skill_root, "rust-docs", "# Rust Docs\n\nUse rustdoc.");
+    let team_skill_path = create_skill(
+        &workspace_skill_root,
+        "team-style",
+        "# Team Style\n\nFollow the formatter.",
+    );
+
+    let runtime = build_runtime(
+        temp_dir.path(),
+        user_skill_root.clone(),
+        Some(workspace_root.clone()),
+        Arc::new(CapturingProvider::default()),
+    );
+    let (connection_id, _) = initialize_connection(&runtime).await?;
+
+    let response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 3,
+                "method": "skills/list",
+                "params": {
+                    "cwd": workspace_root,
+                }
+            }),
+        )
+        .await
+        .context("skills/list response")?;
+    let result: SuccessResponse<SkillListResult> = serde_json::from_value(response)?;
+
+    assert_eq!(
+        result.result,
+        SkillListResult {
+            skills: vec![
+                SkillRecord {
+                    id: "rust-docs".into(),
+                    name: "rust-docs".into(),
+                    description: format!("Skill discovered at {}", rust_skill_path.display()),
+                    path: canon(&rust_skill_path),
+                    enabled: true,
+                    source: SkillSource::User,
+                },
+                SkillRecord {
+                    id: "team-style".into(),
+                    name: "team-style".into(),
+                    description: format!("Skill discovered at {}", team_skill_path.display()),
+                    path: canon(&team_skill_path),
+                    enabled: true,
+                    source: SkillSource::Workspace {
+                        cwd: workspace_root,
+                    },
+                },
+            ],
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_changed_rediscovers_new_workspace_skill() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let user_skill_root = temp_dir.path().join("user-skills");
+    let workspace_root = temp_dir.path().join("workspace");
+    let workspace_skill_root = workspace_root.join(".lpagent").join("skills");
+
+    let alpha_skill_path = create_skill(&workspace_skill_root, "alpha", "# Alpha\n\nFirst skill.");
+
+    let runtime = build_runtime(
+        temp_dir.path(),
+        user_skill_root,
+        Some(workspace_root.clone()),
+        Arc::new(CapturingProvider::default()),
+    );
+    let (connection_id, _) = initialize_connection(&runtime).await?;
+
+    let first_response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 4,
+                "method": "skills/changed",
+                "params": {
+                    "cwd": workspace_root.clone(),
+                }
+            }),
+        )
+        .await
+        .context("first skills/changed response")?;
+    let first_result: SuccessResponse<SkillChangedResult> = serde_json::from_value(first_response)?;
+    assert_eq!(
+        first_result.result,
+        SkillChangedResult {
+            skills: vec![SkillRecord {
+                id: "alpha".into(),
+                name: "alpha".into(),
+                description: format!("Skill discovered at {}", alpha_skill_path.display()),
+                path: canon(&alpha_skill_path),
+                enabled: true,
+                source: SkillSource::Workspace {
+                    cwd: workspace_root.clone(),
+                },
+            }],
+        }
+    );
+
+    let bravo_skill_path = create_skill(&workspace_skill_root, "bravo", "# Bravo\n\nSecond skill.");
+    let second_response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 5,
+                "method": "skills/changed",
+                "params": {
+                    "cwd": workspace_root,
+                }
+            }),
+        )
+        .await
+        .context("second skills/changed response")?;
+    let second_result: SuccessResponse<SkillChangedResult> =
+        serde_json::from_value(second_response)?;
+    assert_eq!(
+        second_result.result,
+        SkillChangedResult {
+            skills: vec![
+                SkillRecord {
+                    id: "alpha".into(),
+                    name: "alpha".into(),
+                    description: format!(
+                        "Skill discovered at {}",
+                        workspace_skill_root
+                            .join("alpha")
+                            .join("SKILL.md")
+                            .display()
+                    ),
+                    path: canon(&workspace_skill_root.join("alpha").join("SKILL.md")),
+                    enabled: true,
+                    source: SkillSource::Workspace {
+                        cwd: workspace_root.clone(),
+                    },
+                },
+                SkillRecord {
+                    id: "bravo".into(),
+                    name: "bravo".into(),
+                    description: format!("Skill discovered at {}", bravo_skill_path.display()),
+                    path: canon(&bravo_skill_path),
+                    enabled: true,
+                    source: SkillSource::Workspace {
+                        cwd: workspace_root,
+                    },
+                },
+            ],
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_resolves_skill_content_into_model_request() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let user_skill_root = temp_dir.path().join("user-skills");
+    let workspace_root = temp_dir.path().join("workspace");
+    let skill_path = create_skill(
+        &user_skill_root,
+        "rust-docs",
+        "# Rust Docs\n\nPrefer `cargo test` before `cargo fmt`.",
+    );
+    let provider = Arc::new(CapturingProvider::default());
+    let runtime = build_runtime(
+        temp_dir.path(),
+        user_skill_root,
+        Some(workspace_root.clone()),
+        provider.clone(),
+    );
+    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
+    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
+
+    let response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 6,
+                "method": "turn/start",
+                "params": {
+                    "session_id": session_id,
+                    "input": [
+                        { "type": "text", "text": "Follow this skill." },
+                        { "type": "skill", "id": "rust-docs" }
+                    ],
+                    "model": null,
+                    "thinking": null,
+                    "sandbox": null,
+                    "approval_policy": null,
+                    "cwd": null
+                }
+            }),
+        )
+        .await
+        .context("turn/start response")?;
+    let start_result: SuccessResponse<lpa_server::TurnStartResult> =
+        serde_json::from_value(response)?;
+    assert_eq!(start_result.result.status, lpa_core::TurnStatus::Running);
+
+    wait_for_turn_completed(&mut notifications_rx).await?;
+
+    let captured_request = provider
+        .stream_requests
+        .lock()
+        .expect("captured requests lock")
+        .first()
+        .cloned()
+        .context("expected one streamed model request")?;
+    let request_text = user_request_text(&captured_request)?;
+    let skill_base_dir = skill_path.parent().context("skill base directory")?;
+    let skill_base_dir = canon(skill_base_dir);
+
+    assert!(request_text.contains("Follow this skill."));
+    assert!(request_text.contains("<skill id=\"rust-docs\" name=\"rust-docs\">"));
+    assert!(request_text.contains("Prefer `cargo test` before `cargo fmt`."));
+    assert!(request_text.contains(&format!("Base directory: {}", skill_base_dir.display())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_rejects_missing_skill_references() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let user_skill_root = temp_dir.path().join("user-skills");
+    let workspace_root = temp_dir.path().join("workspace");
+    let runtime = build_runtime(
+        temp_dir.path(),
+        user_skill_root,
+        Some(workspace_root.clone()),
+        Arc::new(CapturingProvider::default()),
+    );
+    let (connection_id, _) = initialize_connection(&runtime).await?;
+    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
+
+    let response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 7,
+                "method": "turn/start",
+                "params": {
+                    "session_id": session_id,
+                    "input": [
+                        { "type": "skill", "id": "missing-skill" }
+                    ],
+                    "model": null,
+                    "thinking": null,
+                    "sandbox": null,
+                    "approval_policy": null,
+                    "cwd": null
+                }
+            }),
+        )
+        .await
+        .context("turn/start missing skill response")?;
+    let error: ErrorResponse = serde_json::from_value(response)?;
+
+    assert_eq!(error.error.code, ProtocolErrorCode::InvalidParams);
+    assert!(error.error.message.contains("skill not found"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_steer_injects_resolved_skill_into_next_model_request() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let user_skill_root = temp_dir.path().join("user-skills");
+    let workspace_root = temp_dir.path().join("workspace");
+    let skill_path = create_skill(
+        &user_skill_root,
+        "steer-rust",
+        "---\nname: steer-rust\ndescription: Rust steering\n---\nPrefer exhaustive matches and cargo tests.",
+    );
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(BlockingReadOnlyTool {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    }));
+    let provider = Arc::new(SteerCapturingProvider::default());
+    let runtime = build_runtime_with_registry(
+        temp_dir.path(),
+        user_skill_root,
+        Some(workspace_root.clone()),
+        provider.clone(),
+        Arc::new(registry),
+    );
+    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
+    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
+
+    let response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 8,
+                "method": "turn/start",
+                "params": {
+                    "session_id": session_id,
+                    "input": [
+                        { "type": "text", "text": "Start with the tool." }
+                    ],
+                    "model": null,
+                    "thinking": null,
+                    "sandbox": null,
+                    "approval_policy": null,
+                    "cwd": null
+                }
+            }),
+        )
+        .await
+        .context("turn/start response for steering test")?;
+    let start_result: SuccessResponse<lpa_server::TurnStartResult> =
+        serde_json::from_value(response)?;
+
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .context("timed out waiting for blocking tool to start")?;
+
+    let steer_response = runtime
+        .handle_incoming(
+            connection_id,
+            serde_json::json!({
+                "id": 9,
+                "method": "turn/steer",
+                "params": {
+                    "session_id": session_id,
+                    "expected_turn_id": start_result.result.turn_id,
+                    "input": [
+                        { "type": "text", "text": "Apply this steer now." },
+                        { "type": "skill", "id": "steer-rust" }
+                    ]
+                }
+            }),
+        )
+        .await
+        .context("turn/steer response")?;
+    let steer_result: SuccessResponse<lpa_server::TurnSteerResult> =
+        serde_json::from_value(steer_response)?;
+    assert_eq!(steer_result.result.turn_id, start_result.result.turn_id);
+
+    release.notify_one();
+    wait_for_turn_completed(&mut notifications_rx).await?;
+
+    let captured_requests = provider
+        .stream_requests
+        .lock()
+        .expect("captured requests lock");
+    assert_eq!(captured_requests.len(), 2);
+
+    let first_user_texts = all_user_request_texts(&captured_requests[0]);
+    let second_user_texts = all_user_request_texts(&captured_requests[1]);
+    let skill_base_dir = skill_path.parent().context("skill base directory")?;
+    let skill_base_dir = canon(skill_base_dir);
+
+    assert!(
+        first_user_texts
+            .iter()
+            .all(|text| !text.contains("Apply this steer now.")),
+        "steer text should not appear before the follow-up request"
+    );
+    assert!(
+        second_user_texts
+            .iter()
+            .any(|text| text.contains("Apply this steer now.")),
+        "expected steer text in the follow-up request"
+    );
+    assert!(
+        second_user_texts
+            .iter()
+            .any(|text| text.contains("<skill id=\"steer-rust\" name=\"steer-rust\">")),
+        "expected resolved skill wrapper in the follow-up request"
+    );
+    assert!(
+        second_user_texts
+            .iter()
+            .any(|text| text.contains("Prefer exhaustive matches and cargo tests.")),
+        "expected skill body in the follow-up request"
+    );
+    assert!(
+        second_user_texts
+            .iter()
+            .any(|text| text.contains(&format!("Base directory: {}", skill_base_dir.display()))),
+        "expected skill base directory in the follow-up request"
+    );
+    Ok(())
+}

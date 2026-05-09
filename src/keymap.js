@@ -20,6 +20,7 @@ export const ACTIONS = [
   { id: "findReplace",         label: "Find and replace",        default: "Cmd+H" },
   { id: "saveFile",            label: "Save file",               default: "Cmd+S" },
   { id: "openSettings",        label: "Open settings",           default: "Cmd+," },
+  { id: "openAgent",           label: "Open agent chat",         default: "Cmd+I" },
   { id: "debugDump",           label: "Dump debug capture",      default: "Cmd+Shift+X" },
   { id: "shortcutsModal",      label: "Show shortcuts",          default: "Cmd+/" },
 ];

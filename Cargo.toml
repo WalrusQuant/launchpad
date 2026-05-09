@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "src-tauri",
+    "crates/core",
+    "crates/tools",
+    "crates/provider",
+    "crates/safety",
+    "crates/tasks",
+    "crates/mcp",
+    "crates/protocol",
+    "crates/client",
+    "crates/server",
+    "crates/utils",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates (ported from launchpad-agent)
+lpa-core = { path = "crates/core" }
+lpa-tools = { path = "crates/tools" }
+lpa-provider = { path = "crates/provider" }
+lpa-safety = { path = "crates/safety" }
+lpa-tasks = { path = "crates/tasks" }
+lpa-mcp = { path = "crates/mcp" }
+lpa-utils = { path = "crates/utils" }
+lpa-protocol = { path = "crates/protocol" }
+lpa-client = { path = "crates/client" }
+lpa-server = { path = "crates/server" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.29", features = ["scrolling-regions"] }
+unicode-width = "0.2"
+textwrap = "0.16"
+pulldown-cmark = "0.13"
+
+# Logging
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Utilities
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+glob = "0.3"
+regex = "1"
+smol_str = { version = "0.3", features = ["serde"] }
+dirs = "6"
+tempfile = "3.23.0"
+pretty_assertions = "1.4.1"
+strum = "0.27.2"
+strum_macros = "0.28.0"
+schemars = "0.8.22"
+iana-time-zone = "0.1.65"
+colored = "2"
