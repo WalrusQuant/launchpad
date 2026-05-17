@@ -1,5 +1,6 @@
 node_modules/
 dist/
+target/
 src-tauri/target/
 tasks/
 .DS_Store
@@ -10,3 +11,6 @@ tasks/
 
 # Claude Code local state (settings, scheduled task locks, etc.)
 .claude/
+
+# Local plan-mode scratch
+.plans/
