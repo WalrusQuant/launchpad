@@ -24,6 +24,9 @@ pub struct ProviderPreset {
     pub description: &'static str,
     /// Whether this preset represents the "custom/BYO endpoint" sentinel.
     pub is_custom: bool,
+    /// Suggested default model slug used when the user picks this preset in
+    /// the settings UI. `None` for `custom` (the user must type their own).
+    pub default_model: Option<&'static str>,
 }
 
 /// Returns every preset in display order.
@@ -40,6 +43,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["ANTHROPIC_API_KEY", "LPA_API_KEY"],
             description: "Claude models — Sonnet, Opus, Haiku",
             is_custom: false,
+            default_model: Some("claude-opus-4-7"),
         },
         ProviderPreset {
             id: "openai",
@@ -49,6 +53,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["OPENAI_API_KEY", "LPA_API_KEY"],
             description: "GPT models — gpt-4o, gpt-5, o1 family",
             is_custom: false,
+            default_model: Some("gpt-4o"),
         },
         ProviderPreset {
             id: "google",
@@ -58,6 +63,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["GOOGLE_API_KEY", "GEMINI_API_KEY", "LPA_API_KEY"],
             description: "Gemini models — 2.5 Pro, 2.5 Flash",
             is_custom: false,
+            default_model: Some("gemini-2.5-pro"),
         },
         ProviderPreset {
             id: "openrouter",
@@ -67,6 +73,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["OPENROUTER_API_KEY", "LPA_API_KEY"],
             description: "Unified gateway — free + paid models from many vendors",
             is_custom: false,
+            default_model: Some("anthropic/claude-opus-4.7"),
         },
         ProviderPreset {
             id: "groq",
@@ -76,6 +83,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["GROQ_API_KEY", "LPA_API_KEY"],
             description: "Very fast inference — Llama, Mixtral, Gemma, Qwen",
             is_custom: false,
+            default_model: Some("llama-3.3-70b-versatile"),
         },
         ProviderPreset {
             id: "together",
@@ -85,6 +93,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["TOGETHER_API_KEY", "LPA_API_KEY"],
             description: "Open-weight models at scale — Llama, Qwen, DeepSeek",
             is_custom: false,
+            default_model: Some("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
         },
         ProviderPreset {
             id: "mistral",
@@ -94,6 +103,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["MISTRAL_API_KEY", "LPA_API_KEY"],
             description: "Mistral models — Large, Medium, Codestral",
             is_custom: false,
+            default_model: Some("mistral-large-latest"),
         },
         ProviderPreset {
             id: "ollama",
@@ -103,6 +113,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &[],
             description: "Run models locally — no API key needed",
             is_custom: false,
+            default_model: Some("llama3.2"),
         },
         ProviderPreset {
             id: "zai_coding",
@@ -112,6 +123,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["Z_AI_API_KEY", "LPA_API_KEY"],
             description: "Z.ai coding plan — GLM-4.6 (flagship), GLM-4.5 family",
             is_custom: false,
+            default_model: Some("glm-4.6"),
         },
         ProviderPreset {
             id: "custom",
@@ -121,6 +133,7 @@ pub fn all_presets() -> &'static [ProviderPreset] {
             api_key_env_vars: &["LPA_API_KEY"],
             description: "Any OpenAI-compatible endpoint",
             is_custom: true,
+            default_model: None,
         },
     ]
 }
@@ -184,5 +197,31 @@ mod tests {
     #[test]
     fn preset_by_id_returns_none_for_unknown() {
         assert!(preset_by_id("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn every_non_custom_preset_has_a_default_model() {
+        for preset in all_presets() {
+            if preset.is_custom {
+                continue;
+            }
+            assert!(
+                preset.default_model.is_some(),
+                "preset {} should declare a default_model",
+                preset.id
+            );
+        }
+    }
+
+    #[test]
+    fn zai_default_model_is_real_glm_4_6() {
+        let preset = preset_by_id("zai_coding").expect("zai_coding preset");
+        assert_eq!(preset.default_model, Some("glm-4.6"));
+    }
+
+    #[test]
+    fn anthropic_default_model_is_claude_opus_4_7() {
+        let preset = preset_by_id("anthropic").expect("anthropic preset");
+        assert_eq!(preset.default_model, Some("claude-opus-4-7"));
     }
 }

@@ -193,6 +193,22 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
         <label class="settings-label" for="set-agentApiKey">API key</label>
         <input class="settings-input" id="set-agentApiKey" type="password" placeholder="sk-..." autocomplete="off" />
       </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentApprovalPolicy">Approval</label>
+        <select class="settings-select" id="set-agentApprovalPolicy">
+          <option value="interactive">Interactive (ask before each tool call)</option>
+          <option value="auto-approve">Auto-approve (no prompts)</option>
+          <option value="deny">Deny (block all tool calls)</option>
+        </select>
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-agentSandboxMode">Sandbox</label>
+        <select class="settings-select" id="set-agentSandboxMode">
+          <option value="workspace-write">Workspace writes (default)</option>
+          <option value="read-only">Read-only (no writes, no shell)</option>
+          <option value="unrestricted">Unrestricted (no sandbox)</option>
+        </select>
+      </div>
       <input type="hidden" id="set-agentWireApi" />
       <button type="button" class="settings-btn" id="agent-save-btn">Save</button>
       <button type="button" class="settings-btn" id="agent-save-reload-btn">Save &amp; reload</button>
@@ -330,6 +346,8 @@ async function renderAgentConfig(content) {
   const modelInput = content.querySelector("#set-agentModel");
   const baseUrlInput = content.querySelector("#set-agentBaseUrl");
   const apiKeyInput = content.querySelector("#set-agentApiKey");
+  const approvalSel = content.querySelector("#set-agentApprovalPolicy");
+  const sandboxSel = content.querySelector("#set-agentSandboxMode");
   const saveBtn = content.querySelector("#agent-save-btn");
   const feedback = content.querySelector("#agent-save-feedback");
   if (!saveBtn) return;
@@ -353,10 +371,11 @@ async function renderAgentConfig(content) {
     opt.dataset.baseUrl = p.default_base_url || "";
     opt.dataset.description = p.description || "";
     opt.dataset.envVars = (p.api_key_env_vars || []).join(",");
+    opt.dataset.defaultModel = p.default_model || "";
     providerSel.appendChild(opt);
   }
 
-  function applyProvider(id, { resetBaseUrl } = {}) {
+  function applyProvider(id, { resetBaseUrl, resetModel } = {}) {
     const opt = providerSel.querySelector(`option[value="${id}"]`);
     if (!opt) {
       descEl.textContent = "";
@@ -366,6 +385,12 @@ async function renderAgentConfig(content) {
     descEl.textContent = opt.dataset.description || "";
     if (resetBaseUrl) {
       baseUrlInput.value = opt.dataset.baseUrl || "";
+    }
+    // Auto-fill the model when the user actively switches providers, so
+    // stale slugs from the previous preset don't blow up the next request.
+    // Existing edits are preserved on the initial restore pass.
+    if (resetModel) {
+      modelInput.value = opt.dataset.defaultModel || "";
     }
     const envVars = opt.dataset.envVars ? opt.dataset.envVars.split(",") : [];
     apiKeyInput.placeholder =
@@ -380,13 +405,22 @@ async function renderAgentConfig(content) {
   if (cfg.provider) providerSel.value = cfg.provider;
   if (cfg.model) modelInput.value = cfg.model;
   if (cfg.base_url) baseUrlInput.value = cfg.base_url;
+  if (approvalSel) {
+    approvalSel.value = cfg.default_approval_policy || "interactive";
+  }
+  if (sandboxSel) {
+    sandboxSel.value = cfg.default_sandbox_mode || "workspace-write";
+  }
   applyProvider(providerSel.value, { resetBaseUrl: !cfg.base_url });
 
-  // When the user picks a different provider, replace the base URL with the
-  // preset default and clear the API key field (key is provider-specific).
+  // When the user picks a different provider, replace the base URL + model
+  // with the preset defaults and clear the API key field (key is
+  // provider-specific). Without resetModel, stale slugs from the previous
+  // preset (e.g. anthropic's "claude-sonnet" against an OpenAI base URL) hit
+  // the new provider and produce a 400.
   providerSel.addEventListener("change", () => {
     apiKeyInput.value = "";
-    applyProvider(providerSel.value, { resetBaseUrl: true });
+    applyProvider(providerSel.value, { resetBaseUrl: true, resetModel: true });
   });
 
   const reloadBtn = content.querySelector("#agent-save-reload-btn");
@@ -413,6 +447,8 @@ async function renderAgentConfig(content) {
         apiKeyInput.value.trim() ||
         (cfg.provider === providerSel.value ? cfg.api_key : null) ||
         null,
+      default_approval_policy: approvalSel ? approvalSel.value : null,
+      default_sandbox_mode: sandboxSel ? sandboxSel.value : null,
     };
     await invoke("agent_config_save", { cfg: next });
     cfg = next;

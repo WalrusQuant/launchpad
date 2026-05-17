@@ -72,11 +72,22 @@ pub fn load_builtin_model_presets() -> Result<Vec<ModelPreset>, PresetModelCatal
     serde_json::from_str(include_str!("../models.json")).map_err(Into::into)
 }
 
-/// Loads the built-in model list bundled with the crate.
+/// Loads the built-in model list bundled with the crate. Any preset whose
+/// `base_instructions` is blank inherits the model-agnostic default — that
+/// way new catalog entries can opt out of the legacy per-model copy without
+/// breaking the "every Model has a system prompt" invariant downstream.
 pub fn load_builtin_models() -> Result<Vec<Model>, PresetModelCatalogError> {
     let mut presets = load_builtin_model_presets()?;
     presets.sort_by(|left, right| right.priority.cmp(&left.priority));
-    Ok(presets.into_iter().map(Model::from).collect())
+    Ok(presets
+        .into_iter()
+        .map(|mut p| {
+            if p.base_instructions.trim().is_empty() {
+                p.base_instructions = DEFAULT_BASE_INSTRUCTIONS.to_string();
+            }
+            Model::from(p)
+        })
+        .collect())
 }
 
 /// Returns the shared fallback base instructions used when a model has no catalog entry.

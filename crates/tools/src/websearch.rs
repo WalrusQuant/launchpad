@@ -74,4 +74,8 @@ impl Tool for WebSearchTool {
         let text = res.text().await?;
         Ok(ToolOutput::success(text))
     }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
 }

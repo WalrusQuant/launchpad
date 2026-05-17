@@ -5,6 +5,21 @@ use tracing::warn;
 use super::capabilities::{OpenAIReasoningMode, OpenAIRequestProfile};
 use super::{OpenAIReasoningEffort, OpenAIRole};
 
+/// Some OpenAI-compatible providers (notably Z.ai's coding plan) sometimes
+/// omit `tool_calls[].id` even though the spec requires it. An empty id
+/// collides across parallel tool calls in the frontend's `toolUseIndex`,
+/// causing tool_result cards to render under the wrong parent — or to appear
+/// empty when the parent index is missing. Synthesize a deterministic-ish id
+/// when the upstream value is blank so each call routes to its own result.
+pub(crate) fn ensure_tool_call_id(raw: &str, tool_name: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let suffix = uuid::Uuid::new_v4();
+    format!("synth-{tool_name}-{suffix}")
+}
+
 pub(crate) fn request_role(role: &str) -> OpenAIRole {
     match role.parse::<RequestRole>() {
         Ok(RequestRole::System) => OpenAIRole::System,

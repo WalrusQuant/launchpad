@@ -452,11 +452,23 @@ pub async fn query(
             return Ok(());
         }
 
+        let permissions: Arc<dyn lpa_safety::legacy_permissions::PermissionPolicy> =
+            if let Some(sandbox) = session.config.sandbox_policy.clone() {
+                Arc::new(lpa_safety::legacy_permissions::RuleBasedPolicy::with_sandbox(
+                    session.config.permission_mode,
+                    lpa_safety::legacy_permissions::SandboxContext {
+                        policy: sandbox,
+                        cwd: session.cwd.clone(),
+                    },
+                ))
+            } else {
+                Arc::new(lpa_safety::legacy_permissions::RuleBasedPolicy::new(
+                    session.config.permission_mode,
+                ))
+            };
         let tool_ctx = ToolContext {
             cwd: session.cwd.clone(),
-            permissions: Arc::new(lpa_safety::legacy_permissions::RuleBasedPolicy::new(
-                session.config.permission_mode,
-            )),
+            permissions,
             session_id: session.id.clone(),
         };
 

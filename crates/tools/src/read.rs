@@ -86,6 +86,10 @@ impl Tool for ReadTool {
 
         read_file(&path, limit.unwrap_or(usize::MAX), offset.unwrap_or(1))
     }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
 }
 
 fn read_directory(path: &Path, limit: usize, offset: usize) -> anyhow::Result<ToolOutput> {

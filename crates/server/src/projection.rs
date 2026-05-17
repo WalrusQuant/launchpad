@@ -46,17 +46,25 @@ impl DefaultProjection {
                             kind,
                             title: String::new(),
                             body: text.clone(),
+                            payload: None,
                         });
                     }
-                    ContentBlock::ToolUse { name, input, .. } => {
+                    ContentBlock::ToolUse { id, name, input } => {
                         history.push(SessionHistoryItem {
                             kind: SessionHistoryItemKind::ToolCall,
                             title: summarize_tool_call(name, input),
                             body: String::new(),
+                            payload: Some(serde_json::json!({
+                                "tool_use_id": id,
+                                "tool_name": name,
+                                "input": input,
+                            })),
                         });
                     }
                     ContentBlock::ToolResult {
-                        content, is_error, ..
+                        tool_use_id,
+                        content,
+                        is_error,
                     } => {
                         history.push(SessionHistoryItem {
                             kind: if *is_error {
@@ -70,6 +78,11 @@ impl DefaultProjection {
                                 "Tool output".to_string()
                             },
                             body: content.clone(),
+                            payload: Some(serde_json::json!({
+                                "tool_use_id": tool_use_id,
+                                "content": content,
+                                "is_error": is_error,
+                            })),
                         });
                     }
                     ContentBlock::Text { .. } => {}
@@ -88,6 +101,7 @@ pub(crate) fn history_item_from_turn_item(item: &TurnItem) -> Option<SessionHist
                 kind: SessionHistoryItemKind::User,
                 title: String::new(),
                 body: text.clone(),
+                payload: None,
             })
         }
         TurnItem::AgentMessage(TextItem { text })
@@ -100,32 +114,50 @@ pub(crate) fn history_item_from_turn_item(item: &TurnItem) -> Option<SessionHist
             kind: SessionHistoryItemKind::Assistant,
             title: String::new(),
             body: text.clone(),
+            payload: None,
         }),
         TurnItem::ToolCall(ToolCallItem {
-            tool_name, input, ..
+            tool_call_id,
+            tool_name,
+            input,
         }) => Some(SessionHistoryItem {
             kind: SessionHistoryItemKind::ToolCall,
             title: summarize_tool_call(tool_name, input),
             body: String::new(),
+            payload: Some(serde_json::json!({
+                "tool_use_id": tool_call_id,
+                "tool_name": tool_name,
+                "input": input,
+            })),
         }),
         TurnItem::ToolResult(ToolResultItem {
-            output, is_error, ..
-        }) => Some(SessionHistoryItem {
-            kind: if *is_error {
-                SessionHistoryItemKind::Error
-            } else {
-                SessionHistoryItemKind::ToolResult
-            },
-            title: if *is_error {
-                "Tool error".to_string()
-            } else {
-                "Tool output".to_string()
-            },
-            body: match output {
+            tool_call_id,
+            output,
+            is_error,
+        }) => {
+            let body = match output {
                 serde_json::Value::String(text) => text.clone(),
                 other => other.to_string(),
-            },
-        }),
+            };
+            Some(SessionHistoryItem {
+                kind: if *is_error {
+                    SessionHistoryItemKind::Error
+                } else {
+                    SessionHistoryItemKind::ToolResult
+                },
+                title: if *is_error {
+                    "Tool error".to_string()
+                } else {
+                    "Tool output".to_string()
+                },
+                body: body.clone(),
+                payload: Some(serde_json::json!({
+                    "tool_use_id": tool_call_id,
+                    "content": body,
+                    "is_error": is_error,
+                })),
+            })
+        }
         TurnItem::ToolProgress(_)
         | TurnItem::ApprovalRequest(_)
         | TurnItem::ApprovalDecision(_) => None,

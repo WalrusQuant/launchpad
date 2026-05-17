@@ -11,3 +11,6 @@ target/
 
 # Claude Code local state (settings, scheduled task locks, etc.)
 .claude/
+
+# Local-only planning / research notes
+.plans/

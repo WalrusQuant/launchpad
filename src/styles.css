@@ -4492,6 +4492,31 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 }
 .tool-write-preview { max-height: 360px; }
 
+/* Specialized previews for bash / read / grep / glob / web_search.
+   Shared shape with the write/diff previews so the tool list reads
+   consistently. */
+.tool-meta {
+  font-size: 11.5px;
+  color: var(--text-5);
+  padding: 0 0 6px 0;
+}
+.tool-read-head,
+.tool-grep-head,
+.tool-search-head {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text-11);
+  padding: 0 0 2px 0;
+}
+.tool-cmd-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  background: var(--surface-1);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-1);
+}
+
 /* Nested tool_result inside its parent tool_call — strip the outer chrome
    and show a subtle indent so it reads as "this call → this result". */
 .tool-result-slot {

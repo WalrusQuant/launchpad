@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use lpa_safety::legacy_permissions::PermissionMode;
+use lpa_safety::{SandboxPolicyRecord, legacy_permissions::PermissionMode};
 
 use crate::{ActiveCompaction, Message, Model, TokenBudget, rebuild_prompt_view};
 
@@ -16,6 +16,10 @@ use crate::{ActiveCompaction, Message, Model, TokenBudget, rebuild_prompt_view};
 pub struct SessionConfig {
     pub token_budget: TokenBudget,
     pub permission_mode: PermissionMode,
+    /// Optional sandbox declaration. When `Some`, the query loop builds a
+    /// sandbox-aware `RuleBasedPolicy` that gates FileWrite and ShellExec
+    /// based on `workspace_write` and the session's cwd.
+    pub sandbox_policy: Option<SandboxPolicyRecord>,
 }
 
 impl Default for SessionConfig {
@@ -23,6 +27,22 @@ impl Default for SessionConfig {
         Self {
             token_budget: TokenBudget::default(),
             permission_mode: PermissionMode::AutoApprove,
+            sandbox_policy: None,
+        }
+    }
+}
+
+impl SessionConfig {
+    /// Builds a session config with explicit permission + sandbox overrides
+    /// while keeping the default token budget.
+    pub fn with_overrides(
+        permission_mode: PermissionMode,
+        sandbox_policy: Option<SandboxPolicyRecord>,
+    ) -> Self {
+        Self {
+            token_budget: TokenBudget::default(),
+            permission_mode,
+            sandbox_policy,
         }
     }
 }

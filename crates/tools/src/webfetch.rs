@@ -147,6 +147,10 @@ impl Tool for WebFetchTool {
             metadata: Some(json!({ "title": title, "mime": mime })),
         })
     }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
 }
 
 fn is_image_mime(mime: &str) -> bool {

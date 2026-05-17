@@ -542,6 +542,7 @@ function handleApprovalRequest(tab, params) {
       try {
         await invoke("agent_approve", {
           sessionId: tab.sessionId,
+          turnId: tab.turnId || params?.request?.turn_id || null,
           approvalId,
           decision,
           scope: scope || "once",
@@ -801,7 +802,7 @@ async function resumeSession(tab, sessionId) {
 // assistant text gets markdown-rendered, tool calls/results render as
 // compact cards.
 function replayHistoryItem(tab, item) {
-  const { kind, title, body } = item || {};
+  const { kind, title, body, payload } = item || {};
   if (kind === "User" || kind === "user") {
     const el = renderMessage("user", body || title || "", {});
     tab.listEl.appendChild(el);
@@ -816,8 +817,27 @@ function replayHistoryItem(tab, item) {
     return;
   }
   if (kind === "ToolCall" || kind === "tool_call") {
+    // When the rollout carries the original payload (post-fix sessions),
+    // route it through the standard tool-card renderer so the specialized
+    // bash / read / grep / apply_patch / write previews fire on resume.
+    // Otherwise fall back to a minimal title+body card for legacy rollouts.
+    //
+    // Indexing shape MUST match the live-event path (see handleItemStarted):
+    //   tab.items.set(itemId, entry)
+    //   tab.toolUseIndex.set(useId, itemId)
+    // Mixing in `useId` as the items-map key (as an earlier pass did) breaks
+    // any subsequent live tool_result that arrives mid-resume.
+    if (payload && typeof payload === "object") {
+      const card = renderToolCard("tool_call", payload, {});
+      updateToolCard(card, "tool_call", { complete: true, payload });
+      const useId = payload.tool_use_id || payload.tool_call_id;
+      const itemId = crypto.randomUUID();
+      if (useId) tab.toolUseIndex.set(useId, itemId);
+      tab.items.set(itemId, { kind: "tool_call", el: card, payload });
+      tab.listEl.appendChild(card);
+      return;
+    }
     const card = renderToolCard("tool_call", { tool_name: title || "tool" }, {});
-    // Replay-state: show as done.
     updateToolCard(card, "tool_call", { complete: true, payload: {} });
     if (body) {
       const args = document.createElement("pre");
@@ -829,9 +849,23 @@ function replayHistoryItem(tab, item) {
     return;
   }
   if (kind === "ToolResult" || kind === "tool_result") {
-    const card = renderToolCard("tool_result", {}, {});
-    updateToolCard(card, "tool_result", { complete: true, payload: { content: body } });
-    tab.listEl.appendChild(card);
+    // Prefer the rich payload so extractResultText picks up structured
+    // content (stdout/stderr splits, JSON envelopes). Falls back to body
+    // for legacy rollouts.
+    const usePayload = payload && typeof payload === "object"
+      ? payload
+      : { content: body, is_error: false };
+    // Resolve the parent card via toolUseIndex → items, exactly like the
+    // live-event path. Legacy rollouts (no payload, no useId) get a
+    // free-floating result card under tab.listEl.
+    const useId = usePayload.tool_use_id || usePayload.tool_call_id;
+    const parentItemId = useId ? tab.toolUseIndex.get(useId) : null;
+    const parentCardEntry = parentItemId ? tab.items.get(parentItemId) : null;
+    const target = parentCardEntry?.el?.querySelector(".tool-result-slot")
+      || tab.listEl;
+    const card = renderToolCard("tool_result", usePayload, {});
+    updateToolCard(card, "tool_result", { complete: true, payload: usePayload });
+    target.appendChild(card);
     return;
   }
   if (kind === "Error" || kind === "error") {

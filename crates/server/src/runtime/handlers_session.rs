@@ -3,7 +3,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::Mutex;
 
-use lpa_core::{SessionId, SessionTitleFinalSource, SessionTitleState};
+use lpa_core::{SessionConfig, SessionId, SessionTitleFinalSource, SessionTitleState};
+use lpa_safety::{SandboxMode, SandboxPolicyRecord, legacy_permissions::PermissionMode};
 
 use crate::{
     ConnectionState, ProtocolErrorCode, ServerEvent, SessionEventPayload, SessionForkParams,
@@ -117,7 +118,34 @@ impl ServerRuntime {
                 format!("failed to persist session metadata: {error}"),
             );
         }
-        let core_session = self.deps.new_session_state(session_id, params.cwd.clone());
+        // Build the SessionConfig incrementally so a request that only sets
+        // `sandbox_mode` doesn't silently flip `permission_mode` to AutoApprove
+        // (and vice versa). When the caller passes neither, leave `None` so
+        // `new_session_state` falls back to `SessionConfig::default()` —
+        // unchanged behavior from before the agent-fix work.
+        let permission_mode = params
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse);
+        let sandbox_policy = params
+            .sandbox_mode
+            .as_deref()
+            .and_then(parse_sandbox_mode);
+        let session_config = if permission_mode.is_some() || sandbox_policy.is_some() {
+            let mut cfg = SessionConfig::default();
+            if let Some(mode) = permission_mode {
+                cfg.permission_mode = mode;
+            }
+            if sandbox_policy.is_some() {
+                cfg.sandbox_policy = sandbox_policy;
+            }
+            Some(cfg)
+        } else {
+            None
+        };
+        let core_session =
+            self.deps
+                .new_session_state(session_id, params.cwd.clone(), session_config);
         let steering_queue = Arc::clone(&core_session.pending_user_prompts);
         self.sessions.lock().await.insert(
             session_id,
@@ -364,7 +392,7 @@ impl ServerRuntime {
             total_output_tokens: source_core_session.total_output_tokens,
             status: SessionRuntimeStatus::Idle,
         };
-        let mut core_session = self.deps.new_session_state(forked_id, fork_cwd);
+        let mut core_session = self.deps.new_session_state(forked_id, fork_cwd, None);
         core_session.messages = source_core_session.messages.clone();
         core_session.turn_count = source_core_session.turn_count;
         core_session.total_input_tokens = source_core_session.total_input_tokens;
@@ -444,5 +472,26 @@ impl ServerRuntime {
             },
         })
         .expect("serialize session/fork response")
+    }
+}
+
+/// Maps the user-facing `sandbox_mode` string from `SessionStartParams` to the
+/// structured `SandboxPolicyRecord` the runtime consumes. Returns `None` for
+/// unknown values so the server can fall back to the default policy.
+fn parse_sandbox_mode(value: &str) -> Option<SandboxPolicyRecord> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "unrestricted" => Some(SandboxPolicyRecord {
+            mode: SandboxMode::Unrestricted,
+            workspace_write: true,
+        }),
+        "workspace-write" | "workspace_write" => Some(SandboxPolicyRecord {
+            mode: SandboxMode::Restricted,
+            workspace_write: true,
+        }),
+        "read-only" | "read_only" | "readonly" => Some(SandboxPolicyRecord {
+            mode: SandboxMode::Restricted,
+            workspace_write: false,
+        }),
+        _ => None,
     }
 }

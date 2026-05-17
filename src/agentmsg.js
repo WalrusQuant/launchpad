@@ -186,10 +186,24 @@ export function updateToolCard(card, kind, update) {
       // (often more complete) text so we don't duplicate.
       const existing = body.querySelector("pre.tool-output");
       if (existing) existing.remove();
-      const pre = document.createElement("pre");
-      pre.className = "tool-output";
-      pre.textContent = String(text);
-      body.appendChild(pre);
+      const trimmed = typeof text === "string" ? text.trim() : "";
+      if (trimmed.length === 0) {
+        // Surface empty results so the bug is visible. Several OpenAI-compat
+        // providers emit empty tool-result bodies under conditions worth
+        // dogfooding (e.g. a tool that exits 0 with no stdout, or upstream
+        // truncation). Better than an invisible empty pre.
+        const note = document.createElement("div");
+        note.className = "tool-meta tool-result-empty";
+        note.textContent = update.payload?.is_error
+          ? "(error — no output)"
+          : "(no output)";
+        body.appendChild(note);
+      } else {
+        const pre = document.createElement("pre");
+        pre.className = "tool-output";
+        pre.textContent = String(text);
+        body.appendChild(pre);
+      }
     }
   }
 }
@@ -310,6 +324,41 @@ function populateInitial(kind, body, payload) {
         return;
       }
     }
+    if ((toolName === "bash" || toolName === "shell") && args && typeof args === "object") {
+      const command = args.command || args.cmd || args.script;
+      if (typeof command === "string" && command.length) {
+        renderBashPreview(body, command, args);
+        return;
+      }
+    }
+    if (toolName === "read" && args && typeof args === "object") {
+      const filePath = args.filePath || args.file_path || args.path;
+      if (filePath) {
+        renderReadPreview(body, filePath, args);
+        return;
+      }
+    }
+    if (toolName === "grep" && args && typeof args === "object") {
+      const pattern = args.pattern || args.query;
+      if (pattern) {
+        renderGrepPreview(body, pattern, args);
+        return;
+      }
+    }
+    if (toolName === "glob" && args && typeof args === "object") {
+      const pattern = args.glob_pattern || args.pattern || args.glob;
+      if (pattern) {
+        renderGlobPreview(body, pattern, args);
+        return;
+      }
+    }
+    if ((toolName === "web_search" || toolName === "websearch") && args && typeof args === "object") {
+      const query = args.query || args.q;
+      if (query) {
+        renderWebSearchPreview(body, query, args);
+        return;
+      }
+    }
     if (args !== undefined && args !== null) {
       appendArgs(body, args);
     }
@@ -389,6 +438,96 @@ function renderWritePreview(body, filePath, content) {
   const cap = 2000;
   pre.textContent = content.length > cap ? content.slice(0, cap) + "\n…" : content;
   body.appendChild(pre);
+}
+
+// bash: render the command in a monospace block + a muted subline with
+// workdir / timeout when present. Better than dumping the raw JSON args.
+function renderBashPreview(body, command, args) {
+  const cmd = document.createElement("pre");
+  cmd.className = "tool-cmd";
+  cmd.textContent = `$ ${command}`;
+  body.appendChild(cmd);
+
+  const meta = [];
+  if (args.workdir) meta.push(`cwd: ${args.workdir}`);
+  if (args.timeout) meta.push(`timeout: ${args.timeout}ms`);
+  if (args.shell) meta.push(`shell: ${args.shell}`);
+  if (meta.length) {
+    const sub = document.createElement("div");
+    sub.className = "tool-meta";
+    sub.textContent = meta.join(" · ");
+    body.appendChild(sub);
+  }
+}
+
+// read: show the file path + optional offset/limit range.
+function renderReadPreview(body, filePath, args) {
+  const head = document.createElement("div");
+  head.className = "tool-read-head";
+  head.textContent = filePath;
+  body.appendChild(head);
+
+  const offset = Number.isFinite(args.offset) ? args.offset : null;
+  const limit = Number.isFinite(args.limit) ? args.limit : null;
+  if (offset !== null || limit !== null) {
+    const sub = document.createElement("div");
+    sub.className = "tool-meta";
+    const start = offset || 0;
+    const end = limit !== null ? start + limit : null;
+    sub.textContent =
+      end !== null ? `lines ${start}..${end}` : `from line ${start}`;
+    body.appendChild(sub);
+  }
+}
+
+// grep: pattern in a <code>, scope path + flag chips below.
+function renderGrepPreview(body, pattern, args) {
+  const head = document.createElement("div");
+  head.className = "tool-grep-head";
+  const code = document.createElement("code");
+  code.className = "tool-cmd-inline";
+  code.textContent = pattern;
+  head.appendChild(code);
+  body.appendChild(head);
+
+  const meta = [];
+  if (args.path) meta.push(`in ${args.path}`);
+  if (args.glob) meta.push(`glob: ${args.glob}`);
+  if (args.case_insensitive || args.ignore_case) meta.push("case-insensitive");
+  if (meta.length) {
+    const sub = document.createElement("div");
+    sub.className = "tool-meta";
+    sub.textContent = meta.join(" · ");
+    body.appendChild(sub);
+  }
+}
+
+// glob: pattern + optional scope path.
+function renderGlobPreview(body, pattern, args) {
+  const head = document.createElement("div");
+  head.className = "tool-grep-head";
+  const code = document.createElement("code");
+  code.className = "tool-cmd-inline";
+  code.textContent = pattern;
+  head.appendChild(code);
+  body.appendChild(head);
+
+  if (args.path) {
+    const sub = document.createElement("div");
+    sub.className = "tool-meta";
+    sub.textContent = `in ${args.path}`;
+    body.appendChild(sub);
+  }
+}
+
+// web_search: italicized query.
+function renderWebSearchPreview(body, query, _args) {
+  const head = document.createElement("div");
+  head.className = "tool-search-head";
+  const em = document.createElement("em");
+  em.textContent = query;
+  head.appendChild(em);
+  body.appendChild(head);
 }
 
 // ─── Approval card ────────────────────────────────────────────────────────

@@ -26,9 +26,16 @@ pub struct AgentConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Default approval policy hint for the frontend; not enforced server-side.
+    /// Default approval policy applied to every new session.
+    /// Values: `"auto-approve" | "interactive" | "deny"`. Forwarded as
+    /// `permission_mode` on `session/start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_approval_policy: Option<String>,
+    /// Default sandbox mode applied to every new session.
+    /// Values: `"unrestricted" | "workspace-write" | "read-only"`. Forwarded as
+    /// `sandbox_mode` on `session/start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sandbox_mode: Option<String>,
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -51,6 +58,37 @@ pub fn write_user_config(cfg: &AgentConfig) -> Result<(), String> {
     let body = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     atomic_write_with_mode(&path, body.as_bytes(), Some(0o600)).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// One-time initialization: fills in safe defaults for `default_approval_policy`
+/// and `default_sandbox_mode` when they're missing AND persists them to disk.
+///
+/// Called once at app startup from `AgentState::new()`. The previous design
+/// (`apply_first_run_defaults` applied at every load/save) had a load/save
+/// asymmetry: load returned defaults to the UI but never wrote them, so
+/// `agent_session_start` (which reads disk directly) saw `None` and made the
+/// runtime fall back to `AutoApprove` — misaligned with the UI showing
+/// "Interactive". A single persisted initialization makes the on-disk file
+/// the single source of truth.
+pub fn initialize_defaults_if_missing() {
+    let mut cfg = read_user_config();
+    let mut changed = false;
+    if cfg.default_approval_policy.is_none() {
+        cfg.default_approval_policy = Some("interactive".to_string());
+        changed = true;
+    }
+    if cfg.default_sandbox_mode.is_none() {
+        cfg.default_sandbox_mode = Some("workspace-write".to_string());
+        changed = true;
+    }
+    if changed {
+        if let Err(err) = write_user_config(&cfg) {
+            // Best effort — log but don't crash. The runtime falls back to
+            // SessionConfig::default() (AutoApprove + no sandbox) if disk
+            // can't be written.
+            tracing::warn!(?err, "failed to persist initial agent defaults");
+        }
+    }
 }
 
 /// Process-wide lock serializing writes and reads of the LPA_* env vars.
@@ -103,6 +141,9 @@ fn apply_or_unset(key: &str, value: Option<&str>) {
 
 #[tauri::command]
 pub fn agent_config_load() -> Result<AgentConfig, String> {
+    // Disk is the source of truth. Defaults are written once at app startup
+    // by `initialize_defaults_if_missing()` (called from `AgentState::new`),
+    // so by the time this fires the file already holds the right values.
     Ok(read_user_config())
 }
 
@@ -158,6 +199,11 @@ pub struct ProviderPresetView {
     pub api_key_env_vars: Vec<&'static str>,
     pub description: &'static str,
     pub is_custom: bool,
+    /// Recommended default model slug for this provider. `None` for the
+    /// `custom` preset (where the user must supply their own slug). Used by
+    /// the settings UI to auto-fill the model input when the user switches
+    /// providers.
+    pub default_model: Option<&'static str>,
 }
 
 // ─── Session deletion ────────────────────────────────────────────────────
@@ -292,6 +338,7 @@ pub fn agent_provider_presets() -> Vec<ProviderPresetView> {
             api_key_env_vars: p.api_key_env_vars.to_vec(),
             description: p.description,
             is_custom: p.is_custom,
+            default_model: p.default_model,
         })
         .collect()
 }

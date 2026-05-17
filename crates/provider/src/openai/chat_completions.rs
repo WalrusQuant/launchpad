@@ -810,7 +810,7 @@ pub(super) fn parse_tool_use(
             let input = serde_json::from_str(&function.arguments)
                 .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
             Some(ResponseContent::ToolUse {
-                id: value.id.clone(),
+                id: super::shared::ensure_tool_call_id(&value.id, &function.name),
                 name: function.name.clone(),
                 input,
             })
@@ -818,7 +818,7 @@ pub(super) fn parse_tool_use(
         "custom" => {
             let custom = value.custom.as_ref()?;
             Some(ResponseContent::ToolUse {
-                id: value.id.clone(),
+                id: super::shared::ensure_tool_call_id(&value.id, &custom.name),
                 name: custom.name.clone(),
                 input: Value::String(custom.input.clone()),
             })

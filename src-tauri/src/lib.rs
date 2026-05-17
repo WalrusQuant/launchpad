@@ -3828,8 +3828,24 @@ pub fn run() {
             agent::agent_session_delete,
             agent::agent_session_deleted_ids
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Drain MCP supervisors on exit. Without this, child processes
+            // launched by configured MCP servers can outlive the parent app
+            // and accumulate over time.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. })
+                || matches!(event, tauri::RunEvent::Exit)
+            {
+                let state: tauri::State<'_, agent::AgentState> = app_handle.state();
+                // Cap each shutdown to two seconds so a wedged MCP can't
+                // block the user from quitting.
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    state.shutdown(),
+                ));
+            }
+        });
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {

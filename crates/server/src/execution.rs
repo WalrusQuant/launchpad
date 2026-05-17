@@ -86,8 +86,16 @@ impl ServerRuntimeDependencies {
     }
 
     /// Creates an initial core session state for a newly created server session.
-    pub(crate) fn new_session_state(&self, session_id: SessionId, cwd: PathBuf) -> SessionState {
-        let mut state = SessionState::new(SessionConfig::default(), cwd);
+    /// `overrides`, when supplied, replaces the default `SessionConfig` so the
+    /// session inherits the client-provided permission mode and sandbox policy.
+    pub(crate) fn new_session_state(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+        overrides: Option<SessionConfig>,
+    ) -> SessionState {
+        let config = overrides.unwrap_or_default();
+        let mut state = SessionState::new(config, cwd);
         state.id = session_id.to_string();
         state
     }

@@ -41,6 +41,11 @@ pub struct AgentState {
 
 impl AgentState {
     pub fn new() -> Self {
+        // Write safe defaults to ~/.launchpad/agent-config.json on first
+        // launch if the file is empty/missing those fields. Makes disk the
+        // single source of truth so the UI dropdown and the session_start
+        // envelope always agree on what the user's defaults are.
+        super::config::initialize_defaults_if_missing();
         Self {
             runtime: Mutex::new(None),
             mcp_manager: Mutex::new(None),

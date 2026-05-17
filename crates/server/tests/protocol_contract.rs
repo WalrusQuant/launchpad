@@ -82,7 +82,7 @@ fn skill_list_result_serializes_expected_shape() {
 fn approval_response_roundtrip() {
     let payload = ApprovalRespondParams {
         session_id: SessionId::new(),
-        turn_id: TurnId::new(),
+        turn_id: Some(TurnId::new()),
         approval_id: "approval-1".into(),
         decision: ApprovalDecisionValue::Approve,
         scope: ApprovalScopeValue::Session,

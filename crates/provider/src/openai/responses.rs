@@ -251,7 +251,11 @@ fn parse_output_item(item: &Value) -> Vec<ResponseContent> {
                 .or_else(|| item.get("input"))
                 .cloned()
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-            vec![ResponseContent::ToolUse { id, name, input }]
+            vec![ResponseContent::ToolUse {
+                id: super::shared::ensure_tool_call_id(&id, &name),
+                name,
+                input,
+            }]
         }
         Some("reasoning") => Vec::new(),
         _ => Vec::new(),
@@ -269,24 +273,28 @@ fn parse_message_content(item: &Value) -> Option<ResponseContent> {
                 Some(ResponseContent::Text(assistant_text))
             }
         }
-        Some("tool_call") | Some("function_call") => Some(ResponseContent::ToolUse {
-            id: item
+        Some("tool_call") | Some("function_call") => {
+            let raw_id = item
                 .get("call_id")
                 .or_else(|| item.get("id"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            name: item
+                .unwrap_or_default();
+            let name = item
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-            input: item
+                .to_string();
+            let input = item
                 .get("arguments")
                 .or_else(|| item.get("input"))
                 .cloned()
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-        }),
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            Some(ResponseContent::ToolUse {
+                id: super::shared::ensure_tool_call_id(raw_id, &name),
+                name,
+                input,
+            })
+        }
         _ => None,
     }
 }
@@ -549,7 +557,9 @@ impl ModelProviderSDK for OpenAIResponsesProvider {
                                                 let parsed_input = serde_json::from_str(input)
                                                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                                                 content.push(ResponseContent::ToolUse {
-                                                    id: id.clone(),
+                                                    id: super::shared::ensure_tool_call_id(
+                                                        id, name,
+                                                    ),
                                                     name: name.clone(),
                                                     input: parsed_input,
                                                 });
@@ -596,7 +606,7 @@ impl ModelProviderSDK for OpenAIResponsesProvider {
                         let parsed_input = serde_json::from_str(input)
                             .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                         content.push(ResponseContent::ToolUse {
-                            id: id.clone(),
+                            id: super::shared::ensure_tool_call_id(id, name),
                             name: name.clone(),
                             input: parsed_input,
                         });

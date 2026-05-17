@@ -2304,6 +2304,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2315,6 +2316,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

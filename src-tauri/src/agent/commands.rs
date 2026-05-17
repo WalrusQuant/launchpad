@@ -136,6 +136,24 @@ pub async fn agent_session_start(
     if let Some(slug) = model {
         params.insert("model".into(), Value::String(slug));
     }
+    // Project the user's saved approval + sandbox preferences onto the
+    // session/start envelope so the runtime's StaticPermissionPolicy actually
+    // honors them. Unknown values get filtered server-side; absent values let
+    // the runtime fall back to its own defaults.
+    let cfg = super::config::read_user_config();
+    if let Some(mode) = cfg.default_approval_policy.as_deref().map(str::trim) {
+        if !mode.is_empty() {
+            params.insert("permission_mode".into(), Value::String(mode.to_string()));
+        }
+    }
+    if let Some(sandbox) = cfg.default_sandbox_mode.as_deref().map(str::trim) {
+        if !sandbox.is_empty() {
+            params.insert(
+                "sandbox_mode".into(),
+                Value::String(sandbox.to_string()),
+            );
+        }
+    }
     let envelope = json!({
         "jsonrpc": "2.0",
         "id": rpc_id(),
@@ -263,6 +281,7 @@ pub async fn agent_approve(
     window: Window,
     state: State<'_, AgentState>,
     session_id: String,
+    turn_id: Option<String>,
     approval_id: String,
     decision: String,
     scope: Option<String>,
@@ -272,16 +291,27 @@ pub async fn agent_approve(
         .map_err(err)?;
     let runtime = state.runtime(&app).await.map_err(err)?;
 
+    // ApprovalRespondParams requires both session_id and turn_id. Omitting
+    // turn_id makes the params fail to deserialize → handler returns an
+    // InvalidParams error → the orchestrator's oneshot never resolves →
+    // the agent hangs forever. The frontend now passes tab.turnId, but we
+    // also include turn_id only when supplied to keep the surface clean.
+    let mut params = serde_json::Map::new();
+    params.insert("session_id".into(), Value::String(session_id));
+    if let Some(tid) = turn_id.filter(|s| !s.is_empty()) {
+        params.insert("turn_id".into(), Value::String(tid));
+    }
+    params.insert("approval_id".into(), Value::String(approval_id));
+    params.insert("decision".into(), Value::String(decision));
+    params.insert(
+        "scope".into(),
+        Value::String(scope.unwrap_or_else(|| "once".to_string())),
+    );
     let envelope = json!({
         "jsonrpc": "2.0",
         "id": rpc_id(),
         "method": "approval/respond",
-        "params": {
-            "session_id": session_id,
-            "approval_id": approval_id,
-            "decision": decision,
-            "scope": scope.unwrap_or_else(|| "once".to_string())
-        }
+        "params": Value::Object(params),
     });
     Ok(runtime.handle_incoming(connection_id, envelope).await)
 }
