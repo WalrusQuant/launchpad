@@ -52,7 +52,11 @@ export async function invokeWithTimeout(command, args, timeoutMs = 30000) {
   }
 }
 
+let fetchInFlight = false;
+
 export async function fetchGitStatus(path) {
+  if (fetchInFlight) return currentGitInfo;
+  fetchInFlight = true;
   try {
     currentGitInfo = await invoke("get_git_status", { path });
     currentGitRoot = path;
@@ -61,6 +65,8 @@ export async function fetchGitStatus(path) {
   } catch (err) {
     console.error("[git] Git status error:", err);
     return null;
+  } finally {
+    fetchInFlight = false;
   }
 }
 

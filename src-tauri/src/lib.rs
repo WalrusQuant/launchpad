@@ -11,6 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
+async fn blocking<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("blocking task panicked: {e}"))?
+}
+
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
 
 // Tauri event names. Mirror src/events.js — keep both lists in sync, since
@@ -375,53 +385,56 @@ fn close_pty(tab_id: u32, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
-    let entries = fs::read_dir(&path).map_err(|e| e.to_string())?;
+async fn read_directory(path: String) -> Result<Vec<FileEntry>, String> {
+    blocking(move || {
+        let entries = fs::read_dir(&path).map_err(|e| e.to_string())?;
 
-    let mut files: Vec<FileEntry> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            // Use to_string_lossy so non-UTF-8 filenames (rare on macOS but
-            // possible) still show up with replacement characters rather
-            // than disappearing from the listing entirely.
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_hidden = name.starts_with('.');
-            // Don't drop the entry if metadata fails (permission denied,
-            // or TOCTOU where the file was removed between read_dir and
-            // metadata). Fall through to sensible defaults so the user
-            // still sees what's there.
-            let metadata = entry.metadata().ok();
-            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = metadata
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            let mode = metadata
-                .as_ref()
-                .map(|m| m.permissions().mode())
-                .unwrap_or(0);
+        let mut files: Vec<FileEntry> = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                // Use to_string_lossy so non-UTF-8 filenames (rare on macOS but
+                // possible) still show up with replacement characters rather
+                // than disappearing from the listing entirely.
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_hidden = name.starts_with('.');
+                // Don't drop the entry if metadata fails (permission denied,
+                // or TOCTOU where the file was removed between read_dir and
+                // metadata). Fall through to sensible defaults so the user
+                // still sees what's there.
+                let metadata = entry.metadata().ok();
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                let mode = metadata
+                    .as_ref()
+                    .map(|m| m.permissions().mode())
+                    .unwrap_or(0);
 
-            Some(FileEntry {
-                name,
-                path: entry.path().to_string_lossy().to_string(),
-                is_dir,
-                is_hidden,
-                size,
-                modified,
-                mode,
+                Some(FileEntry {
+                    name,
+                    path: entry.path().to_string_lossy().to_string(),
+                    is_dir,
+                    is_hidden,
+                    size,
+                    modified,
+                    mode,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    files.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+        files.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
 
-    Ok(files)
+        Ok(files)
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -440,9 +453,8 @@ struct GitInfo {
     has_upstream: bool,
 }
 
-#[tauri::command]
-fn get_git_status(path: String) -> Result<GitInfo, String> {
-    let repo = match Repository::discover(&path) {
+fn get_git_status_inner(path: &str) -> Result<GitInfo, String> {
+    let repo = match Repository::discover(path) {
         Ok(r) => r,
         Err(_) => {
             return Ok(GitInfo {
@@ -519,6 +531,11 @@ fn get_git_status(path: String) -> Result<GitInfo, String> {
     })
 }
 
+#[tauri::command]
+async fn get_git_status(path: String) -> Result<GitInfo, String> {
+    blocking(move || get_git_status_inner(&path)).await
+}
+
 fn get_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let head = repo.head().ok()?;
     let local_oid = head.target()?;
@@ -551,117 +568,129 @@ struct CommitInfo {
 }
 
 #[tauri::command]
-fn list_branches(path: String) -> Result<Vec<BranchInfo>, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let branches = repo
-        .branches(Some(BranchType::Local))
-        .map_err(|e| e.to_string())?;
+async fn list_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let branches = repo
+            .branches(Some(BranchType::Local))
+            .map_err(|e| e.to_string())?;
 
-    let current_branch = repo
-        .head()
-        .ok()
-        .and_then(|h| h.shorthand().map(String::from));
+        let current_branch = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(String::from));
 
-    let mut result: Vec<BranchInfo> = branches
-        .filter_map(|b| {
-            let (branch, _) = b.ok()?;
-            let name = branch.name().ok()??.to_string();
-            let is_current = current_branch.as_deref() == Some(&name);
+        let mut result: Vec<BranchInfo> = branches
+            .filter_map(|b| {
+                let (branch, _) = b.ok()?;
+                let name = branch.name().ok()??.to_string();
+                let is_current = current_branch.as_deref() == Some(&name);
 
-            let commit = branch.get().peel_to_commit().ok();
-            let last_commit_msg = commit
-                .as_ref()
-                .and_then(|c| c.summary().map(String::from));
-            let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
+                let commit = branch.get().peel_to_commit().ok();
+                let last_commit_msg = commit
+                    .as_ref()
+                    .and_then(|c| c.summary().map(String::from));
+                let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
 
-            let upstream = branch
-                .upstream()
-                .ok()
-                .and_then(|u| u.name().ok().flatten().map(String::from));
+                let upstream = branch
+                    .upstream()
+                    .ok()
+                    .and_then(|u| u.name().ok().flatten().map(String::from));
 
-            Some(BranchInfo {
-                name,
-                is_current,
-                last_commit_msg,
-                last_commit_time,
-                upstream,
+                Some(BranchInfo {
+                    name,
+                    is_current,
+                    last_commit_msg,
+                    last_commit_time,
+                    upstream,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    result.sort_by(|a, b| {
-        b.is_current
-            .cmp(&a.is_current)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+        result.sort_by(|a, b| {
+            b.is_current
+                .cmp(&a.is_current)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
-    Ok(result)
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_commits(path: String, count: Option<usize>) -> Result<Vec<CommitInfo>, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let head = match repo.head() {
-        Ok(h) => h,
-        Err(_) => return Ok(vec![]),
-    };
-    let head_oid = match head.target() {
-        Some(oid) => oid,
-        None => return Ok(vec![]),
-    };
+async fn get_commits(path: String, count: Option<usize>) -> Result<Vec<CommitInfo>, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let head = match repo.head() {
+            Ok(h) => h,
+            Err(_) => return Ok(vec![]),
+        };
+        let head_oid = match head.target() {
+            Some(oid) => oid,
+            None => return Ok(vec![]),
+        };
 
-    let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
-    revwalk.push(head_oid).map_err(|e| e.to_string())?;
+        let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
+        revwalk.push(head_oid).map_err(|e| e.to_string())?;
 
-    let limit = count.unwrap_or(20);
+        let limit = count.unwrap_or(20);
 
-    let commits: Vec<CommitInfo> = revwalk
-        .take(limit)
-        .filter_map(|oid| {
-            let oid = oid.ok()?;
-            let commit = repo.find_commit(oid).ok()?;
-            let short_id = oid.to_string()[..7].to_string();
-            let message = commit
-                .summary()
-                .unwrap_or("(no message)")
-                .to_string();
-            let author = commit.author().name().unwrap_or("Unknown").to_string();
-            let timestamp = commit.time().seconds();
+        let commits: Vec<CommitInfo> = revwalk
+            .take(limit)
+            .filter_map(|oid| {
+                let oid = oid.ok()?;
+                let commit = repo.find_commit(oid).ok()?;
+                let short_id = oid.to_string()[..7].to_string();
+                let message = commit
+                    .summary()
+                    .unwrap_or("(no message)")
+                    .to_string();
+                let author = commit.author().name().unwrap_or("Unknown").to_string();
+                let timestamp = commit.time().seconds();
 
-            Some(CommitInfo {
-                oid: short_id,
-                message,
-                author,
-                timestamp,
-                parent_count: commit.parent_count(),
+                Some(CommitInfo {
+                    oid: short_id,
+                    message,
+                    author,
+                    timestamp,
+                    parent_count: commit.parent_count(),
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    Ok(commits)
+        Ok(commits)
+    })
+    .await
 }
 
 #[tauri::command]
-fn checkout_branch(path: String, branch_name: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    checkout_branch_inner(&repo, &branch_name)
+async fn checkout_branch(path: String, branch_name: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        checkout_branch_inner(&repo, &branch_name)
+    })
+    .await
 }
 
 #[tauri::command]
-fn create_branch(path: String, branch_name: String, checkout: Option<bool>) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+async fn create_branch(path: String, branch_name: String, checkout: Option<bool>) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
-    let head = repo.head().map_err(|e| e.to_string())?;
-    let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+        let head = repo.head().map_err(|e| e.to_string())?;
+        let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
 
-    repo.branch(&branch_name, &commit, false)
-        .map_err(|e| e.to_string())?;
+        repo.branch(&branch_name, &commit, false)
+            .map_err(|e| e.to_string())?;
 
-    if checkout.unwrap_or(true) {
-        checkout_branch_inner(&repo, &branch_name)?;
-    }
+        if checkout.unwrap_or(true) {
+            checkout_branch_inner(&repo, &branch_name)?;
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 fn checkout_branch_inner(repo: &Repository, branch_name: &str) -> Result<(), String> {
@@ -1017,54 +1046,57 @@ fn forget_project_env(path: String) -> Result<(), String> {
 
 // Recursive file search for quick open
 #[tauri::command]
-fn search_files(root: String, query: String, max_results: Option<usize>) -> Result<Vec<String>, String> {
-    let limit = max_results.unwrap_or(50);
-    let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
-    let root_path = std::path::Path::new(&root);
+async fn search_files(root: String, query: String, max_results: Option<usize>) -> Result<Vec<String>, String> {
+    blocking(move || {
+        let limit = max_results.unwrap_or(50);
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        let root_path = std::path::Path::new(&root);
 
-    fn walk(
-        dir: &std::path::Path,
-        root: &std::path::Path,
-        query: &str,
-        results: &mut Vec<String>,
-        limit: usize,
-        depth: usize,
-    ) {
-        if depth > 10 || results.len() >= limit {
-            return;
-        }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        // Sort siblings so walk order is deterministic. fs::read_dir's order
-        // is filesystem-dependent; with a result limit, a non-deterministic
-        // walk makes "which 20 files appear first" vary run-to-run.
-        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        sorted.sort_by_key(|e| e.file_name());
-        for entry in sorted {
-            if results.len() >= limit {
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            query: &str,
+            results: &mut Vec<String>,
+            limit: usize,
+            depth: usize,
+        ) {
+            if depth > 10 || results.len() >= limit {
                 return;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip hidden dirs and common large dirs
-            if name.starts_with('.') || name == "node_modules" || name == "target" || name == "__pycache__" || name == "dist" || name == "build" {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, root, query, results, limit, depth + 1);
-            } else if name.to_lowercase().contains(query) {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                results.push(relative.to_string_lossy().to_string());
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            // Sort siblings so walk order is deterministic. fs::read_dir's order
+            // is filesystem-dependent; with a result limit, a non-deterministic
+            // walk makes "which 20 files appear first" vary run-to-run.
+            let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
+                if results.len() >= limit {
+                    return;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Skip hidden dirs and common large dirs
+                if name.starts_with('.') || name == "node_modules" || name == "target" || name == "__pycache__" || name == "dist" || name == "build" {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, query, results, limit, depth + 1);
+                } else if name.to_lowercase().contains(query) {
+                    let relative = path.strip_prefix(root).unwrap_or(&path);
+                    results.push(relative.to_string_lossy().to_string());
+                }
             }
         }
-    }
 
-    walk(root_path, root_path, &query_lower, &mut results, limit, 0);
-    results.sort_by(|a, b| a.len().cmp(&b.len()));
-    Ok(results)
+        walk(root_path, root_path, &query_lower, &mut results, limit, 0);
+        results.sort_by(|a, b| a.len().cmp(&b.len()));
+        Ok(results)
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -1079,123 +1111,126 @@ struct SearchHit {
 // Project-wide content search. Walks the tree applying the same skip rules as
 // search_files, reads text files under a size cap, and reports matches.
 #[tauri::command]
-fn search_in_files(
+async fn search_in_files(
     root: String,
     query: String,
     case_sensitive: bool,
     is_regex: bool,
     max_results: Option<usize>,
 ) -> Result<Vec<SearchHit>, String> {
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-    let limit = max_results.unwrap_or(500);
-    let root_path = std::path::Path::new(&root);
-
-    // Compile pattern once.
-    let pattern_src = if is_regex {
-        query.clone()
-    } else {
-        regex::escape(&query)
-    };
-    let pattern = regex::RegexBuilder::new(&pattern_src)
-        .case_insensitive(!case_sensitive)
-        .build()
-        .map_err(|e| format!("Invalid pattern: {}", e))?;
-
-    let mut results: Vec<SearchHit> = Vec::new();
-
-    fn walk(
-        dir: &std::path::Path,
-        root: &std::path::Path,
-        pattern: &regex::Regex,
-        results: &mut Vec<SearchHit>,
-        limit: usize,
-        depth: usize,
-    ) {
-        if depth > 12 || results.len() >= limit {
-            return;
+    blocking(move || {
+        if query.is_empty() {
+            return Ok(Vec::new());
         }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
+        let limit = max_results.unwrap_or(500);
+        let root_path = std::path::Path::new(&root);
+
+        // Compile pattern once.
+        let pattern_src = if is_regex {
+            query.clone()
+        } else {
+            regex::escape(&query)
         };
-        // Deterministic walk (same reason as search_files): keeps the set
-        // of matches visited before hitting `limit` stable across runs.
-        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        sorted.sort_by_key(|e| e.file_name());
-        for entry in sorted {
-            if results.len() >= limit {
+        let pattern = regex::RegexBuilder::new(&pattern_src)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| format!("Invalid pattern: {}", e))?;
+
+        let mut results: Vec<SearchHit> = Vec::new();
+
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            pattern: &regex::Regex,
+            results: &mut Vec<SearchHit>,
+            limit: usize,
+            depth: usize,
+        ) {
+            if depth > 12 || results.len() >= limit {
                 return;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.')
-                || name == "node_modules"
-                || name == "target"
-                || name == "__pycache__"
-                || name == "dist"
-                || name == "build"
-            {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, root, pattern, results, limit, depth + 1);
-                continue;
-            }
-            // File size cap: skip anything over 2 MB to keep latency bounded.
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
             };
-            if metadata.len() > 2 * 1024 * 1024 {
-                continue;
-            }
-            let bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            // Binary detection: null byte in the first 512 bytes.
-            if bytes.iter().take(512).any(|b| *b == 0) {
-                continue;
-            }
-            let content = match std::str::from_utf8(&bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
-            for (line_idx, line) in content.lines().enumerate() {
+            // Deterministic walk (same reason as search_files): keeps the set
+            // of matches visited before hitting `limit` stable across runs.
+            let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
                 if results.len() >= limit {
                     return;
                 }
-                if let Some(m) = pattern.find(line) {
-                    // Count chars up to byte offset for 1-indexed column.
-                    let prefix = &line[..m.start()];
-                    let column = prefix.chars().count() as u32 + 1;
-                    let match_length = line[m.start()..m.end()].chars().count() as u32;
-                    let line_content = if line.len() > 500 {
-                        let mut end = 500;
-                        while !line.is_char_boundary(end) && end > 0 {
-                            end -= 1;
-                        }
-                        format!("{}…", &line[..end])
-                    } else {
-                        line.to_string()
-                    };
-                    results.push(SearchHit {
-                        file: rel.clone(),
-                        line: (line_idx as u32) + 1,
-                        column,
-                        match_length,
-                        line_content,
-                    });
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.')
+                    || name == "node_modules"
+                    || name == "target"
+                    || name == "__pycache__"
+                    || name == "dist"
+                    || name == "build"
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, pattern, results, limit, depth + 1);
+                    continue;
+                }
+                // File size cap: skip anything over 2 MB to keep latency bounded.
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if metadata.len() > 2 * 1024 * 1024 {
+                    continue;
+                }
+                let bytes = match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                // Binary detection: null byte in the first 512 bytes.
+                if bytes.iter().take(512).any(|b| *b == 0) {
+                    continue;
+                }
+                let content = match std::str::from_utf8(&bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+                for (line_idx, line) in content.lines().enumerate() {
+                    if results.len() >= limit {
+                        return;
+                    }
+                    if let Some(m) = pattern.find(line) {
+                        // Count chars up to byte offset for 1-indexed column.
+                        let prefix = &line[..m.start()];
+                        let column = prefix.chars().count() as u32 + 1;
+                        let match_length = line[m.start()..m.end()].chars().count() as u32;
+                        let line_content = if line.len() > 500 {
+                            let mut end = 500;
+                            while !line.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            format!("{}…", &line[..end])
+                        } else {
+                            line.to_string()
+                        };
+                        results.push(SearchHit {
+                            file: rel.clone(),
+                            line: (line_idx as u32) + 1,
+                            column,
+                            match_length,
+                            line_content,
+                        });
+                    }
                 }
             }
         }
-    }
 
-    walk(root_path, root_path, &pattern, &mut results, limit, 0);
-    Ok(results)
+        walk(root_path, root_path, &pattern, &mut results, limit, 0);
+        Ok(results)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1243,41 +1278,44 @@ fn open_in_default_app(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, String> {
-    let limit = max_bytes.unwrap_or(8192);
+async fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<String, String> {
+    blocking(move || {
+        let limit = max_bytes.unwrap_or(8192);
 
-    // Stream only up to `limit` bytes so a 50 MB file opened for a 512 KB
-    // preview doesn't allocate 50 MB transiently.
-    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
-    let mut data = Vec::with_capacity(limit.min(64 * 1024));
-    use std::io::Read;
-    file.take(limit as u64)
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
+        // Stream only up to `limit` bytes so a 50 MB file opened for a 512 KB
+        // preview doesn't allocate 50 MB transiently.
+        let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+        let mut data = Vec::with_capacity(limit.min(64 * 1024));
+        use std::io::Read;
+        file.take(limit as u64)
+            .read_to_end(&mut data)
+            .map_err(|e| e.to_string())?;
 
-    // UTF-16 BOM: surface a specific, actionable message instead of a
-    // generic "binary" refusal. UTF-16 ASCII-dominant text used to trip
-    // the old null-byte check as a false positive.
-    if data.len() >= 2
-        && (data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]))
-    {
-        return Err("UTF-16 file — re-save as UTF-8 to edit".into());
-    }
-
-    // Binary heuristic: real text files rarely contain ANY null bytes, but
-    // tolerate a small ratio so source files with null-in-string-literal
-    // don't get rejected. UTF-16-like content will have ~50% nulls, far
-    // above the 1% threshold. Only apply once we have enough bytes to
-    // make the ratio meaningful — a 20-byte file with one null otherwise
-    // looks like "5% null" and would be wrongly rejected.
-    if data.len() > 64 {
-        let null_count = data.iter().filter(|&&b| b == 0).count();
-        if null_count * 100 > data.len() {
-            return Err("Binary file — cannot display".into());
+        // UTF-16 BOM: surface a specific, actionable message instead of a
+        // generic "binary" refusal. UTF-16 ASCII-dominant text used to trip
+        // the old null-byte check as a false positive.
+        if data.len() >= 2
+            && (data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]))
+        {
+            return Err("UTF-16 file — re-save as UTF-8 to edit".into());
         }
-    }
 
-    Ok(String::from_utf8_lossy(&data).to_string())
+        // Binary heuristic: real text files rarely contain ANY null bytes, but
+        // tolerate a small ratio so source files with null-in-string-literal
+        // don't get rejected. UTF-16-like content will have ~50% nulls, far
+        // above the 1% threshold. Only apply once we have enough bytes to
+        // make the ratio meaningful — a 20-byte file with one null otherwise
+        // looks like "5% null" and would be wrongly rejected.
+        if data.len() > 64 {
+            let null_count = data.iter().filter(|&&b| b == 0).count();
+            if null_count * 100 > data.len() {
+                return Err("Binary file — cannot display".into());
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&data).to_string())
+    })
+    .await
 }
 
 // Write `data` to `dest` atomically: write to a sibling temp file, fsync,
@@ -1398,9 +1436,12 @@ fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
 // preserves the inode, so capturing it at open time lets us search for
 // the same file under its new name when the original path disappears.
 #[tauri::command]
-fn get_file_inode(path: String) -> Result<u64, String> {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(&path).map(|m| m.ino()).map_err(|e| e.to_string())
+async fn get_file_inode(path: String) -> Result<u64, String> {
+    blocking(move || {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&path).map(|m| m.ino()).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // Walk the project tree looking for a file whose inode matches `inode`.
@@ -1408,57 +1449,60 @@ fn get_file_inode(path: String) -> Result<u64, String> {
 // (hidden dirs, node_modules, target, etc.) so a rename outside the
 // interesting tree doesn't cost us a giant walk.
 #[tauri::command]
-fn find_path_by_inode(root: String, inode: u64) -> Result<Option<String>, String> {
-    fn walk(
-        dir: &std::path::Path,
-        inode: u64,
-        found: &mut Option<String>,
-        depth: usize,
-    ) {
-        use std::os::unix::fs::MetadataExt;
-        // Bounds match search_files. Project root is depth 0, so this
-        // stops before descending into depth 13 (i.e. walks up to 12
-        // levels below the root).
-        if found.is_some() || depth > 12 {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        sorted.sort_by_key(|e| e.file_name());
-        for entry in sorted {
-            if found.is_some() {
+async fn find_path_by_inode(root: String, inode: u64) -> Result<Option<String>, String> {
+    blocking(move || {
+        fn walk(
+            dir: &std::path::Path,
+            inode: u64,
+            found: &mut Option<String>,
+            depth: usize,
+        ) {
+            use std::os::unix::fs::MetadataExt;
+            // Bounds match search_files. Project root is depth 0, so this
+            // stops before descending into depth 13 (i.e. walks up to 12
+            // levels below the root).
+            if found.is_some() || depth > 12 {
                 return;
             }
-            // Avoid an allocation per entry — name is only used for the
-            // skip-list check, and Cow<str> compares cleanly.
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.')
-                || name_str == "node_modules"
-                || name_str == "target"
-                || name_str == "__pycache__"
-                || name_str == "dist"
-                || name_str == "build"
-            {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
             };
-            if metadata.is_dir() {
-                walk(&entry.path(), inode, found, depth + 1);
-            } else if metadata.ino() == inode {
-                *found = Some(entry.path().to_string_lossy().into_owned());
-                return;
+            let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
+                if found.is_some() {
+                    return;
+                }
+                // Avoid an allocation per entry — name is only used for the
+                // skip-list check, and Cow<str> compares cleanly.
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.')
+                    || name_str == "node_modules"
+                    || name_str == "target"
+                    || name_str == "__pycache__"
+                    || name_str == "dist"
+                    || name_str == "build"
+                {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    walk(&entry.path(), inode, found, depth + 1);
+                } else if metadata.ino() == inode {
+                    *found = Some(entry.path().to_string_lossy().into_owned());
+                    return;
+                }
             }
         }
-    }
 
-    let mut found = None;
-    walk(std::path::Path::new(&root), inode, &mut found, 0);
-    Ok(found)
+        let mut found = None;
+        walk(std::path::Path::new(&root), inode, &mut found, 0);
+        Ok(found)
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -1632,128 +1676,143 @@ struct RefDiff {
 }
 
 #[tauri::command]
-fn get_diff_between_refs(
+async fn get_diff_between_refs(
     path: String,
     from_ref: String,
     to_ref: String,
 ) -> Result<RefDiff, String> {
-    if !(is_valid_git_ref(&from_ref) || is_valid_git_oid(&from_ref)) {
-        return Err("Invalid `from` ref".into());
-    }
-    if !(is_valid_git_ref(&to_ref) || is_valid_git_oid(&to_ref)) {
-        return Err("Invalid `to` ref".into());
-    }
+    blocking(move || {
+        if !(is_valid_git_ref(&from_ref) || is_valid_git_oid(&from_ref)) {
+            return Err("Invalid `from` ref".into());
+        }
+        if !(is_valid_git_ref(&to_ref) || is_valid_git_oid(&to_ref)) {
+            return Err("Invalid `to` ref".into());
+        }
 
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let from_obj = repo.revparse_single(&from_ref).map_err(|e| format!("from `{}`: {}", from_ref, e))?;
-    let to_obj = repo.revparse_single(&to_ref).map_err(|e| format!("to `{}`: {}", to_ref, e))?;
-    let from_tree = from_obj.peel_to_tree().map_err(|e| format!("from `{}` peel: {}", from_ref, e))?;
-    let to_tree = to_obj.peel_to_tree().map_err(|e| format!("to `{}` peel: {}", to_ref, e))?;
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let from_obj = repo.revparse_single(&from_ref).map_err(|e| format!("from `{}`: {}", from_ref, e))?;
+        let to_obj = repo.revparse_single(&to_ref).map_err(|e| format!("to `{}`: {}", to_ref, e))?;
+        let from_tree = from_obj.peel_to_tree().map_err(|e| format!("from `{}` peel: {}", from_ref, e))?;
+        let to_tree = to_obj.peel_to_tree().map_err(|e| format!("to `{}` peel: {}", to_ref, e))?;
 
-    let mut diff_opts = git2::DiffOptions::new();
-    let diff = repo
-        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut diff_opts))
-        .map_err(|e| e.to_string())?;
+        let mut diff_opts = git2::DiffOptions::new();
+        let diff = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut diff_opts))
+            .map_err(|e| e.to_string())?;
 
-    let files = collect_structured_files_diff(&diff)?;
-    let mut additions = 0usize;
-    let mut deletions = 0usize;
-    for f in &files {
-        for h in &f.hunks {
-            for l in &h.lines {
-                match l.origin.as_str() {
-                    "add" => additions += 1,
-                    "remove" => deletions += 1,
-                    _ => {}
+        let files = collect_structured_files_diff(&diff)?;
+        let mut additions = 0usize;
+        let mut deletions = 0usize;
+        for f in &files {
+            for h in &f.hunks {
+                for l in &h.lines {
+                    match l.origin.as_str() {
+                        "add" => additions += 1,
+                        "remove" => deletions += 1,
+                        _ => {}
+                    }
                 }
             }
         }
-    }
-    let files_changed = files.len();
-    Ok(RefDiff {
-        from_ref,
-        to_ref,
-        files,
-        stats: RefDiffStats { files_changed, additions, deletions },
+        let files_changed = files.len();
+        Ok(RefDiff {
+            from_ref,
+            to_ref,
+            files,
+            stats: RefDiffStats { files_changed, additions, deletions },
+        })
     })
+    .await
 }
 
 #[tauri::command]
-fn get_file_diff(path: String, file_path: String, staged: Option<bool>) -> Result<FileDiff, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+async fn get_file_diff(path: String, file_path: String, staged: Option<bool>) -> Result<FileDiff, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.pathspec(&file_path);
+        let mut diff_opts = git2::DiffOptions::new();
+        diff_opts.pathspec(&file_path);
 
-    if staged.unwrap_or(false) {
-        // Staged diff: index vs HEAD
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        let diff = repo
-            .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
-            .map_err(|e| e.to_string())?;
-        collect_structured_diff(&diff)
-    } else {
-        // Unstaged diff: workdir vs index
-        let diff = repo
-            .diff_index_to_workdir(None, Some(&mut diff_opts))
-            .map_err(|e| e.to_string())?;
-        let result = collect_structured_diff(&diff)?;
-        if !result.hunks.is_empty() {
-            return Ok(result);
+        if staged.unwrap_or(false) {
+            // Staged diff: index vs HEAD
+            let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+            let diff = repo
+                .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+                .map_err(|e| e.to_string())?;
+            collect_structured_diff(&diff)
+        } else {
+            // Unstaged diff: workdir vs index
+            let diff = repo
+                .diff_index_to_workdir(None, Some(&mut diff_opts))
+                .map_err(|e| e.to_string())?;
+            let result = collect_structured_diff(&diff)?;
+            if !result.hunks.is_empty() {
+                return Ok(result);
+            }
+            // Fall back to staged if no unstaged changes (backwards compat)
+            let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+            let diff = repo
+                .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+                .map_err(|e| e.to_string())?;
+            collect_structured_diff(&diff)
         }
-        // Fall back to staged if no unstaged changes (backwards compat)
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        let diff = repo
-            .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_stage_all(path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut index = repo.index().map_err(|e| e.to_string())?;
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
             .map_err(|e| e.to_string())?;
-        collect_structured_diff(&diff)
-    }
+        index.write().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_stage_all(path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    index
-        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-        .map_err(|e| e.to_string())?;
-    index.write().map_err(|e| e.to_string())?;
-    Ok(())
+async fn git_stage_file(path: String, file_path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut index = repo.index().map_err(|e| e.to_string())?;
+        index
+            .add_path(std::path::Path::new(&file_path))
+            .map_err(|e| e.to_string())?;
+        index.write().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_stage_file(path: String, file_path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    index
-        .add_path(std::path::Path::new(&file_path))
-        .map_err(|e| e.to_string())?;
-    index.write().map_err(|e| e.to_string())?;
-    Ok(())
-}
+async fn git_commit(path: String, message: String) -> Result<String, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
-#[tauri::command]
-fn git_commit(path: String, message: String) -> Result<String, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut index = repo.index().map_err(|e| e.to_string())?;
+        let tree_oid = index.write_tree().map_err(|e| e.to_string())?;
+        let tree = repo.find_tree(tree_oid).map_err(|e| e.to_string())?;
 
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    let tree_oid = index.write_tree().map_err(|e| e.to_string())?;
-    let tree = repo.find_tree(tree_oid).map_err(|e| e.to_string())?;
+        let sig = repo.signature().map_err(|e| e.to_string())?;
 
-    let sig = repo.signature().map_err(|e| e.to_string())?;
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok());
 
-    let parent = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
 
-    let parents: Vec<&git2::Commit> = parent.iter().collect();
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, &message, &tree, &parents)
+            .map_err(|e| e.to_string())?;
 
-    let oid = repo
-        .commit(Some("HEAD"), &sig, &sig, &message, &tree, &parents)
-        .map_err(|e| e.to_string())?;
-
-    Ok(oid.to_string()[..7].to_string())
+        Ok(oid.to_string()[..7].to_string())
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -1783,62 +1842,68 @@ fn head_is_on_any_remote(repo: &Repository, head_oid: git2::Oid) -> Result<bool,
 }
 
 #[tauri::command]
-fn git_head_on_remote(path: String) -> Result<bool, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let head = match repo.head() {
-        Ok(h) => h,
-        Err(_) => return Ok(false), // unborn HEAD
-    };
-    let head_oid = head.peel_to_commit().map_err(|e| e.to_string())?.id();
-    head_is_on_any_remote(&repo, head_oid)
+async fn git_head_on_remote(path: String) -> Result<bool, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let head = match repo.head() {
+            Ok(h) => h,
+            Err(_) => return Ok(false), // unborn HEAD
+        };
+        let head_oid = head.peel_to_commit().map_err(|e| e.to_string())?.id();
+        head_is_on_any_remote(&repo, head_oid)
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_amend_commit(
+async fn git_amend_commit(
     path: String,
     message: Option<String>,
     include_staged: bool,
 ) -> Result<AmendResult, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
-    // Refuse on unborn or detached HEAD — both leave no clear branch to
-    // amend onto, and silently rewriting a detached HEAD is dangerous.
-    if matches!(repo.head_detached(), Ok(true)) {
-        return Err("HEAD is detached — switch to a branch before amending".into());
-    }
-    let head_ref = repo
-        .head()
-        .map_err(|_| "HEAD is unborn — nothing to amend".to_string())?;
-    let head_commit = head_ref.peel_to_commit().map_err(|e| e.to_string())?;
-    let head_oid = head_commit.id();
+        // Refuse on unborn or detached HEAD — both leave no clear branch to
+        // amend onto, and silently rewriting a detached HEAD is dangerous.
+        if matches!(repo.head_detached(), Ok(true)) {
+            return Err("HEAD is detached — switch to a branch before amending".into());
+        }
+        let head_ref = repo
+            .head()
+            .map_err(|_| "HEAD is unborn — nothing to amend".to_string())?;
+        let head_commit = head_ref.peel_to_commit().map_err(|e| e.to_string())?;
+        let head_oid = head_commit.id();
 
-    let requires_force_push = head_is_on_any_remote(&repo, head_oid)?;
+        let requires_force_push = head_is_on_any_remote(&repo, head_oid)?;
 
-    // Tree: from index when include_staged, else keep HEAD's tree.
-    let new_tree_oid = if include_staged {
-        let mut index = repo.index().map_err(|e| e.to_string())?;
-        index.write_tree().map_err(|e| e.to_string())?
-    } else {
-        head_commit.tree().map_err(|e| e.to_string())?.id()
-    };
-    let new_tree = repo.find_tree(new_tree_oid).map_err(|e| e.to_string())?;
+        // Tree: from index when include_staged, else keep HEAD's tree.
+        let new_tree_oid = if include_staged {
+            let mut index = repo.index().map_err(|e| e.to_string())?;
+            index.write_tree().map_err(|e| e.to_string())?
+        } else {
+            head_commit.tree().map_err(|e| e.to_string())?.id()
+        };
+        let new_tree = repo.find_tree(new_tree_oid).map_err(|e| e.to_string())?;
 
-    let sig = repo.signature().map_err(|e| e.to_string())?;
-    let new_oid = head_commit
-        .amend(
-            Some("HEAD"),
-            Some(&sig),
-            Some(&sig),
-            None,
-            message.as_deref(),
-            Some(&new_tree),
-        )
-        .map_err(|e| e.to_string())?;
+        let sig = repo.signature().map_err(|e| e.to_string())?;
+        let new_oid = head_commit
+            .amend(
+                Some("HEAD"),
+                Some(&sig),
+                Some(&sig),
+                None,
+                message.as_deref(),
+                Some(&new_tree),
+            )
+            .map_err(|e| e.to_string())?;
 
-    Ok(AmendResult {
-        oid: new_oid.to_string(),
-        requires_force_push,
+        Ok(AmendResult {
+            oid: new_oid.to_string(),
+            requires_force_push,
+        })
     })
+    .await
 }
 
 struct GitOpSlot {
@@ -2046,88 +2111,90 @@ fn git_upstream_status(path: &str) -> (bool, Option<String>) {
 }
 
 #[tauri::command]
-fn git_push(
+async fn git_push(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
     let slots = Arc::clone(&state.git_op_slots);
     let counter = Arc::clone(&state.git_op_counter);
-    let label = window.label();
+    let label = window.label().to_string();
+    blocking(move || {
+        let (has_upstream, branch) = git_upstream_status(&path);
 
-    let (has_upstream, branch) = git_upstream_status(&path);
-
-    // Reserve ONE slot that spans both the initial push and the optional
-    // auto-upstream retry. A cancel arriving in the window between the two
-    // attempts would otherwise find an empty slot and be lost — with one
-    // shared reservation, the cancelled flag persists and the retry's child
-    // is killed as soon as it's spawned.
-    let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    slots.lock().unwrap().insert(
-        label.to_string(),
-        GitOpSlot {
-            op_id,
-            pid: None,
-            cancelled: false,
-        },
-    );
-
-    let result = if has_upstream {
-        spawn_git_under_slot(&["push"], &path, &slots, label, op_id)
-    } else {
-        match branch {
-            Some(b) if !b.is_empty() => spawn_git_under_slot(
-                &["push", "--set-upstream", "origin", &b],
-                &path,
-                &slots,
-                label,
+        // Reserve ONE slot that spans both the initial push and the optional
+        // auto-upstream retry. A cancel arriving in the window between the two
+        // attempts would otherwise find an empty slot and be lost — with one
+        // shared reservation, the cancelled flag persists and the retry's child
+        // is killed as soon as it's spawned.
+        let op_id = counter.fetch_add(1, Ordering::SeqCst);
+        slots.lock().unwrap().insert(
+            label.to_string(),
+            GitOpSlot {
                 op_id,
-            ),
-            _ => Err("Could not determine current branch for upstream push".to_string()),
-        }
-    };
+                pid: None,
+                cancelled: false,
+            },
+        );
 
-    // Release the reservation.
-    {
-        let mut guard = slots.lock().unwrap();
-        if let Some(s) = guard.get(label) {
-            if s.op_id == op_id {
-                guard.remove(label);
+        let result = if has_upstream {
+            spawn_git_under_slot(&["push"], &path, &slots, &label, op_id)
+        } else {
+            match branch {
+                Some(b) if !b.is_empty() => spawn_git_under_slot(
+                    &["push", "--set-upstream", "origin", &b],
+                    &path,
+                    &slots,
+                    &label,
+                    op_id,
+                ),
+                _ => Err("Could not determine current branch for upstream push".to_string()),
+            }
+        };
+
+        // Release the reservation.
+        {
+            let mut guard = slots.lock().unwrap();
+            if let Some(s) = guard.get(&label) {
+                if s.op_id == op_id {
+                    guard.remove(&label);
+                }
             }
         }
-    }
 
-    result
+        result
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_pull(
+async fn git_pull(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
-    run_git_cancellable(
-        &["pull", "--prune"],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    )
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        run_git_cancellable(&["pull", "--prune"], &path, &slots, &counter, &label)
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_fetch(
+async fn git_fetch(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
-    run_git_cancellable(
-        &["fetch", "--all", "--prune"],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    )
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        run_git_cancellable(&["fetch", "--all", "--prune"], &path, &slots, &counter, &label)
+    })
+    .await
 }
 
 // Mark the active git slot for `label` cancelled and return the PID (if any)
@@ -2181,25 +2248,25 @@ fn is_valid_git_oid(s: &str) -> bool {
 }
 
 #[tauri::command]
-fn git_merge_branch(
+async fn git_merge_branch(
     path: String,
     branch_name: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
     if !is_valid_git_ref(&branch_name) {
         return Err("Invalid branch name".into());
     }
-    // Merge can block on network I/O if the user's git config pulls on merge
-    // or the operation touches a remote tracking ref. Route it through
-    // run_git_cancellable so cancel_git_op can kill it.
-    run_git_cancellable(
-        &["merge", &branch_name],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    )
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        // Merge can block on network I/O if the user's git config pulls on merge
+        // or the operation touches a remote tracking ref. Route it through
+        // run_git_cancellable so cancel_git_op can kill it.
+        run_git_cancellable(&["merge", &branch_name], &path, &slots, &counter, &label)
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -2210,7 +2277,7 @@ struct CherryPickResult {
 
 // List paths in working tree marked as conflicted by libgit2's status walk.
 fn list_conflict_files(path: &str) -> Vec<String> {
-    match get_git_status(path.to_string()) {
+    match get_git_status_inner(path) {
         Ok(info) => info.files.into_iter()
             .filter(|f| f.status == "conflict")
             .map(|f| f.path)
@@ -2226,69 +2293,75 @@ fn git_dir(path: &str) -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
-fn git_cherry_pick(
+async fn git_cherry_pick(
     path: String,
     oid: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<CherryPickResult, String> {
     if !is_valid_git_oid(&oid) {
         return Err("Invalid commit OID".into());
     }
-    let result = run_git_cancellable(
-        &["cherry-pick", &oid],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    );
-    match result {
-        Ok(_) => Ok(CherryPickResult { ok: true, conflicted_files: Vec::new() }),
-        Err(stderr) => {
-            // Non-zero exit could mean conflict (state file present) OR a
-            // real failure (bad oid, repo state, etc.). Distinguish via
-            // CHERRY_PICK_HEAD so the frontend can route to the conflict UI.
-            let cp_head = git_dir(&path)?.join("CHERRY_PICK_HEAD");
-            if cp_head.exists() {
-                Ok(CherryPickResult {
-                    ok: false,
-                    conflicted_files: list_conflict_files(&path),
-                })
-            } else {
-                Err(stderr)
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        let result = run_git_cancellable(
+            &["cherry-pick", &oid],
+            &path,
+            &slots,
+            &counter,
+            &label,
+        );
+        match result {
+            Ok(_) => Ok(CherryPickResult { ok: true, conflicted_files: Vec::new() }),
+            Err(stderr) => {
+                // Non-zero exit could mean conflict (state file present) OR a
+                // real failure (bad oid, repo state, etc.). Distinguish via
+                // CHERRY_PICK_HEAD so the frontend can route to the conflict UI.
+                let cp_head = git_dir(&path)?.join("CHERRY_PICK_HEAD");
+                if cp_head.exists() {
+                    Ok(CherryPickResult {
+                        ok: false,
+                        conflicted_files: list_conflict_files(&path),
+                    })
+                } else {
+                    Err(stderr)
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_cherry_pick_abort(
+async fn git_cherry_pick_abort(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
-    run_git_cancellable(
-        &["cherry-pick", "--abort"],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    )
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        run_git_cancellable(&["cherry-pick", "--abort"], &path, &slots, &counter, &label)
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_cherry_pick_continue(
+async fn git_cherry_pick_continue(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
-    run_git_cancellable(
-        &["cherry-pick", "--continue"],
-        &path,
-        &Arc::clone(&state.git_op_slots),
-        &Arc::clone(&state.git_op_counter),
-        window.label(),
-    )
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let label = window.label().to_string();
+    blocking(move || {
+        run_git_cancellable(&["cherry-pick", "--continue"], &path, &slots, &counter, &label)
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -2307,74 +2380,77 @@ struct PendingOpState {
 // Returns "none" when the working tree is clean of pending state. The
 // frontend banner is the only consumer.
 #[tauri::command]
-fn get_pending_op_state(path: String) -> Result<PendingOpState, String> {
-    let none = PendingOpState {
-        kind: "none".into(),
-        current_step: None,
-        total_steps: None,
-        head_message: None,
-    };
-    let gd = match git_dir(&path) {
-        Ok(d) => d,
-        Err(_) => return Ok(none),
-    };
-
-    let head_message = (|| -> Option<String> {
-        let repo = Repository::discover(&path).ok()?;
-        let head = repo.head().ok()?;
-        let commit = head.peel_to_commit().ok()?;
-        commit.summary().map(|s| s.to_string())
-    })();
-
-    if gd.join("MERGE_HEAD").exists() {
-        return Ok(PendingOpState {
-            kind: "merge".into(),
+async fn get_pending_op_state(path: String) -> Result<PendingOpState, String> {
+    blocking(move || {
+        let none = PendingOpState {
+            kind: "none".into(),
             current_step: None,
             total_steps: None,
-            head_message,
-        });
-    }
-
-    if gd.join("CHERRY_PICK_HEAD").exists() {
-        return Ok(PendingOpState {
-            kind: "cherry_pick".into(),
-            current_step: None,
-            total_steps: None,
-            head_message,
-        });
-    }
-
-    let rebase_dir = if gd.join("rebase-merge").is_dir() {
-        Some(gd.join("rebase-merge"))
-    } else if gd.join("rebase-apply").is_dir() {
-        Some(gd.join("rebase-apply"))
-    } else {
-        None
-    };
-
-    if let Some(rd) = rebase_dir {
-        // rebase-merge/msgnum + end give "interactive rebase" progress.
-        // rebase-apply/next + last give "git am"-style rebase progress.
-        // Either layout, we read the two text files and parse u32.
-        let read_num = |name: &str| -> Option<u32> {
-            std::fs::read_to_string(rd.join(name))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
+            head_message: None,
         };
-        let (current_step, total_steps) = if rd.file_name() == Some(std::ffi::OsStr::new("rebase-merge")) {
-            (read_num("msgnum"), read_num("end"))
+        let gd = match git_dir(&path) {
+            Ok(d) => d,
+            Err(_) => return Ok(none),
+        };
+
+        let head_message = (|| -> Option<String> {
+            let repo = Repository::discover(&path).ok()?;
+            let head = repo.head().ok()?;
+            let commit = head.peel_to_commit().ok()?;
+            commit.summary().map(|s| s.to_string())
+        })();
+
+        if gd.join("MERGE_HEAD").exists() {
+            return Ok(PendingOpState {
+                kind: "merge".into(),
+                current_step: None,
+                total_steps: None,
+                head_message,
+            });
+        }
+
+        if gd.join("CHERRY_PICK_HEAD").exists() {
+            return Ok(PendingOpState {
+                kind: "cherry_pick".into(),
+                current_step: None,
+                total_steps: None,
+                head_message,
+            });
+        }
+
+        let rebase_dir = if gd.join("rebase-merge").is_dir() {
+            Some(gd.join("rebase-merge"))
+        } else if gd.join("rebase-apply").is_dir() {
+            Some(gd.join("rebase-apply"))
         } else {
-            (read_num("next"), read_num("last"))
+            None
         };
-        return Ok(PendingOpState {
-            kind: "rebase".into(),
-            current_step,
-            total_steps,
-            head_message,
-        });
-    }
 
-    Ok(none)
+        if let Some(rd) = rebase_dir {
+            // rebase-merge/msgnum + end give "interactive rebase" progress.
+            // rebase-apply/next + last give "git am"-style rebase progress.
+            // Either layout, we read the two text files and parse u32.
+            let read_num = |name: &str| -> Option<u32> {
+                std::fs::read_to_string(rd.join(name))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            };
+            let (current_step, total_steps) = if rd.file_name() == Some(std::ffi::OsStr::new("rebase-merge")) {
+                (read_num("msgnum"), read_num("end"))
+            } else {
+                (read_num("next"), read_num("last"))
+            };
+            return Ok(PendingOpState {
+                kind: "rebase".into(),
+                current_step,
+                total_steps,
+                head_message,
+            });
+        }
+
+        Ok(none)
+    })
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2424,82 +2500,85 @@ struct RebaseResult {
 const VALID_REBASE_ACTIONS: &[&str] = &["pick", "reword", "squash", "fixup", "drop", "edit"];
 
 #[tauri::command]
-fn get_rebase_candidate_commits(
+async fn get_rebase_candidate_commits(
     path: String,
     count: usize,
 ) -> Result<RebaseCandidates, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
 
-    if matches!(repo.head_detached(), Ok(true)) {
-        // Use a recognizable typed prefix so the frontend can show a useful
-        // error toast without parsing free-form text.
-        return Err("detached_head".into());
-    }
-
-    let head = repo.head().map_err(|e| format!("HEAD: {}", e))?;
-    let head_oid = head
-        .target()
-        .ok_or_else(|| "HEAD has no target".to_string())?;
-
-    // Determine the upstream cutoff: walk forward from `head` until we hit
-    // a commit reachable from the upstream's tip. That commit (and earlier)
-    // are "shared", so we don't include them in the rebase candidate list.
-    let upstream_oid = (|| -> Option<git2::Oid> {
-        let head_branch_name = head.shorthand()?;
-        let local = repo.find_branch(head_branch_name, BranchType::Local).ok()?;
-        let upstream = local.upstream().ok()?;
-        upstream.get().target()
-    })();
-
-    let upstream_known = upstream_oid.is_some();
-
-    // Build an "on any remote ref" set so we can flag commits as on_remote.
-    // For typical repos this is a small set; we materialize it once.
-    let mut remote_tips: Vec<git2::Oid> = Vec::new();
-    if let Ok(refs) = repo.references_glob("refs/remotes/*") {
-        for r in refs.flatten() {
-            if let Some(t) = r.target() {
-                remote_tips.push(t);
-            }
+        if matches!(repo.head_detached(), Ok(true)) {
+            // Use a recognizable typed prefix so the frontend can show a useful
+            // error toast without parsing free-form text.
+            return Err("detached_head".into());
         }
-    }
 
-    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
-    walk.push(head_oid).map_err(|e| e.to_string())?;
+        let head = repo.head().map_err(|e| format!("HEAD: {}", e))?;
+        let head_oid = head
+            .target()
+            .ok_or_else(|| "HEAD has no target".to_string())?;
 
-    let mut commits: Vec<RebaseCandidateCommit> = Vec::new();
-    for oid_res in walk.take(count) {
-        let oid = match oid_res {
-            Ok(o) => o,
-            Err(_) => break,
-        };
-        // Stop walking once we hit the upstream-shared frontier — anything
-        // beyond is published history we shouldn't be rewriting silently.
-        if let Some(up) = upstream_oid {
-            if oid == up {
-                break;
-            }
-            if matches!(repo.graph_descendant_of(up, oid), Ok(true)) {
-                break;
+        // Determine the upstream cutoff: walk forward from `head` until we hit
+        // a commit reachable from the upstream's tip. That commit (and earlier)
+        // are "shared", so we don't include them in the rebase candidate list.
+        let upstream_oid = (|| -> Option<git2::Oid> {
+            let head_branch_name = head.shorthand()?;
+            let local = repo.find_branch(head_branch_name, BranchType::Local).ok()?;
+            let upstream = local.upstream().ok()?;
+            upstream.get().target()
+        })();
+
+        let upstream_known = upstream_oid.is_some();
+
+        // Build an "on any remote ref" set so we can flag commits as on_remote.
+        // For typical repos this is a small set; we materialize it once.
+        let mut remote_tips: Vec<git2::Oid> = Vec::new();
+        if let Ok(refs) = repo.references_glob("refs/remotes/*") {
+            for r in refs.flatten() {
+                if let Some(t) = r.target() {
+                    remote_tips.push(t);
+                }
             }
         }
 
-        let on_remote = remote_tips.iter().any(|tip| {
-            *tip == oid || matches!(repo.graph_descendant_of(*tip, oid), Ok(true))
-        });
+        let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+        walk.push(head_oid).map_err(|e| e.to_string())?;
 
-        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
-        commits.push(RebaseCandidateCommit {
-            oid: oid.to_string(),
-            short_oid: oid.to_string()[..7].to_string(),
-            message: commit.summary().unwrap_or("(no message)").to_string(),
-            author: commit.author().name().unwrap_or("Unknown").to_string(),
-            timestamp: commit.time().seconds(),
-            on_remote,
-        });
-    }
+        let mut commits: Vec<RebaseCandidateCommit> = Vec::new();
+        for oid_res in walk.take(count) {
+            let oid = match oid_res {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            // Stop walking once we hit the upstream-shared frontier — anything
+            // beyond is published history we shouldn't be rewriting silently.
+            if let Some(up) = upstream_oid {
+                if oid == up {
+                    break;
+                }
+                if matches!(repo.graph_descendant_of(up, oid), Ok(true)) {
+                    break;
+                }
+            }
 
-    Ok(RebaseCandidates { commits, upstream_known })
+            let on_remote = remote_tips.iter().any(|tip| {
+                *tip == oid || matches!(repo.graph_descendant_of(*tip, oid), Ok(true))
+            });
+
+            let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+            commits.push(RebaseCandidateCommit {
+                oid: oid.to_string(),
+                short_oid: oid.to_string()[..7].to_string(),
+                message: commit.summary().unwrap_or("(no message)").to_string(),
+                author: commit.author().name().unwrap_or("Unknown").to_string(),
+                timestamp: commit.time().seconds(),
+                on_remote,
+            });
+        }
+
+        Ok(RebaseCandidates { commits, upstream_known })
+    })
+    .await
 }
 
 // Lightweight tag at HEAD before the rebase mutates anything. Tag name is
@@ -2654,11 +2733,11 @@ fn rebase_in_progress(repo_path: &str) -> bool {
 }
 
 #[tauri::command]
-fn git_rebase_interactive_apply(
+async fn git_rebase_interactive_apply(
     path: String,
     base_oid: String,
     todo: Vec<RebaseTodoEntry>,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<RebaseResult, String> {
     // Accept either a literal OID or a rev expression (HEAD^, abc1234~2, a
@@ -2678,96 +2757,104 @@ fn git_rebase_interactive_apply(
         }
     }
 
-    // Resolve the (possibly rev-expression) base to a concrete OID up front
-    // — both for cleaner argv to `git rebase -i` and so the frontend gets
-    // a real OID back in `stopped_at` if anything goes wrong.
-    let resolved_base = {
-        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-        // Compute the OID inside the same scope as `repo` so the borrow
-        // graph (obj → repo) stays valid; only the resulting String escapes.
-        let oid = repo
-            .revparse_single(&base_oid)
-            .map_err(|e| format!("Resolve `{}`: {}", base_oid, e))?
-            .peel_to_commit()
-            .map_err(|e| format!("`{}` does not resolve to a commit: {}", base_oid, e))?
-            .id();
-        oid.to_string()
-    };
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let rebase_state = Arc::clone(&state.rebase_state);
+    let label = window.label().to_string();
 
-    // Hold the rebase_state lock across the in-progress check + tag/dir
-    // creation + register, so two near-simultaneous IPC calls can't both
-    // pass the in-progress check and clobber each other's state. Also
-    // refuses if our own AppState already has a rebase registered (i.e.
-    // an earlier attempt is paused mid-conflict).
-    let (backup_tag, state_dir) = {
-        let mut guard = state.rebase_state.lock().unwrap();
-        if guard.is_some() || rebase_in_progress(&path) {
-            return Err("A rebase is already in progress — abort or continue it before starting a new one".into());
-        }
-
-        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-        let backup_tag = create_rebase_backup_tag(&repo)?;
-        drop(repo);
-
-        let state_dir = match create_rebase_state_dir(&todo) {
-            Ok(d) => d,
-            Err(e) => {
-                // Tag was created but we never spawned — drop it so we
-                // don't leave noise behind.
-                delete_rebase_backup_tag(&path, &backup_tag);
-                return Err(e);
-            }
+    blocking(move || {
+        // Resolve the (possibly rev-expression) base to a concrete OID up front
+        // — both for cleaner argv to `git rebase -i` and so the frontend gets
+        // a real OID back in `stopped_at` if anything goes wrong.
+        let resolved_base = {
+            let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+            // Compute the OID inside the same scope as `repo` so the borrow
+            // graph (obj → repo) stays valid; only the resulting String escapes.
+            let oid = repo
+                .revparse_single(&base_oid)
+                .map_err(|e| format!("Resolve `{}`: {}", base_oid, e))?
+                .peel_to_commit()
+                .map_err(|e| format!("`{}` does not resolve to a commit: {}", base_oid, e))?
+                .id();
+            oid.to_string()
         };
-        *guard = Some(RebaseStateInfo {
-            state_dir: state_dir.clone(),
-            backup_tag: backup_tag.clone(),
-        });
-        (backup_tag, state_dir)
-    };
 
-    let result = spawn_rebase(&path, &resolved_base, &state_dir, &state, window.label());
+        // Hold the rebase_state lock across the in-progress check + tag/dir
+        // creation + register, so two near-simultaneous IPC calls can't both
+        // pass the in-progress check and clobber each other's state. Also
+        // refuses if our own AppState already has a rebase registered (i.e.
+        // an earlier attempt is paused mid-conflict).
+        let (backup_tag, state_dir) = {
+            let mut guard = rebase_state.lock().unwrap();
+            if guard.is_some() || rebase_in_progress(&path) {
+                return Err("A rebase is already in progress — abort or continue it before starting a new one".into());
+            }
 
-    // Inspect git's repo state to decide whether this was a terminal result
-    // (rebase finished) or a pause (state files still on disk). Three cases
-    // matter: (1) rebase still paused → conflict-or-edit pause; (2) finished
-    // with Ok → clean completion; (3) finished with Err → terminal failure.
-    let rebase_paused = rebase_in_progress(&path);
+            let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+            let backup_tag = create_rebase_backup_tag(&repo)?;
+            drop(repo);
 
-    if rebase_paused {
-        // Conflict (or `edit`) pause — leave state dir + tag intact for
-        // continue/abort to consume. Surface the actual stopped commit so
-        // the frontend can highlight it.
-        return Ok(RebaseResult {
-            ok: false,
-            stopped_at: read_rebase_stopped_sha(&path),
-            conflicted_files: list_conflict_files(&path),
-            completed: false,
-            backup_tag,
-        });
-    }
+            let state_dir = match create_rebase_state_dir(&todo) {
+                Ok(d) => d,
+                Err(e) => {
+                    // Tag was created but we never spawned — drop it so we
+                    // don't leave noise behind.
+                    delete_rebase_backup_tag(&path, &backup_tag);
+                    return Err(e);
+                }
+            };
+            *guard = Some(RebaseStateInfo {
+                state_dir: state_dir.clone(),
+                backup_tag: backup_tag.clone(),
+            });
+            (backup_tag, state_dir)
+        };
 
-    match result {
-        Ok(_) => {
-            // Clean completion — drop the state dir, KEEP the backup tag
-            // (user-visible safety net surfaced in the success toast).
-            cleanup_rebase_state_dir(&state_dir);
-            *state.rebase_state.lock().unwrap() = None;
-            Ok(RebaseResult {
-                ok: true,
-                stopped_at: None,
-                conflicted_files: Vec::new(),
-                completed: true,
+        let result = spawn_rebase(&path, &resolved_base, &state_dir, &slots, &counter, &label);
+
+        // Inspect git's repo state to decide whether this was a terminal result
+        // (rebase finished) or a pause (state files still on disk). Three cases
+        // matter: (1) rebase still paused → conflict-or-edit pause; (2) finished
+        // with Ok → clean completion; (3) finished with Err → terminal failure.
+        let rebase_paused = rebase_in_progress(&path);
+
+        if rebase_paused {
+            // Conflict (or `edit`) pause — leave state dir + tag intact for
+            // continue/abort to consume. Surface the actual stopped commit so
+            // the frontend can highlight it.
+            return Ok(RebaseResult {
+                ok: false,
+                stopped_at: read_rebase_stopped_sha(&path),
+                conflicted_files: list_conflict_files(&path),
+                completed: false,
                 backup_tag,
-            })
+            });
         }
-        Err(err) => {
-            // Terminal failure — clean up everything we created.
-            cleanup_rebase_state_dir(&state_dir);
-            delete_rebase_backup_tag(&path, &backup_tag);
-            *state.rebase_state.lock().unwrap() = None;
-            Err(err)
+
+        match result {
+            Ok(_) => {
+                // Clean completion — drop the state dir, KEEP the backup tag
+                // (user-visible safety net surfaced in the success toast).
+                cleanup_rebase_state_dir(&state_dir);
+                *rebase_state.lock().unwrap() = None;
+                Ok(RebaseResult {
+                    ok: true,
+                    stopped_at: None,
+                    conflicted_files: Vec::new(),
+                    completed: true,
+                    backup_tag,
+                })
+            }
+            Err(err) => {
+                // Terminal failure — clean up everything we created.
+                cleanup_rebase_state_dir(&state_dir);
+                delete_rebase_backup_tag(&path, &backup_tag);
+                *rebase_state.lock().unwrap() = None;
+                Err(err)
+            }
         }
-    }
+    })
+    .await
 }
 
 // During a rebase pause, .git/rebase-merge/stopped-sha contains the OID of
@@ -2794,14 +2881,15 @@ fn spawn_rebase(
     path: &str,
     base_oid: &str,
     state_dir: &std::path::Path,
-    state: &State<AppState>,
+    slots: &Arc<Mutex<GitOpSlots>>,
+    counter: &Arc<AtomicU64>,
     label: &str,
 ) -> Result<String, String> {
     // We can't reuse run_git_cancellable directly — it doesn't take env
     // overrides. Instead replicate its slot reservation pattern around a
     // bespoke spawn that sets the editor envs.
-    let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
-    state.git_op_slots.lock().unwrap().insert(
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    slots.lock().unwrap().insert(
         label.to_string(),
         GitOpSlot {
             op_id,
@@ -2835,7 +2923,7 @@ fn spawn_rebase(
         let pid = child.id();
 
         let kill_now = {
-            let mut guard = state.git_op_slots.lock().unwrap();
+            let mut guard = slots.lock().unwrap();
             match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
@@ -2851,7 +2939,7 @@ fn spawn_rebase(
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
         {
-            let mut guard = state.git_op_slots.lock().unwrap();
+            let mut guard = slots.lock().unwrap();
             if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
@@ -2867,7 +2955,7 @@ fn spawn_rebase(
     })();
 
     {
-        let mut guard = state.git_op_slots.lock().unwrap();
+        let mut guard = slots.lock().unwrap();
         if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
                 guard.remove(label);
@@ -2881,8 +2969,8 @@ fn spawn_rebase(
 // Common cleanup logic for terminal results from continue/skip/abort.
 // `delete_tag` controls whether the backup tag is also removed (true on
 // abort; false on clean continue/skip — the tag is the user's safety net).
-fn finalize_rebase(state: &State<AppState>, repo_path: &str, delete_tag: bool) {
-    let info = state.rebase_state.lock().unwrap().take();
+fn finalize_rebase(rebase_state: &Arc<Mutex<Option<RebaseStateInfo>>>, repo_path: &str, delete_tag: bool) {
+    let info = rebase_state.lock().unwrap().take();
     if let Some(info) = info {
         cleanup_rebase_state_dir(&info.state_dir);
         if delete_tag {
@@ -2894,15 +2982,17 @@ fn finalize_rebase(state: &State<AppState>, repo_path: &str, delete_tag: bool) {
 fn run_git_with_rebase_env(
     args: &[&str],
     path: &str,
-    state: &State<AppState>,
+    slots: &Arc<Mutex<GitOpSlots>>,
+    counter: &Arc<AtomicU64>,
+    rebase_state: &Arc<Mutex<Option<RebaseStateInfo>>>,
     label: &str,
 ) -> Result<String, String> {
     // Rebase --continue/--skip may invoke commit_editor.sh again (for the
     // next reword/squash entry), so we have to keep the env vars set.
     // Replicate run_git_cancellable's slot pattern with the env overrides.
-    let info = state.rebase_state.lock().unwrap().clone();
-    let op_id = state.git_op_counter.fetch_add(1, Ordering::SeqCst);
-    state.git_op_slots.lock().unwrap().insert(
+    let info = rebase_state.lock().unwrap().clone();
+    let op_id = counter.fetch_add(1, Ordering::SeqCst);
+    slots.lock().unwrap().insert(
         label.to_string(),
         GitOpSlot {
             op_id,
@@ -2931,7 +3021,7 @@ fn run_git_with_rebase_env(
         let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         let kill_now = {
-            let mut guard = state.git_op_slots.lock().unwrap();
+            let mut guard = slots.lock().unwrap();
             match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
@@ -2946,7 +3036,7 @@ fn run_git_with_rebase_env(
 
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
         {
-            let mut guard = state.git_op_slots.lock().unwrap();
+            let mut guard = slots.lock().unwrap();
             if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
@@ -2962,7 +3052,7 @@ fn run_git_with_rebase_env(
     })();
 
     {
-        let mut guard = state.git_op_slots.lock().unwrap();
+        let mut guard = slots.lock().unwrap();
         if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
                 guard.remove(label);
@@ -2974,107 +3064,126 @@ fn run_git_with_rebase_env(
 }
 
 #[tauri::command]
-fn git_rebase_continue(
+async fn git_rebase_continue(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<RebaseResult, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &state, window.label());
-    let still_paused = rebase_in_progress(&path);
-    let backup_tag = state
-        .rebase_state
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|i| i.backup_tag.clone())
-        .unwrap_or_default();
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let rebase_state = Arc::clone(&state.rebase_state);
+    let label = window.label().to_string();
+    blocking(move || {
+        let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &slots, &counter, &rebase_state, &label);
+        let still_paused = rebase_in_progress(&path);
+        let backup_tag = rebase_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|i| i.backup_tag.clone())
+            .unwrap_or_default();
 
-    if still_paused {
-        // Another conflict — keep state dir + tag.
-        return Ok(RebaseResult {
-            ok: false,
-            stopped_at: read_rebase_stopped_sha(&path),
-            conflicted_files: list_conflict_files(&path),
-            completed: false,
+        if still_paused {
+            // Another conflict — keep state dir + tag.
+            return Ok(RebaseResult {
+                ok: false,
+                stopped_at: read_rebase_stopped_sha(&path),
+                conflicted_files: list_conflict_files(&path),
+                completed: false,
+                backup_tag,
+            });
+        }
+
+        // Terminal: rebase finished. Clean up state dir; keep tag on success.
+        let ok = result.is_ok();
+        finalize_rebase(&rebase_state, &path, /*delete_tag=*/ false);
+        if !ok {
+            let err = result.err().unwrap_or_else(|| "Rebase continue failed".into());
+            return Err(err);
+        }
+        Ok(RebaseResult {
+            ok: true,
+            stopped_at: None,
+            conflicted_files: Vec::new(),
+            completed: true,
             backup_tag,
-        });
-    }
-
-    // Terminal: rebase finished. Clean up state dir; keep tag on success.
-    let ok = result.is_ok();
-    finalize_rebase(&state, &path, /*delete_tag=*/ false);
-    if !ok {
-        let err = result.err().unwrap_or_else(|| "Rebase continue failed".into());
-        return Err(err);
-    }
-    Ok(RebaseResult {
-        ok: true,
-        stopped_at: None,
-        conflicted_files: Vec::new(),
-        completed: true,
-        backup_tag,
+        })
     })
+    .await
 }
 
 #[tauri::command]
-fn git_rebase_skip(
+async fn git_rebase_skip(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<RebaseResult, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--skip"], &path, &state, window.label());
-    let still_paused = rebase_in_progress(&path);
-    let backup_tag = state
-        .rebase_state
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|i| i.backup_tag.clone())
-        .unwrap_or_default();
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let rebase_state = Arc::clone(&state.rebase_state);
+    let label = window.label().to_string();
+    blocking(move || {
+        let result = run_git_with_rebase_env(&["rebase", "--skip"], &path, &slots, &counter, &rebase_state, &label);
+        let still_paused = rebase_in_progress(&path);
+        let backup_tag = rebase_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|i| i.backup_tag.clone())
+            .unwrap_or_default();
 
-    if still_paused {
-        return Ok(RebaseResult {
-            ok: false,
-            stopped_at: read_rebase_stopped_sha(&path),
-            conflicted_files: list_conflict_files(&path),
-            completed: false,
+        if still_paused {
+            return Ok(RebaseResult {
+                ok: false,
+                stopped_at: read_rebase_stopped_sha(&path),
+                conflicted_files: list_conflict_files(&path),
+                completed: false,
+                backup_tag,
+            });
+        }
+        let ok = result.is_ok();
+        finalize_rebase(&rebase_state, &path, /*delete_tag=*/ false);
+        if !ok {
+            return Err(result.err().unwrap_or_else(|| "Rebase skip failed".into()));
+        }
+        Ok(RebaseResult {
+            ok: true,
+            stopped_at: None,
+            conflicted_files: Vec::new(),
+            completed: true,
             backup_tag,
-        });
-    }
-    let ok = result.is_ok();
-    finalize_rebase(&state, &path, /*delete_tag=*/ false);
-    if !ok {
-        return Err(result.err().unwrap_or_else(|| "Rebase skip failed".into()));
-    }
-    Ok(RebaseResult {
-        ok: true,
-        stopped_at: None,
-        conflicted_files: Vec::new(),
-        completed: true,
-        backup_tag,
+        })
     })
+    .await
 }
 
 #[tauri::command]
-fn git_rebase_abort(
+async fn git_rebase_abort(
     path: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     window: tauri::Window,
 ) -> Result<String, String> {
-    let result = run_git_with_rebase_env(&["rebase", "--abort"], &path, &state, window.label());
-    // Abort always cleans up — drop the tag too. Even on abort failure we
-    // still try to drop the state dir (it's our temp resource), but leave
-    // the tag in place so the user can recover manually if abort failed.
-    if result.is_ok() {
-        finalize_rebase(&state, &path, /*delete_tag=*/ true);
-    } else {
-        // Best-effort: clean the state dir without removing the tag.
-        let info = state.rebase_state.lock().unwrap().take();
-        if let Some(info) = info {
-            cleanup_rebase_state_dir(&info.state_dir);
+    let slots = Arc::clone(&state.git_op_slots);
+    let counter = Arc::clone(&state.git_op_counter);
+    let rebase_state = Arc::clone(&state.rebase_state);
+    let label = window.label().to_string();
+    blocking(move || {
+        let result = run_git_with_rebase_env(&["rebase", "--abort"], &path, &slots, &counter, &rebase_state, &label);
+        // Abort always cleans up — drop the tag too. Even on abort failure we
+        // still try to drop the state dir (it's our temp resource), but leave
+        // the tag in place so the user can recover manually if abort failed.
+        if result.is_ok() {
+            finalize_rebase(&rebase_state, &path, /*delete_tag=*/ true);
+        } else {
+            // Best-effort: clean the state dir without removing the tag.
+            let info = rebase_state.lock().unwrap().take();
+            if let Some(info) = info {
+                cleanup_rebase_state_dir(&info.state_dir);
+            }
         }
-    }
-    result
+        result
+    })
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3098,186 +3207,210 @@ struct ConflictVersions {
 // 2 = ours, 3 = theirs. A file may be missing any of 1/2/3 depending on
 // which side added/deleted it.
 #[tauri::command]
-fn get_conflict_versions(path: String, file_path: String) -> Result<ConflictVersions, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let index = repo.index().map_err(|e| e.to_string())?;
+async fn get_conflict_versions(path: String, file_path: String) -> Result<ConflictVersions, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let index = repo.index().map_err(|e| e.to_string())?;
 
-    let path_bytes = file_path.as_bytes();
-    let mut base = None;
-    let mut ours = None;
-    let mut theirs = None;
+        let path_bytes = file_path.as_bytes();
+        let mut base = None;
+        let mut ours = None;
+        let mut theirs = None;
 
-    for entry in index.iter() {
-        if entry.path != path_bytes {
-            continue;
+        for entry in index.iter() {
+            if entry.path != path_bytes {
+                continue;
+            }
+            // libgit2 packs stage in bits 12-13 of `flags`: GIT_IDXENTRY_STAGEMASK
+            // = 0x3000, shift = 12. Stage 0 = normal, 1 = base, 2 = ours, 3 = theirs.
+            let stage = ((entry.flags & 0x3000) >> 12) as i32;
+            let blob = match repo.find_blob(entry.id) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            // Blob content may not be UTF-8 (binary files, mixed encodings);
+            // for the merge UI we surface the lossy conversion so the user
+            // gets *something* instead of an opaque error. The 3-pane editor
+            // is text-only by design.
+            let content = String::from_utf8_lossy(blob.content()).into_owned();
+            match stage {
+                1 => base = Some(content),
+                2 => ours = Some(content),
+                3 => theirs = Some(content),
+                _ => {}
+            }
         }
-        // libgit2 packs stage in bits 12-13 of `flags`: GIT_IDXENTRY_STAGEMASK
-        // = 0x3000, shift = 12. Stage 0 = normal, 1 = base, 2 = ours, 3 = theirs.
-        let stage = ((entry.flags & 0x3000) >> 12) as i32;
-        let blob = match repo.find_blob(entry.id) {
-            Ok(b) => b,
-            Err(_) => continue,
+
+        let abs_path = std::path::Path::new(&path).join(&file_path);
+        let merged = std::fs::read_to_string(&abs_path).ok();
+
+        Ok(ConflictVersions { base, ours, theirs, merged })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
+    blocking(move || {
+        let mut checkout = std::process::Command::new("git");
+        checkout
+            .args(["checkout", "--ours", "--", &file_path])
+            .current_dir(&path);
+        apply_git_env(&mut checkout);
+        let status = checkout.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("Failed to checkout --ours".into());
+        }
+        let mut add = std::process::Command::new("git");
+        add.args(["add", "--", &file_path]).current_dir(&path);
+        apply_git_env(&mut add);
+        let status = add.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("Failed to stage resolved file".into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
+    blocking(move || {
+        let mut checkout = std::process::Command::new("git");
+        checkout
+            .args(["checkout", "--theirs", "--", &file_path])
+            .current_dir(&path);
+        apply_git_env(&mut checkout);
+        let status = checkout.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("Failed to checkout --theirs".into());
+        }
+        let mut add = std::process::Command::new("git");
+        add.args(["add", "--", &file_path]).current_dir(&path);
+        apply_git_env(&mut add);
+        let status = add.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("Failed to stage resolved file".into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_unstage_file(path: String, file_path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        match repo.head() {
+            Ok(head) => {
+                let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+                let obj = head_commit.as_object();
+                repo.reset_default(Some(obj), [file_path.as_str()])
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(_) => {
+                // Unborn HEAD (no commits yet) — remove from index directly
+                let mut index = repo.index().map_err(|e| e.to_string())?;
+                index.remove_path(std::path::Path::new(&file_path)).map_err(|e| e.to_string())?;
+                index.write().map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_unstage_all(path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        match repo.head() {
+            Ok(head) => {
+                let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+                let obj = head_commit.as_object();
+                repo.reset_default(Some(obj), ["*"])
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(_) => {
+                // Unborn HEAD (no commits yet) — clear the entire index
+                let mut index = repo.index().map_err(|e| e.to_string())?;
+                index.clear().map_err(|e| e.to_string())?;
+                index.write().map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let workdir = repo.workdir().ok_or("Repository has no workdir")?;
+        let abs = workdir.join(&file_path);
+
+        // Two cases route to "delete from disk":
+        //   1) status_file says wt_new (untracked file at the top level).
+        //   2) status_file errors with GIT_ENOTFOUND because the path lives
+        //      inside an untracked directory — git reports the directory,
+        //      not its contents, so status_file can't see the child. Fall
+        //      back to a presence check on disk, gated on the NotFound
+        //      error code so we don't misclassify other libgit2 errors.
+        let status_result = repo.status_file(std::path::Path::new(&file_path));
+        let treat_as_untracked = match &status_result {
+            Ok(s) => s.is_wt_new(),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => abs.exists(),
+            Err(_) => false,
         };
-        // Blob content may not be UTF-8 (binary files, mixed encodings);
-        // for the merge UI we surface the lossy conversion so the user
-        // gets *something* instead of an opaque error. The 3-pane editor
-        // is text-only by design.
-        let content = String::from_utf8_lossy(blob.content()).into_owned();
-        match stage {
-            1 => base = Some(content),
-            2 => ours = Some(content),
-            3 => theirs = Some(content),
-            _ => {}
+
+        if treat_as_untracked {
+            let meta = fs::metadata(&abs).map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
+            } else {
+                fs::remove_file(&abs).map_err(|e| e.to_string())?;
+            }
+            return Ok(());
         }
-    }
 
-    let abs_path = std::path::Path::new(&path).join(&file_path);
-    let merged = std::fs::read_to_string(&abs_path).ok();
+        // Surface any non-NotFound status_file error rather than silently
+        // falling through to checkout_head, which would just fail again.
+        status_result.map_err(|e| e.to_string())?;
 
-    Ok(ConflictVersions { base, ours, theirs, merged })
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.path(&file_path).force();
+        repo.checkout_head(Some(&mut checkout))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_resolve_ours(path: String, file_path: String) -> Result<(), String> {
-    let mut checkout = std::process::Command::new("git");
-    checkout
-        .args(["checkout", "--ours", "--", &file_path])
-        .current_dir(&path);
-    apply_git_env(&mut checkout);
-    let status = checkout.status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to checkout --ours".into());
-    }
-    let mut add = std::process::Command::new("git");
-    add.args(["add", "--", &file_path]).current_dir(&path);
-    apply_git_env(&mut add);
-    let status = add.status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to stage resolved file".into());
-    }
-    Ok(())
+async fn git_stash_save(path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let sig = repo.signature().map_err(|e| e.to_string())?;
+        // stash_save requires &mut Repository
+        let mut repo = repo;
+        repo.stash_save(&sig, "Launchpad stash", None)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_resolve_theirs(path: String, file_path: String) -> Result<(), String> {
-    let mut checkout = std::process::Command::new("git");
-    checkout
-        .args(["checkout", "--theirs", "--", &file_path])
-        .current_dir(&path);
-    apply_git_env(&mut checkout);
-    let status = checkout.status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to checkout --theirs".into());
-    }
-    let mut add = std::process::Command::new("git");
-    add.args(["add", "--", &file_path]).current_dir(&path);
-    apply_git_env(&mut add);
-    let status = add.status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to stage resolved file".into());
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn git_unstage_file(path: String, file_path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    match repo.head() {
-        Ok(head) => {
-            let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
-            let obj = head_commit.as_object();
-            repo.reset_default(Some(obj), [file_path.as_str()])
-                .map_err(|e| e.to_string())?;
-        }
-        Err(_) => {
-            // Unborn HEAD (no commits yet) — remove from index directly
-            let mut index = repo.index().map_err(|e| e.to_string())?;
-            index.remove_path(std::path::Path::new(&file_path)).map_err(|e| e.to_string())?;
-            index.write().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn git_unstage_all(path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    match repo.head() {
-        Ok(head) => {
-            let head_commit = head.peel_to_commit().map_err(|e| e.to_string())?;
-            let obj = head_commit.as_object();
-            repo.reset_default(Some(obj), ["*"])
-                .map_err(|e| e.to_string())?;
-        }
-        Err(_) => {
-            // Unborn HEAD (no commits yet) — clear the entire index
-            let mut index = repo.index().map_err(|e| e.to_string())?;
-            index.clear().map_err(|e| e.to_string())?;
-            index.write().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn git_discard_file(path: String, file_path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let workdir = repo.workdir().ok_or("Repository has no workdir")?;
-    let abs = workdir.join(&file_path);
-
-    // Two cases route to "delete from disk":
-    //   1) status_file says wt_new (untracked file at the top level).
-    //   2) status_file errors with GIT_ENOTFOUND because the path lives
-    //      inside an untracked directory — git reports the directory,
-    //      not its contents, so status_file can't see the child. Fall
-    //      back to a presence check on disk, gated on the NotFound
-    //      error code so we don't misclassify other libgit2 errors.
-    let status_result = repo.status_file(std::path::Path::new(&file_path));
-    let treat_as_untracked = match &status_result {
-        Ok(s) => s.is_wt_new(),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => abs.exists(),
-        Err(_) => false,
-    };
-
-    if treat_as_untracked {
-        let meta = fs::metadata(&abs).map_err(|e| e.to_string())?;
-        if meta.is_dir() {
-            fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
-        } else {
-            fs::remove_file(&abs).map_err(|e| e.to_string())?;
-        }
-        return Ok(());
-    }
-
-    // Surface any non-NotFound status_file error rather than silently
-    // falling through to checkout_head, which would just fail again.
-    status_result.map_err(|e| e.to_string())?;
-
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.path(&file_path).force();
-    repo.checkout_head(Some(&mut checkout))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-fn git_stash_save(path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let sig = repo.signature().map_err(|e| e.to_string())?;
-    // stash_save requires &mut Repository
-    let mut repo = repo;
-    repo.stash_save(&sig, "Launchpad stash", None)
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-fn git_stash_pop(path: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut repo = repo;
-    repo.stash_pop(0, None)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+async fn git_stash_pop(path: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut repo = repo;
+        repo.stash_pop(0, None)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -3287,158 +3420,179 @@ struct StashEntry {
 }
 
 #[tauri::command]
-fn git_stash_list(path: String) -> Result<Vec<StashEntry>, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut repo = repo;
-    let mut entries = Vec::new();
-    repo.stash_foreach(|index, message, _oid| {
-        entries.push(StashEntry {
-            index,
-            message: message.to_string(),
-        });
-        true
-    }).map_err(|e| e.to_string())?;
-    Ok(entries)
+async fn git_stash_list(path: String) -> Result<Vec<StashEntry>, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut repo = repo;
+        let mut entries = Vec::new();
+        repo.stash_foreach(|index, message, _oid| {
+            entries.push(StashEntry {
+                index,
+                message: message.to_string(),
+            });
+            true
+        }).map_err(|e| e.to_string())?;
+        Ok(entries)
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_stash_apply(path: String, index: usize) -> Result<(), String> {
-    let mut repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    repo.stash_apply(index, None)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+async fn git_stash_apply(path: String, index: usize) -> Result<(), String> {
+    blocking(move || {
+        let mut repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        repo.stash_apply(index, None)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_stash_drop(path: String, index: usize) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut repo = repo;
-    repo.stash_drop(index)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+async fn git_stash_drop(path: String, index: usize) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut repo = repo;
+        repo.stash_drop(index)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn git_delete_branch(path: String, branch_name: String) -> Result<(), String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let mut branch = repo
-        .find_branch(&branch_name, BranchType::Local)
-        .map_err(|e| e.to_string())?;
-    branch.delete().map_err(|e| e.to_string())?;
-    Ok(())
+async fn git_delete_branch(path: String, branch_name: String) -> Result<(), String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let mut branch = repo
+            .find_branch(&branch_name, BranchType::Local)
+            .map_err(|e| e.to_string())?;
+        branch.delete().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_remote_branches(path: String) -> Result<Vec<BranchInfo>, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let branches = repo
-        .branches(Some(BranchType::Remote))
-        .map_err(|e| e.to_string())?;
+async fn list_remote_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let branches = repo
+            .branches(Some(BranchType::Remote))
+            .map_err(|e| e.to_string())?;
 
-    let result: Vec<BranchInfo> = branches
-        .filter_map(|b| {
-            let (branch, _) = b.ok()?;
-            let full_name = branch.name().ok()??.to_string();
-            // Skip HEAD pointer
-            if full_name.ends_with("/HEAD") {
-                return None;
-            }
-            // Strip "origin/" prefix for display
-            let name = full_name
-                .strip_prefix("origin/")
-                .unwrap_or(&full_name)
-                .to_string();
+        let result: Vec<BranchInfo> = branches
+            .filter_map(|b| {
+                let (branch, _) = b.ok()?;
+                let full_name = branch.name().ok()??.to_string();
+                // Skip HEAD pointer
+                if full_name.ends_with("/HEAD") {
+                    return None;
+                }
+                // Strip "origin/" prefix for display
+                let name = full_name
+                    .strip_prefix("origin/")
+                    .unwrap_or(&full_name)
+                    .to_string();
 
-            let commit = branch.get().peel_to_commit().ok();
-            let last_commit_msg = commit
-                .as_ref()
-                .and_then(|c| c.summary().map(String::from));
-            let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
+                let commit = branch.get().peel_to_commit().ok();
+                let last_commit_msg = commit
+                    .as_ref()
+                    .and_then(|c| c.summary().map(String::from));
+                let last_commit_time = commit.as_ref().map(|c| c.time().seconds());
 
-            Some(BranchInfo {
-                name,
-                is_current: false,
-                last_commit_msg,
-                last_commit_time,
-                upstream: None,
+                Some(BranchInfo {
+                    name,
+                    is_current: false,
+                    last_commit_msg,
+                    last_commit_time,
+                    upstream: None,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    Ok(result)
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_commit_details(path: String, oid: String) -> Result<CommitDetail, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let obj = repo.revparse_single(&oid).map_err(|e| e.to_string())?;
-    let commit = obj.peel_to_commit().map_err(|e| e.to_string())?;
+async fn get_commit_details(path: String, oid: String) -> Result<CommitDetail, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let obj = repo.revparse_single(&oid).map_err(|e| e.to_string())?;
+        let commit = obj.peel_to_commit().map_err(|e| e.to_string())?;
 
-    let tree = commit.tree().map_err(|e| e.to_string())?;
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let tree = commit.tree().map_err(|e| e.to_string())?;
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
-    let diff = repo
-        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
-        .map_err(|e| e.to_string())?;
+        let diff = repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+            .map_err(|e| e.to_string())?;
 
-    // First pass: build file list from deltas
-    let mut files: Vec<CommitFileStat> = Vec::new();
-    for idx in 0..diff.deltas().len() {
-        let delta = diff.get_delta(idx).unwrap();
-        let file_path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let status = match delta.status() {
-            git2::Delta::Added => "added",
-            git2::Delta::Deleted => "deleted",
-            git2::Delta::Modified => "modified",
-            git2::Delta::Renamed => "renamed",
-            git2::Delta::Copied => "copied",
-            _ => "modified",
-        };
-        files.push(CommitFileStat {
-            path: file_path,
-            additions: 0,
-            deletions: 0,
-            status: status.to_string(),
-        });
-    }
+        // First pass: build file list from deltas
+        let mut files: Vec<CommitFileStat> = Vec::new();
+        for idx in 0..diff.deltas().len() {
+            let delta = diff.get_delta(idx).unwrap();
+            let file_path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let status = match delta.status() {
+                git2::Delta::Added => "added",
+                git2::Delta::Deleted => "deleted",
+                git2::Delta::Modified => "modified",
+                git2::Delta::Renamed => "renamed",
+                git2::Delta::Copied => "copied",
+                _ => "modified",
+            };
+            files.push(CommitFileStat {
+                path: file_path,
+                additions: 0,
+                deletions: 0,
+                status: status.to_string(),
+            });
+        }
 
-    // Second pass: count additions/deletions per file via Patch
-    let num_deltas = diff.deltas().len();
-    for i in 0..num_deltas {
-        if let Ok(patch) = git2::Patch::from_diff(&diff, i) {
-            if let Some(patch) = patch {
-                let (_, additions, deletions) = patch.line_stats().unwrap_or((0, 0, 0));
-                files[i].additions = additions;
-                files[i].deletions = deletions;
+        // Second pass: count additions/deletions per file via Patch
+        let num_deltas = diff.deltas().len();
+        for i in 0..num_deltas {
+            if let Ok(patch) = git2::Patch::from_diff(&diff, i) {
+                if let Some(patch) = patch {
+                    let (_, additions, deletions) = patch.line_stats().unwrap_or((0, 0, 0));
+                    files[i].additions = additions;
+                    files[i].deletions = deletions;
+                }
             }
         }
-    }
 
-    let message = commit.summary().unwrap_or("(no message)").to_string();
-    let author = commit.author().name().unwrap_or("Unknown").to_string();
-    let timestamp = commit.time().seconds();
-    let short_oid = commit.id().to_string()[..7].to_string();
+        let message = commit.summary().unwrap_or("(no message)").to_string();
+        let author = commit.author().name().unwrap_or("Unknown").to_string();
+        let timestamp = commit.time().seconds();
+        let short_oid = commit.id().to_string()[..7].to_string();
 
-    Ok(CommitDetail {
-        oid: short_oid,
-        message,
-        author,
-        timestamp,
-        files,
+        Ok(CommitDetail {
+            oid: short_oid,
+            message,
+            author,
+            timestamp,
+            files,
+        })
     })
+    .await
 }
 
 #[tauri::command]
-fn get_remote_url(path: String) -> Result<String, String> {
-    let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
-    let remote = repo.find_remote("origin").map_err(|e| e.to_string())?;
-    let url = remote.url().ok_or("No URL for origin")?.to_string();
-    Ok(url)
+async fn get_remote_url(path: String) -> Result<String, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let remote = repo.find_remote("origin").map_err(|e| e.to_string())?;
+        let url = remote.url().ok_or("No URL for origin")?.to_string();
+        Ok(url)
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -3906,7 +4060,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         fs::write(&path, "hello world").unwrap();
-        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        let result = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None));
         assert_eq!(result.unwrap(), "hello world");
     }
 
@@ -3915,13 +4069,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         fs::write(&path, "hello world").unwrap();
-        let result = read_file_preview(path.to_string_lossy().to_string(), Some(5));
+        let result = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), Some(5)));
         assert_eq!(result.unwrap(), "hello");
     }
 
     #[test]
     fn test_read_file_preview_missing_file() {
-        let result = read_file_preview("/nonexistent/path/file.txt".into(), None);
+        let result = tauri::async_runtime::block_on(read_file_preview("/nonexistent/path/file.txt".into(), None));
         assert!(result.is_err());
     }
 
@@ -4046,11 +4200,11 @@ mod tests {
     #[test]
     fn test_diff_between_refs_multi_file() {
         let (dir, c1, c2) = setup_two_commit_repo();
-        let result = get_diff_between_refs(
+        let result = tauri::async_runtime::block_on(get_diff_between_refs(
             dir.path().to_string_lossy().to_string(),
             c1,
             c2,
-        ).unwrap();
+        )).unwrap();
 
         assert_eq!(result.stats.files_changed, 2, "should detect 2 changed files");
         // foo.txt: 1 added line; hello.txt: 1 added (TWO), 1 removed (two), 1 added (four)
@@ -4076,11 +4230,11 @@ mod tests {
     fn test_diff_between_refs_short_oid() {
         // Short OIDs (7 chars) should resolve via revparse_single
         let (dir, c1, c2) = setup_two_commit_repo();
-        let result = get_diff_between_refs(
+        let result = tauri::async_runtime::block_on(get_diff_between_refs(
             dir.path().to_string_lossy().to_string(),
             c1[..7].to_string(),
             c2[..7].to_string(),
-        ).unwrap();
+        )).unwrap();
         assert_eq!(result.stats.files_changed, 2);
     }
 
@@ -4090,26 +4244,26 @@ mod tests {
         let path = dir.path().to_string_lossy().to_string();
 
         // Shell-injection attempt
-        let err = get_diff_between_refs(path.clone(), "HEAD; rm -rf /".into(), c2.clone()).err().unwrap();
+        let err = tauri::async_runtime::block_on(get_diff_between_refs(path.clone(), "HEAD; rm -rf /".into(), c2.clone())).err().unwrap();
         assert!(err.contains("Invalid"), "expected validation error, got: {}", err);
 
         // Leading dash (option injection)
-        let err = get_diff_between_refs(path.clone(), "--upload-pack=evil".into(), c2.clone()).err().unwrap();
+        let err = tauri::async_runtime::block_on(get_diff_between_refs(path.clone(), "--upload-pack=evil".into(), c2.clone())).err().unwrap();
         assert!(err.contains("Invalid"), "expected validation error, got: {}", err);
 
         // Non-existent ref (passes validation, fails revparse)
-        assert!(get_diff_between_refs(path.clone(), "nonexistent-ref".into(), c2).is_err());
+        assert!(tauri::async_runtime::block_on(get_diff_between_refs(path.clone(), "nonexistent-ref".into(), c2)).is_err());
     }
 
     #[test]
     fn test_diff_between_refs_same_ref_is_empty() {
         // Diff of a ref with itself should produce no files / no changes.
         let (dir, _c1, c2) = setup_two_commit_repo();
-        let result = get_diff_between_refs(
+        let result = tauri::async_runtime::block_on(get_diff_between_refs(
             dir.path().to_string_lossy().to_string(),
             c2.clone(),
             c2,
-        ).unwrap();
+        )).unwrap();
         assert_eq!(result.stats.files_changed, 0);
         assert_eq!(result.stats.additions, 0);
         assert_eq!(result.stats.deletions, 0);
@@ -4124,7 +4278,7 @@ mod tests {
     fn test_amend_message_only() {
         let dir = setup_git_repo();
         let path = dir.path().to_string_lossy().to_string();
-        let result = git_amend_commit(path.clone(), Some("amended message".into()), false).unwrap();
+        let result = tauri::async_runtime::block_on(git_amend_commit(path.clone(), Some("amended message".into()), false)).unwrap();
 
         let repo = Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -4146,7 +4300,7 @@ mod tests {
         idx.add_path(std::path::Path::new("extra.txt")).unwrap();
         idx.write().unwrap();
 
-        git_amend_commit(path, None, true).unwrap();
+        tauri::async_runtime::block_on(git_amend_commit(path, None, true)).unwrap();
 
         // The amended commit's tree should now include extra.txt
         let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -4160,7 +4314,7 @@ mod tests {
     fn test_amend_rejects_unborn_head() {
         let dir = setup_empty_git_repo();
         let path = dir.path().to_string_lossy().to_string();
-        let err = git_amend_commit(path, Some("x".into()), false).err().unwrap();
+        let err = tauri::async_runtime::block_on(git_amend_commit(path, Some("x".into()), false)).err().unwrap();
         assert!(err.contains("unborn"), "expected unborn error, got: {}", err);
     }
 
@@ -4181,7 +4335,7 @@ mod tests {
             "test fixture",
         ).unwrap();
 
-        let result = git_amend_commit(path, Some("amended".into()), false).unwrap();
+        let result = tauri::async_runtime::block_on(git_amend_commit(path, Some("amended".into()), false)).unwrap();
         assert!(result.requires_force_push, "should require force-push when HEAD is on a remote ref");
     }
 
@@ -4221,7 +4375,7 @@ mod tests {
     fn test_pending_op_none_for_clean_repo() {
         let dir = setup_git_repo();
         let path = dir.path().to_string_lossy().to_string();
-        let s = get_pending_op_state(path).unwrap();
+        let s = tauri::async_runtime::block_on(get_pending_op_state(path)).unwrap();
         assert_eq!(s.kind, "none");
     }
 
@@ -4235,7 +4389,7 @@ mod tests {
         let head_oid = repo.head().unwrap().target().unwrap();
         fs::write(gd.join("MERGE_HEAD"), format!("{}\n", head_oid)).unwrap();
 
-        let s = get_pending_op_state(path).unwrap();
+        let s = tauri::async_runtime::block_on(get_pending_op_state(path)).unwrap();
         assert_eq!(s.kind, "merge");
         assert!(s.head_message.is_some());
     }
@@ -4249,7 +4403,7 @@ mod tests {
         let head_oid = repo.head().unwrap().target().unwrap();
         fs::write(gd.join("CHERRY_PICK_HEAD"), format!("{}\n", head_oid)).unwrap();
 
-        let s = get_pending_op_state(path).unwrap();
+        let s = tauri::async_runtime::block_on(get_pending_op_state(path)).unwrap();
         assert_eq!(s.kind, "cherry_pick");
     }
 
@@ -4263,7 +4417,7 @@ mod tests {
         fs::write(rd.join("msgnum"), "2\n").unwrap();
         fs::write(rd.join("end"), "5\n").unwrap();
 
-        let s = get_pending_op_state(path).unwrap();
+        let s = tauri::async_runtime::block_on(get_pending_op_state(path)).unwrap();
         assert_eq!(s.kind, "rebase");
         assert_eq!(s.current_step, Some(2));
         assert_eq!(s.total_steps, Some(5));
@@ -4279,7 +4433,7 @@ mod tests {
         fs::write(rd.join("next"), "1\n").unwrap();
         fs::write(rd.join("last"), "3\n").unwrap();
 
-        let s = get_pending_op_state(path).unwrap();
+        let s = tauri::async_runtime::block_on(get_pending_op_state(path)).unwrap();
         assert_eq!(s.kind, "rebase");
         assert_eq!(s.current_step, Some(1));
         assert_eq!(s.total_steps, Some(3));
@@ -4322,7 +4476,7 @@ mod tests {
     fn test_rebase_candidates_no_upstream_caps_at_count() {
         let (dir, oids) = setup_three_commit_repo();
         let path = dir.path().to_string_lossy().to_string();
-        let candidates = get_rebase_candidate_commits(path, 10).unwrap();
+        let candidates = tauri::async_runtime::block_on(get_rebase_candidate_commits(path, 10)).unwrap();
         assert!(!candidates.upstream_known, "no upstream configured");
         assert_eq!(candidates.commits.len(), 3);
         // Newest first
@@ -4342,7 +4496,7 @@ mod tests {
         repo.set_head_detached(mid_oid).unwrap();
         drop(repo);
 
-        let err = get_rebase_candidate_commits(path, 10).err().unwrap();
+        let err = tauri::async_runtime::block_on(get_rebase_candidate_commits(path, 10)).err().unwrap();
         assert_eq!(err, "detached_head");
     }
 
@@ -4358,7 +4512,7 @@ mod tests {
             .unwrap();
         drop(repo);
 
-        let candidates = get_rebase_candidate_commits(path, 10).unwrap();
+        let candidates = tauri::async_runtime::block_on(get_rebase_candidate_commits(path, 10)).unwrap();
         // All three commits are reachable from origin/main → all on_remote.
         assert!(candidates.commits.iter().all(|c| c.on_remote));
     }
@@ -4478,7 +4632,7 @@ mod tests {
         index.write().unwrap();
 
         // Unstage it
-        let result = git_unstage_file(path, "new.txt".into());
+        let result = tauri::async_runtime::block_on(git_unstage_file(path, "new.txt".into()));
         assert!(result.is_ok());
 
         // Verify it's no longer staged
@@ -4504,7 +4658,7 @@ mod tests {
         index.write().unwrap();
 
         // Should not panic or error — this is the bug we fixed
-        let result = git_unstage_file(path, "first.txt".into());
+        let result = tauri::async_runtime::block_on(git_unstage_file(path, "first.txt".into()));
         assert!(result.is_ok());
     }
 
@@ -4523,7 +4677,7 @@ mod tests {
         index.write().unwrap();
 
         // Should not panic or error
-        let result = git_unstage_all(path);
+        let result = tauri::async_runtime::block_on(git_unstage_all(path));
         assert!(result.is_ok());
 
         // Verify index is empty
@@ -4713,7 +4867,7 @@ mod tests {
         let mut data = vec![0xFF, 0xFE];
         data.extend_from_slice(b"h\0e\0l\0l\0o\0");
         fs::write(&path, &data).unwrap();
-        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        let err = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None)).unwrap_err();
         assert!(err.contains("UTF-16"), "expected UTF-16 message, got: {}", err);
     }
 
@@ -4724,7 +4878,7 @@ mod tests {
         let mut data = vec![0xFE, 0xFF];
         data.extend_from_slice(b"\0h\0e\0l\0l\0o");
         fs::write(&path, &data).unwrap();
-        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        let err = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None)).unwrap_err();
         assert!(err.contains("UTF-16"));
     }
 
@@ -4738,7 +4892,7 @@ mod tests {
             data.push(if i % 3 == 0 { 0u8 } else { b'A' });
         }
         fs::write(&path, &data).unwrap();
-        let err = read_file_preview(path.to_string_lossy().to_string(), None).unwrap_err();
+        let err = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None)).unwrap_err();
         assert!(err.contains("Binary"), "expected Binary message, got: {}", err);
     }
 
@@ -4753,7 +4907,7 @@ mod tests {
         data.extend_from_slice(b"more text");
         assert!(data.len() <= 64);
         fs::write(&path, &data).unwrap();
-        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        let result = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None));
         assert!(result.is_ok(), "short file with single null should be readable");
     }
 
@@ -4763,7 +4917,7 @@ mod tests {
         let path = dir.path().join("long.txt");
         let body: String = "the quick brown fox jumps over the lazy dog\n".repeat(20);
         fs::write(&path, body.as_bytes()).unwrap();
-        let result = read_file_preview(path.to_string_lossy().to_string(), None).unwrap();
+        let result = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None)).unwrap();
         // Default cap is 8192 bytes — body is well under that, so full content returns.
         assert_eq!(result, body);
     }
@@ -4776,7 +4930,7 @@ mod tests {
         let mut data = vec![b'A'; 200];
         data[100] = 0;
         fs::write(&path, &data).unwrap();
-        let result = read_file_preview(path.to_string_lossy().to_string(), None);
+        let result = tauri::async_runtime::block_on(read_file_preview(path.to_string_lossy().to_string(), None));
         assert!(result.is_ok(), "0.5% nulls should be tolerated");
     }
 
@@ -5062,7 +5216,7 @@ mod tests {
         fs::create_dir(dir.path().join("Zoo")).unwrap();
         fs::create_dir(dir.path().join("alpha-dir")).unwrap();
 
-        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let entries = tauri::async_runtime::block_on(read_directory(dir.path().to_string_lossy().to_string())).unwrap();
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         // Dirs first (case-insensitive alpha), then files (case-insensitive alpha).
         assert_eq!(names, vec!["alpha-dir", "Zoo", "Apple.txt", "zeta.txt"]);
@@ -5074,7 +5228,7 @@ mod tests {
         fs::write(dir.path().join(".hidden"), b"").unwrap();
         fs::write(dir.path().join("visible.txt"), b"").unwrap();
 
-        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let entries = tauri::async_runtime::block_on(read_directory(dir.path().to_string_lossy().to_string())).unwrap();
         let hidden: Vec<&str> = entries.iter().filter(|e| e.is_hidden).map(|e| e.name.as_str()).collect();
         assert_eq!(hidden, vec![".hidden"]);
     }
@@ -5084,7 +5238,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("with-bytes.txt"), b"abcdefg").unwrap();
 
-        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let entries = tauri::async_runtime::block_on(read_directory(dir.path().to_string_lossy().to_string())).unwrap();
         let entry = entries.iter().find(|e| e.name == "with-bytes.txt").unwrap();
         assert_eq!(entry.size, 7);
         assert!(!entry.is_dir);
@@ -5094,7 +5248,7 @@ mod tests {
 
     #[test]
     fn test_read_directory_errors_on_missing_dir() {
-        let result = read_directory("/no/such/directory/anywhere".into());
+        let result = tauri::async_runtime::block_on(read_directory("/no/such/directory/anywhere".into()));
         assert!(result.is_err());
     }
 
@@ -5104,7 +5258,7 @@ mod tests {
         // Filtering hidden files is a frontend choice.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".env"), b"").unwrap();
-        let entries = read_directory(dir.path().to_string_lossy().to_string()).unwrap();
+        let entries = tauri::async_runtime::block_on(read_directory(dir.path().to_string_lossy().to_string())).unwrap();
         assert!(entries.iter().any(|e| e.name == ".env"));
     }
 
@@ -5117,9 +5271,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.txt");
         fs::write(&path, b"x").unwrap();
-        let inode = get_file_inode(path.to_string_lossy().to_string()).unwrap();
+        let inode = tauri::async_runtime::block_on(get_file_inode(path.to_string_lossy().to_string())).unwrap();
 
-        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        let found = tauri::async_runtime::block_on(find_path_by_inode(dir.path().to_string_lossy().to_string(), inode)).unwrap();
         assert_eq!(found, Some(path.to_string_lossy().to_string()));
     }
 
@@ -5130,13 +5284,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("before.txt");
         fs::write(&original, b"x").unwrap();
-        let inode = get_file_inode(original.to_string_lossy().to_string()).unwrap();
+        let inode = tauri::async_runtime::block_on(get_file_inode(original.to_string_lossy().to_string())).unwrap();
 
         let renamed = dir.path().join("nested").join("after.txt");
         fs::create_dir_all(renamed.parent().unwrap()).unwrap();
         fs::rename(&original, &renamed).unwrap();
 
-        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        let found = tauri::async_runtime::block_on(find_path_by_inode(dir.path().to_string_lossy().to_string(), inode)).unwrap();
         assert_eq!(found, Some(renamed.to_string_lossy().to_string()),
             "inode walker should find the file at its new path");
     }
@@ -5146,7 +5300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"x").unwrap();
         // Inode 1 effectively never matches a real file in a tempdir.
-        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), 1).unwrap();
+        let found = tauri::async_runtime::block_on(find_path_by_inode(dir.path().to_string_lossy().to_string(), 1)).unwrap();
         assert_eq!(found, None);
     }
 
@@ -5159,9 +5313,9 @@ mod tests {
         fs::create_dir_all(&nm).unwrap();
         let buried = nm.join("buried.js");
         fs::write(&buried, b"x").unwrap();
-        let inode = get_file_inode(buried.to_string_lossy().to_string()).unwrap();
+        let inode = tauri::async_runtime::block_on(get_file_inode(buried.to_string_lossy().to_string())).unwrap();
 
-        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        let found = tauri::async_runtime::block_on(find_path_by_inode(dir.path().to_string_lossy().to_string(), inode)).unwrap();
         assert_eq!(found, None,
             "node_modules must be skipped to keep the walk bounded");
     }
@@ -5173,9 +5327,9 @@ mod tests {
         fs::create_dir(&hidden).unwrap();
         let buried = hidden.join("data");
         fs::write(&buried, b"x").unwrap();
-        let inode = get_file_inode(buried.to_string_lossy().to_string()).unwrap();
+        let inode = tauri::async_runtime::block_on(get_file_inode(buried.to_string_lossy().to_string())).unwrap();
 
-        let found = find_path_by_inode(dir.path().to_string_lossy().to_string(), inode).unwrap();
+        let found = tauri::async_runtime::block_on(find_path_by_inode(dir.path().to_string_lossy().to_string(), inode)).unwrap();
         assert_eq!(found, None);
     }
 
@@ -5190,7 +5344,7 @@ mod tests {
         fs::write(dir.path().join("settings.rs"), b"").unwrap();
         fs::write(dir.path().join("other.txt"), b"").unwrap();
 
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "set".into(), None).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "set".into(), None)).unwrap();
         assert_eq!(hits, vec!["settings.rs"]);
     }
 
@@ -5198,7 +5352,7 @@ mod tests {
     fn test_search_files_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("ReadMe.md"), b"").unwrap();
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "README".into(), None).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "README".into(), None)).unwrap();
         assert_eq!(hits, vec!["ReadMe.md"]);
     }
 
@@ -5214,7 +5368,7 @@ mod tests {
         // One match in the project root proper.
         fs::write(dir.path().join("hit.txt"), b"").unwrap();
 
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "hit".into(), None).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "hit".into(), None)).unwrap();
         assert_eq!(hits, vec!["hit.txt"], "only the root-level file should match");
     }
 
@@ -5224,7 +5378,7 @@ mod tests {
         for i in 0..10 {
             fs::write(dir.path().join(format!("file-{}.txt", i)), b"").unwrap();
         }
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "file".into(), Some(3)).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "file".into(), Some(3))).unwrap();
         assert_eq!(hits.len(), 3);
     }
 
@@ -5238,7 +5392,7 @@ mod tests {
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
         fs::write(&nested, b"").unwrap();
 
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "config".into(), None).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "config".into(), None)).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0], "config.rs", "shorter path should rank first");
     }
@@ -5252,7 +5406,7 @@ mod tests {
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
         fs::write(&nested, b"").unwrap();
 
-        let hits = search_files(dir.path().to_string_lossy().to_string(), "main".into(), None).unwrap();
+        let hits = tauri::async_runtime::block_on(search_files(dir.path().to_string_lossy().to_string(), "main".into(), None)).unwrap();
         assert_eq!(hits, vec!["src/main.rs"]);
     }
 
@@ -5263,7 +5417,7 @@ mod tests {
     #[test]
     fn test_git_status_non_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
         assert!(!info.is_repo);
         assert_eq!(info.branch, None);
         assert!(info.files.is_empty());
@@ -5275,7 +5429,7 @@ mod tests {
     #[test]
     fn test_git_status_clean_repo_after_initial_commit() {
         let dir = setup_git_repo();
-        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
         assert!(info.is_repo);
         assert!(info.branch.is_some(), "branch should resolve after a commit");
         assert!(info.files.is_empty(), "clean tree should have no status entries");
@@ -5285,7 +5439,7 @@ mod tests {
     fn test_git_status_reports_untracked_as_new() {
         let dir = setup_git_repo();
         fs::write(dir.path().join("untracked.txt"), b"x").unwrap();
-        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
         let entry = info.files.iter().find(|f| f.path == "untracked.txt")
             .expect("untracked file should appear in status");
         assert_eq!(entry.status, "new");
@@ -5300,7 +5454,7 @@ mod tests {
         idx.add_path(std::path::Path::new("added.txt")).unwrap();
         idx.write().unwrap();
 
-        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
         let entry = info.files.iter().find(|f| f.path == "added.txt").unwrap();
         assert_eq!(entry.status, "index_new",
             "staged-but-not-committed file should be index_new");
@@ -5323,7 +5477,7 @@ mod tests {
         // Then modify again on disk so the worktree differs from the index
         fs::write(&target, b"and again").unwrap();
 
-        let info = get_git_status(dir.path().to_string_lossy().to_string()).unwrap();
+        let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
         let kinds: Vec<&str> = info.files.iter()
             .filter(|f| f.path == "hello.txt")
             .map(|f| f.status.as_str())
@@ -5345,10 +5499,10 @@ mod tests {
         fs::write(&target, b"x").unwrap();
         assert!(target.exists());
 
-        git_discard_file(
+        tauri::async_runtime::block_on(git_discard_file(
             dir.path().to_string_lossy().to_string(),
             "untracked.txt".into(),
-        ).unwrap();
+        )).unwrap();
         assert!(!target.exists(), "untracked file should be deleted from disk");
     }
 
@@ -5365,10 +5519,10 @@ mod tests {
         let target = untracked_dir.join("notes.txt");
         fs::write(&target, b"x").unwrap();
 
-        git_discard_file(
+        tauri::async_runtime::block_on(git_discard_file(
             dir.path().to_string_lossy().to_string(),
             "scratch/notes.txt".into(),
-        ).unwrap();
+        )).unwrap();
         assert!(!target.exists(), "file inside untracked dir should be deleted");
     }
 
@@ -5380,10 +5534,10 @@ mod tests {
         let target = dir.path().join("hello.txt");
         fs::write(&target, b"corrupted").unwrap();
 
-        git_discard_file(
+        tauri::async_runtime::block_on(git_discard_file(
             dir.path().to_string_lossy().to_string(),
             "hello.txt".into(),
-        ).unwrap();
+        )).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"hello world",
             "discard should restore HEAD content");
     }
@@ -5394,10 +5548,10 @@ mod tests {
         // returns NotFound, abs.exists() is false → treat_as_untracked
         // is false, status_result error propagates.
         let dir = setup_git_repo();
-        let result = git_discard_file(
+        let result = tauri::async_runtime::block_on(git_discard_file(
             dir.path().to_string_lossy().to_string(),
             "never-existed.txt".into(),
-        );
+        ));
         assert!(result.is_err());
     }
 
@@ -5451,12 +5605,12 @@ mod tests {
         fs::write(dir.path().join("hello.txt"), b"changed").unwrap();
 
         // Pre-stage: should be 'modified' (worktree)
-        let pre = get_git_status(path_str.clone()).unwrap();
+        let pre = get_git_status_inner(&path_str).unwrap();
         assert!(pre.files.iter().any(|f| f.path == "hello.txt" && f.status == "modified"));
 
-        git_stage_file(path_str.clone(), "hello.txt".into()).unwrap();
+        tauri::async_runtime::block_on(git_stage_file(path_str.clone(), "hello.txt".into())).unwrap();
 
-        let post = get_git_status(path_str).unwrap();
+        let post = get_git_status_inner(&path_str).unwrap();
         let kinds: Vec<&str> = post.files.iter()
             .filter(|f| f.path == "hello.txt")
             .map(|f| f.status.as_str())
@@ -5473,9 +5627,9 @@ mod tests {
         let path_str = dir.path().to_string_lossy().to_string();
         fs::write(dir.path().join("fresh.txt"), b"x").unwrap();
 
-        git_stage_file(path_str.clone(), "fresh.txt".into()).unwrap();
+        tauri::async_runtime::block_on(git_stage_file(path_str.clone(), "fresh.txt".into())).unwrap();
 
-        let info = get_git_status(path_str).unwrap();
+        let info = get_git_status_inner(&path_str).unwrap();
         let entry = info.files.iter().find(|f| f.path == "fresh.txt").unwrap();
         assert_eq!(entry.status, "index_new",
             "newly-tracked file should be index_new after staging");
@@ -5489,9 +5643,9 @@ mod tests {
         fs::write(dir.path().join("b.txt"), b"b").unwrap();
         fs::write(dir.path().join("hello.txt"), b"changed").unwrap();
 
-        git_stage_all(path_str.clone()).unwrap();
+        tauri::async_runtime::block_on(git_stage_all(path_str.clone())).unwrap();
 
-        let info = get_git_status(path_str).unwrap();
+        let info = get_git_status_inner(&path_str).unwrap();
         // Every entry now should be a staged status.
         for f in &info.files {
             assert!(
@@ -5521,7 +5675,7 @@ mod tests {
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature/x", &head_commit, false).unwrap();
 
-        let branches = list_branches(dir.path().to_string_lossy().to_string()).unwrap();
+        let branches = tauri::async_runtime::block_on(list_branches(dir.path().to_string_lossy().to_string())).unwrap();
         assert_eq!(branches.len(), 2);
         let current_count = branches.iter().filter(|b| b.is_current).count();
         assert_eq!(current_count, 1, "exactly one branch should be marked current");
@@ -5532,7 +5686,7 @@ mod tests {
     #[test]
     fn test_list_branches_no_upstream_when_remote_missing() {
         let dir = setup_git_repo();
-        let branches = list_branches(dir.path().to_string_lossy().to_string()).unwrap();
+        let branches = tauri::async_runtime::block_on(list_branches(dir.path().to_string_lossy().to_string())).unwrap();
         assert!(branches.iter().all(|b| b.upstream.is_none()),
             "no remote configured → no branch should report an upstream");
     }
@@ -5540,7 +5694,7 @@ mod tests {
     #[test]
     fn test_get_commits_returns_history() {
         let dir = setup_git_repo();
-        let commits = get_commits(dir.path().to_string_lossy().to_string(), None).unwrap();
+        let commits = tauri::async_runtime::block_on(get_commits(dir.path().to_string_lossy().to_string(), None)).unwrap();
         assert_eq!(commits.len(), 1, "single initial commit from setup_git_repo");
         let c = &commits[0];
         assert_eq!(c.message, "initial commit");
@@ -5566,14 +5720,14 @@ mod tests {
             repo.commit(Some("HEAD"), &sig, &sig, &format!("commit {}", i), &tree, &[&parent]).unwrap();
         }
 
-        let limited = get_commits(dir.path().to_string_lossy().to_string(), Some(2)).unwrap();
+        let limited = tauri::async_runtime::block_on(get_commits(dir.path().to_string_lossy().to_string(), Some(2))).unwrap();
         assert_eq!(limited.len(), 2);
     }
 
     #[test]
     fn test_get_commits_unborn_head_returns_empty() {
         let dir = setup_empty_git_repo();
-        let result = get_commits(dir.path().to_string_lossy().to_string(), None);
+        let result = tauri::async_runtime::block_on(get_commits(dir.path().to_string_lossy().to_string(), None));
         assert!(result.is_ok(), "unborn HEAD should return Ok, not Err");
         assert!(result.unwrap().is_empty(), "unborn HEAD should return empty vec");
     }
@@ -5669,10 +5823,10 @@ mod tests {
     #[test]
     fn test_get_conflict_versions_returns_all_three_stages() {
         let dir = setup_conflicted_repo();
-        let result = get_conflict_versions(
+        let result = tauri::async_runtime::block_on(get_conflict_versions(
             dir.path().to_string_lossy().to_string(),
             "file.txt".into(),
-        )
+        ))
         .expect("get_conflict_versions should succeed on conflicted file");
 
         assert_eq!(result.base.as_deref(), Some("base\n"));
@@ -5688,10 +5842,10 @@ mod tests {
     #[test]
     fn test_get_conflict_versions_clean_file_returns_none_stages() {
         let dir = setup_git_repo();
-        let result = get_conflict_versions(
+        let result = tauri::async_runtime::block_on(get_conflict_versions(
             dir.path().to_string_lossy().to_string(),
             "hello.txt".into(),
-        )
+        ))
         .expect("clean file lookup should not error");
 
         // No conflict → no stages 1/2/3. merged still reads from working tree.
@@ -5704,10 +5858,10 @@ mod tests {
     #[test]
     fn test_get_conflict_versions_missing_file_returns_all_none() {
         let dir = setup_git_repo();
-        let result = get_conflict_versions(
+        let result = tauri::async_runtime::block_on(get_conflict_versions(
             dir.path().to_string_lossy().to_string(),
             "does_not_exist.txt".into(),
-        )
+        ))
         .expect("missing file lookup should not error");
 
         assert!(result.base.is_none());
