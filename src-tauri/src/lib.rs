@@ -16,9 +16,17 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(f)
-        .await
-        .map_err(|e| format!("blocking task panicked: {e}"))?
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(inner) => inner,
+        Err(join_err) => {
+            // The panic itself is captured to ~/.launchpad/panic.log by the
+            // panic hook installed in run(); this extra eprintln gives the
+            // join error context in the dev console so it's correlated with
+            // whichever command was running when the panic happened.
+            eprintln!("[blocking] spawn_blocking task failed: {join_err}");
+            Err(format!("blocking task panicked: {join_err}"))
+        }
+    }
 }
 
 type FsWatcher = notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>;
@@ -1383,52 +1391,65 @@ fn atomic_write_with_mode(
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
-    // Size limit to prevent accidental large writes
+async fn write_file(path: String, content: String) -> Result<(), String> {
+    // Size limit to prevent accidental large writes. Checked before
+    // spawn_blocking so the rejection round-trip is cheap.
     if content.len() > 10 * 1024 * 1024 {
         return Err("File content exceeds 10MB limit".into());
     }
-    atomic_write(std::path::Path::new(&path), content.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
+    blocking(move || {
+        atomic_write(std::path::Path::new(&path), content.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn create_file(path: String) -> Result<(), String> {
-    if std::path::Path::new(&path).exists() {
-        return Err("File already exists".into());
-    }
-    std::fs::write(&path, "").map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn create_directory(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn delete_path(path: String, project_root: Option<String>) -> Result<(), String> {
-    // When a project_root is supplied, refuse deletions outside it. The
-    // context menu is the only caller today and always passes this, so in
-    // practice nothing unguarded reaches remove_dir_all. Cheap defense
-    // against a future caller handing an arbitrary path.
-    if let Some(root) = project_root {
-        let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
-        let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
-        if !target.starts_with(&root_canon) {
-            return Err("Refusing to delete path outside project root".into());
+async fn create_file(path: String) -> Result<(), String> {
+    blocking(move || {
+        if std::path::Path::new(&path).exists() {
+            return Err("File already exists".into());
         }
-    }
-    let p = std::path::Path::new(&path);
-    if p.is_dir() {
-        std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
-    } else {
-        std::fs::remove_file(&path).map_err(|e| e.to_string())
-    }
+        std::fs::write(&path, "").map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
-    std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())
+async fn create_directory(path: String) -> Result<(), String> {
+    blocking(move || std::fs::create_dir_all(&path).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn delete_path(path: String, project_root: Option<String>) -> Result<(), String> {
+    // Off-thread because remove_dir_all on a large subtree (e.g. accidental
+    // delete of node_modules/) can take seconds and would otherwise block
+    // the IPC dispatch thread.
+    blocking(move || {
+        // When a project_root is supplied, refuse deletions outside it. The
+        // context menu is the only caller today and always passes this, so in
+        // practice nothing unguarded reaches remove_dir_all. Cheap defense
+        // against a future caller handing an arbitrary path.
+        if let Some(root) = project_root {
+            let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
+            let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+            if !target.starts_with(&root_canon) {
+                return Err("Refusing to delete path outside project root".into());
+            }
+        }
+        let p = std::path::Path::new(&path);
+        if p.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
+    blocking(move || std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())).await
 }
 
 // Inode of the file at `path`. Used to relocate editor tabs whose file
@@ -3076,6 +3097,10 @@ async fn git_rebase_continue(
     blocking(move || {
         let result = run_git_with_rebase_env(&["rebase", "--continue"], &path, &slots, &counter, &rebase_state, &label);
         let still_paused = rebase_in_progress(&path);
+        // rebase_state is intentionally read BEFORE finalize_rebase runs:
+        // run_git_with_rebase_env doesn't touch it, so backup_tag is still
+        // Some(_) here whether the rebase paused again or completed. The
+        // finalize_rebase call below is what clears it on terminal results.
         let backup_tag = rebase_state
             .lock()
             .unwrap()
@@ -4025,7 +4050,7 @@ mod tests {
     fn test_write_file_basic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
-        let result = write_file(path.to_string_lossy().to_string(), "hello".into());
+        let result = tauri::async_runtime::block_on(write_file(path.to_string_lossy().to_string(), "hello".into()));
         assert!(result.is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
     }
@@ -4035,7 +4060,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.txt");
         let content = "x".repeat(10 * 1024 * 1024 + 1); // just over 10MB
-        let result = write_file(path.to_string_lossy().to_string(), content);
+        let result = tauri::async_runtime::block_on(write_file(path.to_string_lossy().to_string(), content));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("10MB"));
         // File should not have been created
@@ -4047,7 +4072,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limit.txt");
         let content = "x".repeat(10 * 1024 * 1024); // exactly 10MB
-        let result = write_file(path.to_string_lossy().to_string(), content);
+        let result = tauri::async_runtime::block_on(write_file(path.to_string_lossy().to_string(), content));
         assert!(result.is_ok());
     }
 
@@ -4944,7 +4969,7 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
         let target = dir.path().join("doomed.txt");
         fs::write(&target, b"x").unwrap();
-        let result = delete_path(target.to_string_lossy().to_string(), Some(root));
+        let result = tauri::async_runtime::block_on(delete_path(target.to_string_lossy().to_string(), Some(root)));
         assert!(result.is_ok(), "delete inside root should succeed: {:?}", result);
         assert!(!target.exists());
     }
@@ -4957,7 +4982,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("a.txt"), b"a").unwrap();
         let target = dir.path().join("nested");
-        let result = delete_path(target.to_string_lossy().to_string(), Some(root));
+        let result = tauri::async_runtime::block_on(delete_path(target.to_string_lossy().to_string(), Some(root)));
         assert!(result.is_ok());
         assert!(!target.exists(), "recursive directory delete should remove tree");
     }
@@ -4972,7 +4997,7 @@ mod tests {
         fs::write(&outside, b"keep me").unwrap();
 
         let root = project_dir.path().to_string_lossy().to_string();
-        let result = delete_path(outside.to_string_lossy().to_string(), Some(root));
+        let result = tauri::async_runtime::block_on(delete_path(outside.to_string_lossy().to_string(), Some(root)));
         assert!(result.is_err(), "expected refusal, got: {:?}", result);
         assert!(
             result.as_ref().unwrap_err().contains("outside project root"),
@@ -4990,7 +5015,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("file.txt");
         fs::write(&target, b"x").unwrap();
-        let result = delete_path(target.to_string_lossy().to_string(), None);
+        let result = tauri::async_runtime::block_on(delete_path(target.to_string_lossy().to_string(), None));
         assert!(result.is_ok());
         assert!(!target.exists());
     }
@@ -5010,7 +5035,7 @@ mod tests {
         symlink(&outside_target, &escape_link).unwrap();
 
         let root = project_dir.path().to_string_lossy().to_string();
-        let result = delete_path(escape_link.to_string_lossy().to_string(), Some(root));
+        let result = tauri::async_runtime::block_on(delete_path(escape_link.to_string_lossy().to_string(), Some(root)));
         assert!(result.is_err(), "symlink whose target escapes root must be refused");
         assert!(outside_target.exists(), "outside target must survive");
     }
@@ -5021,7 +5046,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
         let missing = dir.path().join("never-existed.txt");
-        let result = delete_path(missing.to_string_lossy().to_string(), Some(root));
+        let result = tauri::async_runtime::block_on(delete_path(missing.to_string_lossy().to_string(), Some(root)));
         assert!(result.is_err());
     }
 
