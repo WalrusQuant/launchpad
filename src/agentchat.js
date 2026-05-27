@@ -114,10 +114,19 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
   title.textContent = "Agent";
   headerLeft.appendChild(title);
   header.appendChild(headerLeft);
+  const headerRight = document.createElement("div");
+  headerRight.className = "agent-header-right";
+  const modePill = document.createElement("button");
+  modePill.className = "agent-mode-pill";
+  modePill.title = "Click to toggle permission mode";
+  modePill.textContent = "Interactive";
+  modePill.dataset.mode = "interactive";
+  headerRight.appendChild(modePill);
   const modelLabel = document.createElement("div");
   modelLabel.className = "agent-header-model";
   modelLabel.textContent = "—";
-  header.appendChild(modelLabel);
+  headerRight.appendChild(modelLabel);
+  header.appendChild(headerRight);
   containerEl.appendChild(header);
 
   // Message list (scroll container)
@@ -146,11 +155,30 @@ export async function createAgentTab({ tabs, nextUiTabId, switchTab, renderTabBa
     /** Map approval_id → ApprovalRequest payload */
     pendingApprovals: new Map(),
     modelSlug: null,
+    permissionMode: "interactive",
     scrollPinned: true,
     listEl,
     modelLabel,
+    modePill,
     fileName: "Agent",
   };
+
+  modePill.addEventListener("click", async () => {
+    if (!tab.sessionId) return;
+    const next = tab.permissionMode === "interactive" ? "auto-approve" : "interactive";
+    try {
+      const resp = await invoke("agent_session_update_config", {
+        sessionId: tab.sessionId,
+        permissionMode: next,
+      });
+      const mode = resp?.result?.permission_mode || next;
+      tab.permissionMode = mode;
+      modePill.dataset.mode = mode;
+      modePill.textContent = mode === "auto-approve" ? "Auto" : "Interactive";
+    } catch (e) {
+      console.warn("failed to update permission mode:", e);
+    }
+  });
 
   // Track scroll-pinned state — auto-scroll only when user is at bottom
   listEl.addEventListener("scroll", () => {

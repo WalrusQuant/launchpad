@@ -3826,7 +3826,8 @@ pub fn run() {
             agent::agent_is_configured,
             agent::agent_provider_presets,
             agent::agent_session_delete,
-            agent::agent_session_deleted_ids
+            agent::agent_session_deleted_ids,
+            agent::agent_session_update_config
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

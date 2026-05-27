@@ -4133,6 +4133,11 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   letter-spacing: 0.02em;
   color: var(--text-11);
 }
+.agent-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .agent-header-model {
   color: var(--text-5);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -4140,6 +4145,31 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   background: var(--surface-6);
   padding: 2px 8px;
   border-radius: 10px;
+}
+.agent-mode-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border-2);
+  background: var(--surface-6);
+  color: var(--text-5);
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  transition: background 0.15s, color 0.15s;
+}
+.agent-mode-pill:hover {
+  background: var(--border-1);
+  color: var(--text-11);
+}
+.agent-mode-pill[data-mode="auto-approve"] {
+  background: #e6a700;
+  color: #000;
+  border-color: #e6a700;
+}
+.agent-mode-pill[data-mode="auto-approve"]:hover {
+  background: #cc9400;
 }
 
 .agent-messages {

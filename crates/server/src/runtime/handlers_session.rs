@@ -482,6 +482,57 @@ impl ServerRuntime {
         })
         .expect("serialize session/fork response")
     }
+
+    pub(super) async fn handle_session_config_update(
+        &self,
+        request_id: serde_json::Value,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            session_id: lpa_core::SessionId,
+            #[serde(default)]
+            permission_mode: Option<String>,
+        }
+        let params: Params = match serde_json::from_value(params) {
+            Ok(p) => p,
+            Err(e) => {
+                return self.error_response(
+                    request_id,
+                    ProtocolErrorCode::InvalidParams,
+                    format!("invalid session/config/update params: {e}"),
+                );
+            }
+        };
+        let sessions = self.sessions.lock().await;
+        let Some(session_arc) = sessions.get(&params.session_id) else {
+            return self.error_response(
+                request_id,
+                ProtocolErrorCode::InvalidParams,
+                format!("session not found: {}", params.session_id),
+            );
+        };
+        let session = session_arc.lock().await;
+        let mut core = session.core_session.lock().await;
+        if let Some(mode_str) = &params.permission_mode {
+            if let Some(mode) = PermissionMode::parse(mode_str) {
+                core.config.permission_mode = mode;
+            }
+        }
+        let current_mode = match core.config.permission_mode {
+            PermissionMode::AutoApprove => "auto-approve",
+            PermissionMode::Interactive => "interactive",
+            PermissionMode::Deny => "deny",
+        };
+        serde_json::to_value(crate::SuccessResponse {
+            id: request_id,
+            result: serde_json::json!({
+                "session_id": params.session_id,
+                "permission_mode": current_mode,
+            }),
+        })
+        .expect("serialize session/config/update response")
+    }
 }
 
 /// Maps the user-facing `sandbox_mode` string from `SessionStartParams` to the

@@ -165,6 +165,9 @@ impl ServerRuntime {
             "turn/start" => Some(self.handle_turn_start(id?, params).await),
             "turn/interrupt" => Some(self.handle_turn_interrupt(id?, params).await),
             "turn/steer" => Some(self.handle_turn_steer(connection_id, id?, params).await),
+            "session/config/update" => {
+                Some(self.handle_session_config_update(id?, params).await)
+            }
             "approval/respond" => Some(self.handle_approval_respond(id?, params).await),
             "events/subscribe" => Some(
                 self.handle_events_subscribe(connection_id, id?, params)

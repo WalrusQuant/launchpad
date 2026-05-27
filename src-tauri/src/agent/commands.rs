@@ -436,3 +436,29 @@ pub async fn agent_skills_list(
     });
     Ok(runtime.handle_incoming(connection_id, envelope).await)
 }
+
+/// Update a live session's permission mode without restarting.
+#[tauri::command]
+pub async fn agent_session_update_config(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AgentState>,
+    session_id: String,
+    permission_mode: String,
+) -> Result<Option<Value>, String> {
+    let connection_id = require_connection_id(&state, &app, window.label())
+        .await
+        .map_err(err)?;
+    let runtime = state.runtime(&app).await.map_err(err)?;
+
+    let envelope = json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id(),
+        "method": "session/config/update",
+        "params": {
+            "session_id": session_id,
+            "permission_mode": permission_mode,
+        }
+    });
+    Ok(runtime.handle_incoming(connection_id, envelope).await)
+}
