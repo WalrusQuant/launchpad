@@ -788,7 +788,7 @@ fn write_projects_file(projects: &[Project]) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_project_path(path: &str) -> String {
+pub(crate) fn normalize_project_path(path: &str) -> String {
     // Canonicalize when possible so two different strings for the same dir dedupe.
     // Fall back to the raw string if the path doesn't resolve (missing dir).
     match fs::canonicalize(path) {
@@ -3827,7 +3827,10 @@ pub fn run() {
             agent::agent_provider_presets,
             agent::agent_session_delete,
             agent::agent_session_deleted_ids,
-            agent::agent_session_update_config
+            agent::agent_session_update_config,
+            agent::agent_project_config_load,
+            agent::agent_project_config_save,
+            agent::agent_project_config_clear
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

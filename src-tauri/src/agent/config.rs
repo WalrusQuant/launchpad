@@ -218,6 +218,87 @@ pub struct ProviderPresetView {
     pub default_model: Option<&'static str>,
 }
 
+// ─── Per-project agent config overrides ──────────────────────────────────
+//
+// Stored at `~/.launchpad/project-agent-config.json`, keyed by canonical
+// project path (same pattern as project-env.json). Each entry is a sparse
+// AgentConfig — only non-None fields override the global config.
+
+type ProjectAgentConfigStore = std::collections::BTreeMap<String, AgentConfig>;
+
+fn project_agent_config_path() -> std::path::PathBuf {
+    launchpad_dir().join("project-agent-config.json")
+}
+
+fn read_project_agent_store() -> ProjectAgentConfigStore {
+    let path = project_agent_config_path();
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return ProjectAgentConfigStore::new();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+fn write_project_agent_store(store: &ProjectAgentConfigStore) -> Result<(), String> {
+    let path = project_agent_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+    atomic_write_with_mode(&path, body.as_bytes(), Some(0o600)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Merge global + per-project config. Project overrides win field-by-field
+/// for non-None fields. Permission rules are concatenated (project first).
+pub fn merged_config_for_project(project_path: Option<&str>) -> AgentConfig {
+    let global = read_user_config();
+    let project_override = project_path
+        .map(crate::normalize_project_path)
+        .and_then(|key| read_project_agent_store().remove(&key));
+    let Some(proj) = project_override else {
+        return global;
+    };
+    AgentConfig {
+        provider: proj.provider.or(global.provider),
+        wire_api: proj.wire_api.or(global.wire_api),
+        model: proj.model.or(global.model),
+        base_url: proj.base_url.or(global.base_url),
+        api_key: proj.api_key.or(global.api_key),
+        default_approval_policy: proj.default_approval_policy.or(global.default_approval_policy),
+        default_sandbox_mode: proj.default_sandbox_mode.or(global.default_sandbox_mode),
+        permission_rules: match (proj.permission_rules, global.permission_rules) {
+            (Some(mut p), Some(g)) => {
+                p.extend(g);
+                Some(p)
+            }
+            (p, g) => p.or(g),
+        },
+    }
+}
+
+#[tauri::command]
+pub fn agent_project_config_load(project_path: String) -> Result<AgentConfig, String> {
+    let key = crate::normalize_project_path(&project_path);
+    let store = read_project_agent_store();
+    Ok(store.get(&key).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn agent_project_config_save(project_path: String, cfg: AgentConfig) -> Result<(), String> {
+    let key = crate::normalize_project_path(&project_path);
+    let mut store = read_project_agent_store();
+    store.insert(key, cfg);
+    write_project_agent_store(&store)
+}
+
+#[tauri::command]
+pub fn agent_project_config_clear(project_path: String) -> Result<(), String> {
+    let key = crate::normalize_project_path(&project_path);
+    let mut store = read_project_agent_store();
+    store.remove(&key);
+    write_project_agent_store(&store)
+}
+
 // ─── Session deletion ────────────────────────────────────────────────────
 //
 // The runtime doesn't currently expose a "delete this session" primitive,

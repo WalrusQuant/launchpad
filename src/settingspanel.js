@@ -164,6 +164,51 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       <button type="button" class="settings-btn env-add-btn" id="env-add-btn">+ Add variable</button>
     </div>
 
+    <div class="settings-section" id="project-agent-section" ${getActiveProject() ? "" : "hidden"}>
+      <h3 class="settings-section-title">
+        Project Agent Overrides
+        <span class="settings-section-sub" id="project-agent-name"></span>
+      </h3>
+      <div class="settings-env-help">
+        Override agent settings for this project only. Unset fields fall back to the global Agent config below.
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-projAgentModel">Model</label>
+        <input class="settings-input" id="set-projAgentModel" type="text" placeholder="(use global default)" />
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-projAgentApproval">Approval</label>
+        <select class="settings-select" id="set-projAgentApproval">
+          <option value="">(use global default)</option>
+          <option value="interactive">Interactive</option>
+          <option value="auto-approve">Auto-approve</option>
+          <option value="deny">Deny</option>
+        </select>
+      </div>
+      <div class="settings-row">
+        <label class="settings-label" for="set-projAgentSandbox">Write scope</label>
+        <select class="settings-select" id="set-projAgentSandbox">
+          <option value="">(use global default)</option>
+          <option value="workspace-write">Workspace writes</option>
+          <option value="read-only">Read-only</option>
+          <option value="unrestricted">Unrestricted</option>
+        </select>
+      </div>
+      <div class="settings-subsection">
+        <label class="settings-label">Project permission rules</label>
+        <div class="settings-env-help" style="margin-top:-2px">
+          Additional rules for this project. Prepended to global rules (take priority).
+        </div>
+        <div id="proj-perm-rules-list" class="env-var-list"></div>
+        <button type="button" class="settings-btn env-add-btn" id="proj-perm-rule-add-btn">+ Add rule</button>
+      </div>
+      <div style="margin-top:10px; display:flex; gap:8px; align-items:center">
+        <button type="button" class="settings-btn" id="proj-agent-save-btn">Save project overrides</button>
+        <button type="button" class="settings-btn" id="proj-agent-clear-btn" style="color:var(--text-5)">Clear all overrides</button>
+        <span id="proj-agent-feedback" class="settings-feedback"></span>
+      </div>
+    </div>
+
     <div class="settings-section" id="agent-section">
       <h3 class="settings-section-title">Agent</h3>
       <div class="settings-env-help">
@@ -236,6 +281,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   containerEl.appendChild(content);
   renderKeybindings(content.querySelector("#keybindings-list"));
   renderProjectEnv(content);
+  renderProjectAgentConfig(content);
   renderAgentConfig(content);
 
   // Wire up all inputs
@@ -346,6 +392,159 @@ function escapeAttr(str) {
 // re-validates on save so the JSON file can never contain bad keys.
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// ─── Per-project agent config overrides ─────────────────────────────────────
+
+const PROJ_TOOL_NAMES = [
+  "bash", "write", "apply_patch", "webfetch", "websearch",
+  "read", "glob", "grep", "skill", "question", "todowrite", "update_plan",
+  "*",
+];
+
+async function renderProjectAgentConfig(content) {
+  const section = content.querySelector("#project-agent-section");
+  if (!section) return;
+  const project = getActiveProject();
+  if (!project) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const nameEl = content.querySelector("#project-agent-name");
+  if (nameEl) nameEl.textContent = `— ${project.name}`;
+
+  const modelInput = content.querySelector("#set-projAgentModel");
+  const approvalSel = content.querySelector("#set-projAgentApproval");
+  const sandboxSel = content.querySelector("#set-projAgentSandbox");
+  const rulesListEl = content.querySelector("#proj-perm-rules-list");
+  const rulesAddBtn = content.querySelector("#proj-perm-rule-add-btn");
+  const saveBtn = content.querySelector("#proj-agent-save-btn");
+  const clearBtn = content.querySelector("#proj-agent-clear-btn");
+  const feedback = content.querySelector("#proj-agent-feedback");
+
+  let projCfg = {};
+  try {
+    projCfg = await invoke("agent_project_config_load", { projectPath: project.path });
+  } catch (_) {}
+
+  if (projCfg.model) modelInput.value = projCfg.model;
+  if (projCfg.default_approval_policy) approvalSel.value = projCfg.default_approval_policy;
+  if (projCfg.default_sandbox_mode) sandboxSel.value = projCfg.default_sandbox_mode;
+
+  let projRules = (projCfg.permission_rules || []).map((r) => ({ ...r }));
+
+  function renderProjRules() {
+    if (!rulesListEl) return;
+    rulesListEl.innerHTML = "";
+    if (projRules.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "env-empty";
+      empty.textContent = "No project-specific rules.";
+      rulesListEl.appendChild(empty);
+      return;
+    }
+    projRules.forEach((rule, idx) => {
+      const row = document.createElement("div");
+      row.className = "env-var-row";
+
+      const toolSel = document.createElement("select");
+      toolSel.className = "settings-select perm-tool-sel";
+      for (const name of PROJ_TOOL_NAMES) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name === "*" ? "* (all tools)" : name;
+        if (name === rule.tool) opt.selected = true;
+        toolSel.appendChild(opt);
+      }
+      toolSel.addEventListener("change", () => { rule.tool = toolSel.value; });
+
+      const patternInput = document.createElement("input");
+      patternInput.type = "text";
+      patternInput.className = "settings-input env-value";
+      patternInput.placeholder = "e.g. npm run *";
+      patternInput.value = rule.pattern || "";
+      patternInput.spellcheck = false;
+      patternInput.addEventListener("input", () => {
+        rule.pattern = patternInput.value || null;
+      });
+
+      const decisionSel = document.createElement("select");
+      decisionSel.className = "settings-select perm-decision-sel";
+      for (const d of ["allow", "deny"]) {
+        const opt = document.createElement("option");
+        opt.value = d;
+        opt.textContent = d.charAt(0).toUpperCase() + d.slice(1);
+        if (d === rule.decision) opt.selected = true;
+        decisionSel.appendChild(opt);
+      }
+      decisionSel.addEventListener("change", () => { rule.decision = decisionSel.value; });
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "env-delete";
+      deleteBtn.title = "Delete this rule";
+      deleteBtn.textContent = "✕";
+      deleteBtn.addEventListener("click", () => {
+        projRules.splice(idx, 1);
+        renderProjRules();
+      });
+
+      row.appendChild(toolSel);
+      row.appendChild(patternInput);
+      row.appendChild(decisionSel);
+      row.appendChild(deleteBtn);
+      rulesListEl.appendChild(row);
+    });
+  }
+
+  if (rulesAddBtn) {
+    rulesAddBtn.addEventListener("click", () => {
+      projRules.push({ tool: "bash", pattern: null, decision: "allow" });
+      renderProjRules();
+    });
+  }
+  renderProjRules();
+
+  function showProjFeedback(msg, kind) {
+    feedback.textContent = msg;
+    feedback.classList.toggle("settings-feedback-ok", kind === "ok");
+    feedback.classList.toggle("settings-feedback-err", kind === "err");
+    setTimeout(() => {
+      feedback.textContent = "";
+      feedback.classList.remove("settings-feedback-ok", "settings-feedback-err");
+    }, 4000);
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const cleanRules = projRules.filter((r) => r.tool);
+    const cfg = {
+      model: modelInput.value.trim() || null,
+      default_approval_policy: approvalSel.value || null,
+      default_sandbox_mode: sandboxSel.value || null,
+      permission_rules: cleanRules.length > 0 ? cleanRules : null,
+    };
+    try {
+      await invoke("agent_project_config_save", { projectPath: project.path, cfg });
+      showProjFeedback("Saved. New agent tabs will use these overrides.", "ok");
+    } catch (err) {
+      showProjFeedback(`Failed: ${err}`, "err");
+    }
+  });
+
+  clearBtn.addEventListener("click", async () => {
+    try {
+      await invoke("agent_project_config_clear", { projectPath: project.path });
+      modelInput.value = "";
+      approvalSel.value = "";
+      sandboxSel.value = "";
+      projRules = [];
+      renderProjRules();
+      showProjFeedback("Cleared. Global config will be used.", "ok");
+    } catch (err) {
+      showProjFeedback(`Clear failed: ${err}`, "err");
+    }
+  });
+}
 
 async function renderAgentConfig(content) {
   const providerSel = content.querySelector("#set-agentProvider");

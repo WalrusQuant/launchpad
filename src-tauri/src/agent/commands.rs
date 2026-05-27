@@ -140,7 +140,7 @@ pub async fn agent_session_start(
     // session/start envelope so the runtime's StaticPermissionPolicy actually
     // honors them. Unknown values get filtered server-side; absent values let
     // the runtime fall back to its own defaults.
-    let cfg = super::config::read_user_config();
+    let cfg = super::config::merged_config_for_project(project_path.as_deref());
     if let Some(mode) = cfg.default_approval_policy.as_deref().map(str::trim) {
         if !mode.is_empty() {
             params.insert("permission_mode".into(), Value::String(mode.to_string()));
