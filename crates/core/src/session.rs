@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use lpa_safety::{SandboxPolicyRecord, legacy_permissions::PermissionMode};
+use lpa_safety::{SandboxPolicyRecord, legacy_permissions::{PermissionMode, PermissionRule}};
 
 use crate::{ActiveCompaction, Message, Model, TokenBudget, rebuild_prompt_view};
 
@@ -20,6 +20,8 @@ pub struct SessionConfig {
     /// sandbox-aware `RuleBasedPolicy` that gates FileWrite and ShellExec
     /// based on `workspace_write` and the session's cwd.
     pub sandbox_policy: Option<SandboxPolicyRecord>,
+    /// Explicit permission rules evaluated before the mode fallback.
+    pub permission_rules: Vec<PermissionRule>,
 }
 
 impl Default for SessionConfig {
@@ -28,6 +30,7 @@ impl Default for SessionConfig {
             token_budget: TokenBudget::default(),
             permission_mode: PermissionMode::Interactive,
             sandbox_policy: None,
+            permission_rules: Vec::new(),
         }
     }
 }
@@ -43,6 +46,7 @@ impl SessionConfig {
             token_budget: TokenBudget::default(),
             permission_mode,
             sandbox_policy,
+            permission_rules: Vec::new(),
         }
     }
 }

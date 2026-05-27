@@ -202,12 +202,20 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
         </select>
       </div>
       <div class="settings-row">
-        <label class="settings-label" for="set-agentSandboxMode">Sandbox</label>
+        <label class="settings-label" for="set-agentSandboxMode">Write scope</label>
         <select class="settings-select" id="set-agentSandboxMode">
           <option value="workspace-write">Workspace writes (default)</option>
           <option value="read-only">Read-only (no writes, no shell)</option>
-          <option value="unrestricted">Unrestricted (no sandbox)</option>
+          <option value="unrestricted">Unrestricted (no restrictions)</option>
         </select>
+      </div>
+      <div class="settings-subsection">
+        <label class="settings-label">Permission rules</label>
+        <div class="settings-env-help" style="margin-top:-2px">
+          Per-tool allow/deny rules. Evaluated before the approval mode fallback. Deny rules for protected paths (.git/, .env, *.pem, *.key) are always enforced.
+        </div>
+        <div id="permission-rules-list" class="env-var-list"></div>
+        <button type="button" class="settings-btn env-add-btn" id="permission-rule-add-btn">+ Add rule</button>
       </div>
       <input type="hidden" id="set-agentWireApi" />
       <button type="button" class="settings-btn" id="agent-save-btn">Save</button>
@@ -435,20 +443,102 @@ async function renderAgentConfig(content) {
     }, 4000);
   }
 
+  // ─── Permission rules editor ───────────────────────────────────────────
+  const TOOL_NAMES = [
+    "bash", "write", "apply_patch", "webfetch", "websearch",
+    "read", "glob", "grep", "skill", "question", "todowrite", "update_plan",
+    "*",
+  ];
+  const rulesListEl = content.querySelector("#permission-rules-list");
+  const rulesAddBtn = content.querySelector("#permission-rule-add-btn");
+  let permRules = (cfg.permission_rules || []).map((r) => ({ ...r }));
+
+  function renderPermRules() {
+    if (!rulesListEl) return;
+    rulesListEl.innerHTML = "";
+    if (permRules.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "env-empty";
+      empty.textContent = "No custom rules. The approval mode applies to all tool calls.";
+      rulesListEl.appendChild(empty);
+      return;
+    }
+    permRules.forEach((rule, idx) => {
+      const row = document.createElement("div");
+      row.className = "env-var-row";
+
+      const toolSel = document.createElement("select");
+      toolSel.className = "settings-select perm-tool-sel";
+      for (const name of TOOL_NAMES) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name === "*" ? "* (all tools)" : name;
+        if (name === rule.tool) opt.selected = true;
+        toolSel.appendChild(opt);
+      }
+      toolSel.addEventListener("change", () => { rule.tool = toolSel.value; });
+
+      const patternInput = document.createElement("input");
+      patternInput.type = "text";
+      patternInput.className = "settings-input env-value";
+      patternInput.placeholder = "e.g. npm run *";
+      patternInput.value = rule.pattern || "";
+      patternInput.spellcheck = false;
+      patternInput.addEventListener("input", () => {
+        rule.pattern = patternInput.value || null;
+      });
+
+      const decisionSel = document.createElement("select");
+      decisionSel.className = "settings-select perm-decision-sel";
+      for (const d of ["allow", "deny"]) {
+        const opt = document.createElement("option");
+        opt.value = d;
+        opt.textContent = d.charAt(0).toUpperCase() + d.slice(1);
+        if (d === rule.decision) opt.selected = true;
+        decisionSel.appendChild(opt);
+      }
+      decisionSel.addEventListener("change", () => { rule.decision = decisionSel.value; });
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "env-delete";
+      deleteBtn.title = "Delete this rule";
+      deleteBtn.textContent = "✕";
+      deleteBtn.addEventListener("click", () => {
+        permRules.splice(idx, 1);
+        renderPermRules();
+      });
+
+      row.appendChild(toolSel);
+      row.appendChild(patternInput);
+      row.appendChild(decisionSel);
+      row.appendChild(deleteBtn);
+      rulesListEl.appendChild(row);
+    });
+  }
+
+  if (rulesAddBtn) {
+    rulesAddBtn.addEventListener("click", () => {
+      permRules.push({ tool: "bash", pattern: null, decision: "allow" });
+      renderPermRules();
+    });
+  }
+  renderPermRules();
+
   async function saveCurrent() {
+    const cleanRules = permRules.filter((r) => r.tool);
     const next = {
       provider: providerSel.value || null,
       wire_api: wireHidden.value || null,
       model: modelInput.value.trim() || null,
       base_url: baseUrlInput.value.trim() || null,
-      // Only overwrite api_key if the user typed something. Otherwise keep
-      // the saved one (only when the provider hasn't changed).
       api_key:
         apiKeyInput.value.trim() ||
         (cfg.provider === providerSel.value ? cfg.api_key : null) ||
         null,
       default_approval_policy: approvalSel ? approvalSel.value : null,
       default_sandbox_mode: sandboxSel ? sandboxSel.value : null,
+      permission_rules: cleanRules.length > 0 ? cleanRules : null,
     };
     await invoke("agent_config_save", { cfg: next });
     cfg = next;

@@ -47,6 +47,20 @@ pub struct SessionStartParams {
     /// `protocol` stays free of safety-crate types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<String>,
+    /// Per-tool permission rules. Each entry has `tool` (tool name or `"*"`),
+    /// optional `pattern` (glob matched against the tool's target), and
+    /// `decision` (`"allow"` or `"deny"`). Evaluated before the mode fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_rules: Option<Vec<PermissionRuleParam>>,
+}
+
+/// Wire-format permission rule carried in `session/start` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRuleParam {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    pub decision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

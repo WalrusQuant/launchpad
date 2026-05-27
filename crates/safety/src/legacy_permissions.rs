@@ -152,8 +152,21 @@ impl RuleBasedPolicy {
         if pattern == "*" {
             return true;
         }
+        if pattern.starts_with('*') && pattern.ends_with('*') {
+            let inner = &pattern[1..pattern.len() - 1];
+            return target.contains(inner);
+        }
         if pattern.ends_with('*') {
             return target.starts_with(pattern.trim_end_matches('*'));
+        }
+        if pattern.starts_with('*') {
+            return target.ends_with(pattern.trim_start_matches('*'));
+        }
+        if pattern.contains('*') {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 2 {
+                return target.starts_with(parts[0]) && target.ends_with(parts[1]);
+            }
         }
         target == pattern
     }
@@ -339,6 +352,26 @@ mod tests {
             "/tmp/*",
             "/var/tmp/file.txt"
         ));
+    }
+
+    #[test]
+    fn pattern_matches_suffix() {
+        assert!(RuleBasedPolicy::pattern_matches("*.pem", "server.pem"));
+        assert!(RuleBasedPolicy::pattern_matches("*.pem", "/etc/ssl/cert.pem"));
+        assert!(!RuleBasedPolicy::pattern_matches("*.pem", "file.txt"));
+    }
+
+    #[test]
+    fn pattern_matches_contains() {
+        assert!(RuleBasedPolicy::pattern_matches("*.git/*", "/repo/.git/config"));
+        assert!(!RuleBasedPolicy::pattern_matches("*.git/*", "/repo/legit.gitignore"));
+    }
+
+    #[test]
+    fn pattern_matches_prefix_suffix() {
+        assert!(RuleBasedPolicy::pattern_matches("npm run *", "npm run build"));
+        assert!(RuleBasedPolicy::pattern_matches("npm run *", "npm run test:watch"));
+        assert!(!RuleBasedPolicy::pattern_matches("npm run *", "yarn test"));
     }
 
     #[tokio::test]

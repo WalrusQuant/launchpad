@@ -128,11 +128,25 @@ impl ToolOrchestrator {
                 }
             }
 
+            let target = match call.name.as_str() {
+                "bash" => call
+                    .input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                "write" | "apply_patch" => call
+                    .input
+                    .get("file_path")
+                    .or_else(|| call.input.get("path"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            };
             let request = PermissionRequest {
                 tool_name: call.name.clone(),
                 resource: ResourceKind::Custom(call.name.clone()),
                 description: format!("execute tool {}", call.name),
-                target: None,
+                target,
             };
 
             match ctx.permissions.check(&request).await {

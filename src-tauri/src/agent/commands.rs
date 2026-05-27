@@ -154,6 +154,33 @@ pub async fn agent_session_start(
             );
         }
     }
+    // Build permission rules: protected paths first (always-deny), then
+    // user-configured rules. First-match semantics in RuleBasedPolicy
+    // means protected denies take priority.
+    {
+        let mut rules: Vec<Value> = Vec::new();
+        for r in super::protected_paths::protected_write_rules() {
+            if let lpa_safety::legacy_permissions::ResourceKind::Custom(tool) = &r.resource {
+                rules.push(json!({
+                    "tool": tool,
+                    "pattern": r.pattern,
+                    "decision": if r.allow { "allow" } else { "deny" },
+                }));
+            }
+        }
+        if let Some(user_rules) = &cfg.permission_rules {
+            for r in user_rules {
+                rules.push(json!({
+                    "tool": &r.tool,
+                    "pattern": &r.pattern,
+                    "decision": &r.decision,
+                }));
+            }
+        }
+        if !rules.is_empty() {
+            params.insert("permission_rules".into(), Value::Array(rules));
+        }
+    }
     let envelope = json!({
         "jsonrpc": "2.0",
         "id": rpc_id(),

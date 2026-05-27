@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod host;
 mod native_tools;
+pub mod protected_paths;
 
 pub use commands::*;
 pub use config::*;

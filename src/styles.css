@@ -2870,6 +2870,20 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   align-self: flex-start;
 }
 
+.perm-tool-sel {
+  max-width: 140px;
+  min-width: 100px;
+}
+
+.perm-decision-sel {
+  max-width: 80px;
+  min-width: 70px;
+}
+
+.settings-subsection {
+  margin-top: 12px;
+}
+
 /* ===== Editor Tab Instances ===== */
 .editor-instance {
   height: 100%;

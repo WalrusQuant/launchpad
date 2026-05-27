@@ -14,6 +14,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{atomic_write_with_mode, launchpad_dir};
 
+/// User-facing permission rule stored in `agent-config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRuleConfig {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    pub decision: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +45,9 @@ pub struct AgentConfig {
     /// `sandbox_mode` on `session/start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sandbox_mode: Option<String>,
+    /// Per-tool permission rules. Evaluated before the mode fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_rules: Option<Vec<PermissionRuleConfig>>,
 }
 
 fn config_path() -> std::path::PathBuf {

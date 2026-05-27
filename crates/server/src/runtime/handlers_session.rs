@@ -131,7 +131,15 @@ impl ServerRuntime {
             .sandbox_mode
             .as_deref()
             .and_then(parse_sandbox_mode);
-        let session_config = if permission_mode.is_some() || sandbox_policy.is_some() {
+        let permission_rules = params
+            .permission_rules
+            .as_ref()
+            .map(|rules| parse_permission_rules(rules))
+            .unwrap_or_default();
+        let has_overrides = permission_mode.is_some()
+            || sandbox_policy.is_some()
+            || !permission_rules.is_empty();
+        let session_config = if has_overrides {
             let mut cfg = SessionConfig::default();
             if let Some(mode) = permission_mode {
                 cfg.permission_mode = mode;
@@ -139,6 +147,7 @@ impl ServerRuntime {
             if sandbox_policy.is_some() {
                 cfg.sandbox_policy = sandbox_policy;
             }
+            cfg.permission_rules = permission_rules;
             Some(cfg)
         } else {
             None
@@ -494,4 +503,18 @@ fn parse_sandbox_mode(value: &str) -> Option<SandboxPolicyRecord> {
         }),
         _ => None,
     }
+}
+
+fn parse_permission_rules(
+    rules: &[lpa_protocol::PermissionRuleParam],
+) -> Vec<lpa_safety::legacy_permissions::PermissionRule> {
+    use lpa_safety::legacy_permissions::{PermissionRule, ResourceKind};
+    rules
+        .iter()
+        .map(|r| PermissionRule {
+            resource: ResourceKind::Custom(r.tool.clone()),
+            pattern: r.pattern.clone().unwrap_or_else(|| "*".to_string()),
+            allow: r.decision.trim().eq_ignore_ascii_case("allow"),
+        })
+        .collect()
 }
