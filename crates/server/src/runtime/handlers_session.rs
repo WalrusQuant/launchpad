@@ -119,10 +119,10 @@ impl ServerRuntime {
             );
         }
         // Build the SessionConfig incrementally so a request that only sets
-        // `sandbox_mode` doesn't silently flip `permission_mode` to AutoApprove
+        // `sandbox_mode` doesn't silently flip `permission_mode` to Interactive
         // (and vice versa). When the caller passes neither, leave `None` so
-        // `new_session_state` falls back to `SessionConfig::default()` —
-        // unchanged behavior from before the agent-fix work.
+        // `new_session_state` falls back to `SessionConfig::default()`
+        // (Interactive + no sandbox).
         let permission_mode = params
             .permission_mode
             .as_deref()

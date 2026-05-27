@@ -172,7 +172,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       </div>
       <div class="settings-env-note">
         <span class="settings-env-note-icon">ⓘ</span>
-        <span>Provider changes take effect <strong>after restart</strong>. The runtime is built once per app launch.</span>
+        <span>Provider changes take effect after <strong>Save &amp; reload</strong>. Existing agent tabs will reconnect on their next message.</span>
       </div>
       <div class="settings-row">
         <label class="settings-label" for="set-agentProvider">Provider</label>

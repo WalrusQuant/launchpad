@@ -84,7 +84,7 @@ pub fn initialize_defaults_if_missing() {
     if changed {
         if let Err(err) = write_user_config(&cfg) {
             // Best effort — log but don't crash. The runtime falls back to
-            // SessionConfig::default() (AutoApprove + no sandbox) if disk
+            // SessionConfig::default() (Interactive + no sandbox) if disk
             // can't be written.
             tracing::warn!(?err, "failed to persist initial agent defaults");
         }

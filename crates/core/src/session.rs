@@ -26,7 +26,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             token_budget: TokenBudget::default(),
-            permission_mode: PermissionMode::AutoApprove,
+            permission_mode: PermissionMode::Interactive,
             sandbox_policy: None,
         }
     }
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn session_config_default_values() {
         let config = SessionConfig::default();
-        assert_eq!(config.permission_mode, PermissionMode::AutoApprove);
+        assert_eq!(config.permission_mode, PermissionMode::Interactive);
     }
 
     #[test]
