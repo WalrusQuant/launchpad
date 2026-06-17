@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
+// Extracted command modules. Each is re-exported at the crate root so the
+// `tauri::generate_handler!` list and the test module (which does
+// `use super::*`) can reference commands by bare name. Shared state structs
+// and helpers (AppState, blocking, atomic_write, …) stay in lib.rs as
+// pub(crate) and the modules pull them back in via `use crate::…`.
+mod settings;
+pub(crate) use settings::*;
+
 // Poison-tolerant mutex locking. A thread panicking while holding one of our
 // process-lifetime mutexes (git op slots, rebase state, the SSH-sock cache)
 // would poison it, and a plain `.lock().unwrap()` then turns that one-off
@@ -19,7 +27,7 @@ use tauri::{Emitter, Manager, State};
 // (they hold maps/options of owned data), so recovering the inner value is
 // safe and strictly better than cascading panics. `into_inner()` reclaims the
 // guard from the poison error.
-trait MutexExt<T> {
+pub(crate) trait MutexExt<T> {
     fn lock_safe(&self) -> std::sync::MutexGuard<'_, T>;
 }
 impl<T> MutexExt<T> for Mutex<T> {
@@ -28,7 +36,7 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
-async fn blocking<F, T>(f: F) -> Result<T, String>
+pub(crate) async fn blocking<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -751,64 +759,6 @@ fn checkout_branch_inner(repo: &Repository, branch_name: &str) -> Result<(), Str
     Ok(())
 }
 
-// Settings
-fn config_path() -> std::path::PathBuf {
-    launchpad_dir().join("config.json")
-}
-
-#[tauri::command]
-fn load_settings() -> Result<String, String> {
-    let path = config_path();
-    if path.exists() {
-        fs::read_to_string(&path).map_err(|e| e.to_string())
-    } else {
-        Ok("{}".to_string())
-    }
-}
-
-#[tauri::command]
-fn save_settings(data: String) -> Result<(), String> {
-    // Validate JSON before writing to prevent config corruption
-    let parsed: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("Invalid JSON: {}", e))?;
-    let normalized = serde_json::to_string_pretty(&parsed)
-        .map_err(|e| format!("JSON serialization error: {}", e))?;
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn file_settings_path() -> std::path::PathBuf {
-    launchpad_dir().join("file-settings.json")
-}
-
-#[tauri::command]
-fn load_file_settings() -> Result<String, String> {
-    let path = file_settings_path();
-    if path.exists() {
-        fs::read_to_string(&path).map_err(|e| e.to_string())
-    } else {
-        Ok("{}".to_string())
-    }
-}
-
-#[tauri::command]
-fn save_file_settings(data: String) -> Result<(), String> {
-    let parsed: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("Invalid JSON: {}", e))?;
-    let normalized = serde_json::to_string_pretty(&parsed)
-        .map_err(|e| format!("JSON serialization error: {}", e))?;
-    let path = file_settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    atomic_write(&path, normalized.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 // Projects
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct Project {
@@ -1385,7 +1335,7 @@ async fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<Str
 // can't collide on the same temp path and corrupt each other.
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     atomic_write_with_mode(dest, data, None)
 }
 
@@ -1394,7 +1344,7 @@ fn atomic_write(dest: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 // relevant (e.g. project-env.json at 0o600): if we rename first and
 // chmod after, the file briefly exists at the default umask (0o644)
 // and a concurrent reader on a shared machine could snapshot secrets.
-fn atomic_write_with_mode(
+pub(crate) fn atomic_write_with_mode(
     dest: &std::path::Path,
     data: &[u8],
     explicit_mode: Option<u32>,
@@ -4062,7 +4012,7 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn dirs_home() -> Option<std::path::PathBuf> {
+pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
@@ -4072,7 +4022,7 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 // `LAUNCHPAD_HOME` IS the directory (not its parent), so a test can
 // `std::env::set_var("LAUNCHPAD_HOME", tempdir.path())` and immediately
 // read/write files there.
-fn launchpad_dir() -> std::path::PathBuf {
+pub(crate) fn launchpad_dir() -> std::path::PathBuf {
     if let Some(override_path) = std::env::var_os("LAUNCHPAD_HOME") {
         return std::path::PathBuf::from(override_path);
     }
