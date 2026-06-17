@@ -1,4 +1,4 @@
-import { gutter, GutterMarker } from "@codemirror/view";
+import { gutter, GutterMarker, keymap, EditorView } from "@codemirror/view";
 import { StateField, StateEffect, RangeSetBuilder, RangeSet } from "@codemirror/state";
 
 // Change gutter: paints a per-line bar showing how each line differs from HEAD
@@ -121,12 +121,58 @@ const changeGutterView = gutter({
   markers: (view) => view.state.field(changeField),
 });
 
+// Line-start positions of every marked line, in document order. Drives hunk
+// navigation; reads straight off the gutter's RangeSet so it always matches
+// what's painted.
+function changedPositions(state) {
+  const set = state.field(changeField, false);
+  if (!set) return [];
+  const positions = [];
+  const iter = set.iter();
+  while (iter.value) {
+    positions.push(iter.from);
+    iter.next();
+  }
+  return positions;
+}
+
+function jumpToChange(view, dir) {
+  const positions = changedPositions(view.state);
+  if (!positions.length) return false;
+  const curLineStart = view.state.doc.lineAt(view.state.selection.main.head).from;
+
+  let target;
+  if (dir > 0) {
+    target = positions.find((p) => p > curLineStart);
+    if (target === undefined) target = positions[0]; // wrap to first
+  } else {
+    const before = positions.filter((p) => p < curLineStart);
+    target = before.length ? before[before.length - 1] : positions[positions.length - 1];
+  }
+  view.dispatch({
+    selection: { anchor: target },
+    effects: EditorView.scrollIntoView(target, { y: "center" }),
+  });
+  return true;
+}
+
+/** Move the cursor to the next changed line (wraps at end). */
+export const goToNextChange = (view) => jumpToChange(view, 1);
+/** Move the cursor to the previous changed line (wraps at start). */
+export const goToPrevChange = (view) => jumpToChange(view, -1);
+
+const changeNavKeymap = keymap.of([
+  { key: "Alt-j", run: goToNextChange },
+  { key: "Alt-k", run: goToPrevChange },
+]);
+
 /**
- * Editor extension that renders the change gutter. Pair with `updateChangeGutter`
- * to push a fresh classification after open / save / external change.
+ * Editor extension that renders the change gutter and wires hunk navigation
+ * (Alt-j / Alt-k). Pair with `updateChangeGutter` to push a fresh
+ * classification after open / save / external change.
  */
 export function changeGutter() {
-  return [changeField, changeGutterView];
+  return [changeField, changeGutterView, changeNavKeymap];
 }
 
 /** Push a fresh { added, modified, deleted } classification into the view. */
