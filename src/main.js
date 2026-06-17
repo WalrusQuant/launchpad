@@ -225,6 +225,34 @@ function getTerminalTheme() {
   return getResolvedTheme() === "light" ? lightTerminalTheme : darkTerminalTheme;
 }
 
+// Load the WebGL renderer for a pane and, critically, recover from context
+// loss. Browsers cap the number of live WebGL contexts (~8-16) and evict the
+// least-recently-used one when the cap is hit. With a split workspace you have
+// 2+ live terminal canvases; clicking from one group to the other makes the
+// group you just LEFT the eviction candidate — its context is lost and, with
+// no handler, its canvas stops painting (the "one terminal goes blank" bug,
+// issue #3). On loss we dispose the dead addon and load a fresh one so the
+// terminal repaints; if WebGL is unavailable entirely we fall back to canvas.
+function loadWebgl(pane) {
+  try {
+    const addon = new WebglAddon();
+    addon.onContextLoss(() => {
+      addon.dispose();
+      pane.webglAddon = null;
+      // Re-create on the next frame so the GL stack has settled after the loss.
+      requestAnimationFrame(() => {
+        // Guard against a pane disposed between loss and this callback.
+        if (pane.term.element) loadWebgl(pane);
+      });
+    });
+    pane.term.loadAddon(addon);
+    pane.webglAddon = addon;
+  } catch (e) {
+    pane.webglAddon = null;
+    console.warn("WebGL renderer not available, using default");
+  }
+}
+
 async function createPane(parentEl, cwd) {
   const s = getSettings();
   const term = new Terminal({
@@ -255,6 +283,7 @@ async function createPane(parentEl, cwd) {
     ptyId: null,
     term,
     fitAddon,
+    webglAddon: null,
     el,
     // Flow control — backpressure replaces gate/buffer/settle resize coordination
     unackedChars: 0,
@@ -280,11 +309,7 @@ async function createPane(parentEl, cwd) {
       await document.fonts.ready;
     }
     term.open(el);
-    try {
-      term.loadAddon(new WebglAddon());
-    } catch (e) {
-      console.warn("WebGL renderer not available, using default");
-    }
+    loadWebgl(pane);
     fitAddon.fit();
     // Pass actual dimensions so the PTY starts at the right size — no resize race.
     // projectPath is the key Rust uses to look up per-project env vars (see
@@ -2341,10 +2366,16 @@ document.addEventListener("keydown", (e) => {
   }
   if (keyMatches(e, "saveFile")) {
     e.preventDefault();
-    if (isEditorTab) {
-      saveEditorTab(activeTabUiId);
-    } else if (isMergeTab) {
-      saveMergeTab(activeTabUiId);
+    // Save the tab in the FOCUSED group, not always the left group. When the
+    // workspace is split and the user is editing a file in the right group,
+    // Cmd+S must save that tab — routing to activeTabUiId (always left) would
+    // silently save the wrong tab or no-op, and the user thinks they saved.
+    const saveId = isSplit && focusedGroup === "right" ? rightActiveTabUiId : activeTabUiId;
+    const saveTab = tabs.get(saveId);
+    if (saveTab?.type === "editor") {
+      saveEditorTab(saveId);
+    } else if (saveTab?.type === "merge") {
+      saveMergeTab(saveId);
     }
     return;
   }
@@ -2453,7 +2484,9 @@ terminalContainer.addEventListener("click", (e) => {
 // Unsaved changes warning
 window.addEventListener("beforeunload", (e) => {
   for (const tab of tabs.values()) {
-    if (tab.type === "editor" && tab.modified) {
+    // Merge tabs track `modified` and are saveable too — a reload/quit must
+    // warn before silently dropping unsaved conflict resolutions.
+    if ((tab.type === "editor" || tab.type === "merge") && tab.modified) {
       e.preventDefault();
       e.returnValue = "";
       return;
@@ -2651,6 +2684,22 @@ function setFocusedGroup(group) {
   const right = document.getElementById("group-right");
   if (left) left.classList.toggle("group-focused", group === "left");
   if (right) right.classList.toggle("group-focused", group === "right");
+  // The .group-focused class can change a group's box sizing (focus border),
+  // which resizes BOTH groups' panes. Nothing else re-fits on a focus switch,
+  // so a group could be left with a stale xterm grid (contributing cause of
+  // issue #3). Re-fit each group's active terminal after the class flip.
+  refitGroupTerminals();
+}
+
+// Re-fit the active terminal tab in each group. Cheap no-op for non-terminal
+// active tabs. Used after focus switches and other layout-affecting changes
+// that the ResizeObserver on the shared outer container doesn't catch.
+function refitGroupTerminals() {
+  for (const id of [activeTabUiId, isSplit ? rightActiveTabUiId : -1]) {
+    if (id === -1) continue;
+    const tab = tabs.get(id);
+    if (tab && tab.type === "terminal") fitAllPanes(tab, { immediate: true });
+  }
 }
 
 function renderRightTabBar() {
@@ -2745,8 +2794,10 @@ function switchRightTab(uiId) {
   rightActiveTabUiId = uiId;
 
   if (tab.type === "terminal") {
+    // Fit immediately (parity with switchTab) so the grid matches the
+    // container before paint; focus on the next frame.
+    fitAllPanes(tab, { immediate: true });
     requestAnimationFrame(() => {
-      fitAllPanes(tab);
       const activePane = tab.panes[tab.activePane] || tab.panes[0];
       if (activePane) activePane.term.focus();
     });

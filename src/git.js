@@ -165,9 +165,17 @@ export function stopGitPolling() {
 }
 
 export function getGitFileStatus(filePath) {
-  if (!currentGitInfo || !currentGitInfo.is_repo) return null;
+  if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return null;
+  // Anchor on the project root and compare git-relative paths exactly, the
+  // same way applyGitColors does. The old endsWith("/" + f.path) match
+  // collided between same-named files in sibling trees (src/foo.js vs
+  // lib/foo.js) and could even match across unrelated roots — wrong here
+  // because this status gates conflict-mode on editor open.
+  const rootWithSlash = currentGitRoot.replace(/\/+$/, "") + "/";
+  if (!filePath.startsWith(rootWithSlash)) return null;
+  const rel = filePath.slice(rootWithSlash.length);
   for (const f of currentGitInfo.files) {
-    if (filePath.endsWith("/" + f.path)) return f.status;
+    if (f.path === rel) return f.status;
   }
   return null;
 }
