@@ -28,6 +28,8 @@ mod fs;
 pub(crate) use fs::*;
 mod git;
 pub(crate) use git::*;
+mod lsp;
+pub(crate) use lsp::*;
 
 // Poison-tolerant mutex locking. A thread panicking while holding one of our
 // process-lifetime mutexes (git op slots, rebase state, the SSH-sock cache)
@@ -73,6 +75,8 @@ pub(crate) mod events {
     pub const PTY_OUTPUT: &str = "pty-output";
     pub const PTY_EXIT: &str = "pty-exit";
     pub const FS_CHANGED: &str = "fs-changed";
+    pub const LSP_MESSAGE: &str = "lsp-message";
+    pub const LSP_EXIT: &str = "lsp-exit";
 }
 
 // Each tab has its own PTY writer and master
@@ -122,6 +126,10 @@ pub(crate) struct AppState {
     // no rebase is in progress (or one was leaked across an app restart —
     // git --continue/--abort still work; we just don't get the cleanup).
     pub(crate) rebase_state: Arc<Mutex<Option<RebaseStateInfo>>>,
+    // Running language servers, keyed by "{language}:{project_path}". One server
+    // per language per project (see lsp.rs). Holds the child handle + stdin pipe;
+    // the reader thread owns stdout and forwards framed messages as events.
+    pub(crate) lsp_servers: Arc<Mutex<HashMap<String, LspInstance>>>,
 }
 
 #[derive(Clone)]
@@ -282,6 +290,7 @@ pub fn run() {
         projects_file_lock: Arc::new(Mutex::new(())),
         project_env_file_lock: Arc::new(Mutex::new(())),
         rebase_state: Arc::new(Mutex::new(None)),
+        lsp_servers: Arc::new(Mutex::new(HashMap::new())),
     };
 
     tauri::Builder::default()
@@ -373,7 +382,10 @@ pub fn run() {
             focus_project_window,
             register_project_window,
             unregister_project_window,
-            unregister_window_label
+            unregister_window_label,
+            lsp_start,
+            lsp_send,
+            lsp_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

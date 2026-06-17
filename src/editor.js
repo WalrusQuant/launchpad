@@ -178,6 +178,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
   const fontSizeCompartment = new Compartment();
   const blameCompartment = new Compartment();
   const visualExtrasCompartment = new Compartment();
+  const lspCompartment = new Compartment();
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
@@ -223,6 +224,9 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
     fontSizeCompartment.of(fontSizeTheme(fontSize || DEFAULT_FONT_SIZE)),
     visualExtrasCompartment.of(buildVisualExtras(visualExtras || {})),
+    // Filled in asynchronously (after the language server connects) via the
+    // handle's setLspExtension — the editor opens immediately without it.
+    lspCompartment.of([]),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());
@@ -270,6 +274,9 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     },
     setVisualExtras(flags) {
       view.dispatch({ effects: visualExtrasCompartment.reconfigure(buildVisualExtras(flags || {})) });
+    },
+    setLspExtension(ext) {
+      view.dispatch({ effects: lspCompartment.reconfigure(ext || []) });
     },
   };
 }

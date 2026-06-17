@@ -5,7 +5,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
 import { updateChangeGutter, deriveLineChanges } from "./changegutter.js";
-import { collectSymbols } from "./symbols.js";
+import { collectSymbols, normalizeLspSymbols } from "./symbols.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser, revealPath } from "./filebrowser.js";
@@ -23,6 +23,7 @@ import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
 import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE } from "./events.js";
+import { lspExtensionForFile, shutdownAllLsp, lspDocumentSymbols } from "./lspclient.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -874,6 +875,9 @@ function ensureSymbolOutline() {
 const SYMBOL_KIND_BADGE = {
   function: "ƒ", fn: "ƒ", method: "ƒ", class: "C", struct: "S",
   enum: "E", trait: "T", impl: "I", mod: "M", heading: "#",
+  // Additional kinds surfaced by LSP documentSymbol:
+  interface: "I", property: "p", field: "f", variable: "v",
+  constant: "c", type: "T", symbol: "•",
 };
 
 function renderSymbolResults(query) {
@@ -936,17 +940,27 @@ function hideSymbolOutline() {
   popEscape(hideSymbolOutline);
 }
 
+// Map normalized LSP symbols (0-based line/character) to palette entries with a
+// document offset, so they jump the same way syntax-tree symbols do.
+function lspSymbolsToPaletteEntries(view, normalized) {
+  const doc = view.state.doc;
+  return normalized.map((s) => {
+    const lineNo = Math.min(Math.max((s.line || 0) + 1, 1), doc.lines);
+    const lineObj = doc.line(lineNo);
+    const from = Math.min(lineObj.from + (s.character || 0), lineObj.to);
+    return { name: s.name, kind: s.kind, from, level: s.level };
+  });
+}
+
 function showSymbolOutline(tab) {
   const overlay = ensureSymbolOutline();
+  // Open immediately with syntax-tree symbols (instant, no server needed), then
+  // upgrade to the language server's documentSymbol result if one's available.
   let symbols;
   try {
     symbols = collectSymbols(tab.editorView.state);
   } catch (_) {
     symbols = [];
-  }
-  if (symbols.length === 0) {
-    showToast("No symbols found in this file", "info");
-    return;
   }
   symbolOutlineState = { view: tab.editorView, all: symbols, filtered: symbols, active: 0 };
   overlay.classList.add("visible");
@@ -955,6 +969,21 @@ function showSymbolOutline(tab) {
   renderSymbolResults("");
   input.focus();
   pushEscape(hideSymbolOutline);
+
+  if (getSettings().editorLanguageServer) {
+    const project = getActiveProject();
+    lspDocumentSymbols(tab.filePath, tab.fileName, project?.path)
+      .then((raw) => {
+        const norm = raw ? normalizeLspSymbols(raw) : [];
+        // Only swap in if the palette is still open for this same editor.
+        if (!norm.length || !symbolOutlineState || symbolOutlineState.view !== tab.editorView) {
+          return;
+        }
+        symbolOutlineState.all = lspSymbolsToPaletteEntries(tab.editorView, norm);
+        renderSymbolResults(input.value.trim().toLowerCase());
+      })
+      .catch(() => {});
+  }
 }
 
 async function createEditorTab(filePath, options = {}) {
@@ -1078,6 +1107,21 @@ async function createEditorTab(filePath, options = {}) {
 
   // Paint the change gutter from the working-tree-vs-HEAD diff.
   refreshEditorGutter(tab);
+
+  // Wire language-server support (opt-in): diagnostics, completion, hover,
+  // go-to-def, etc. Async — the server connects in the background and features
+  // light up once it does. Guarded so a closed/replaced tab doesn't get a late
+  // reconfigure.
+  if (getSettings().editorLanguageServer) {
+    const projectPath = getActiveProject()?.path;
+    lspExtensionForFile(filePath, fileName, projectPath)
+      .then((ext) => {
+        if (tabs.get(uiId) === tab && (!Array.isArray(ext) || ext.length)) {
+          editorHandle.setLspExtension(ext);
+        }
+      })
+      .catch((err) => console.warn("[lsp] wiring failed:", err));
+  }
 
   // Right-click context menu for editor
   editorContent.addEventListener("contextmenu", (e) => {
@@ -3050,6 +3094,10 @@ document.getElementById("back-to-projects").addEventListener("click", async () =
     // when watch_directory failed at init.
     invoke("unwatch_directory", { path: watchedProjectPath || project.path }).catch(() => {});
   }
+
+  // Stop language servers before the reload drops the webview — the Rust-side
+  // registry outlives it, so without this a project switch orphans them.
+  await shutdownAllLsp();
 
   // Full reload resets all module state and triggers boot() → picker.
   setActiveProject(null);

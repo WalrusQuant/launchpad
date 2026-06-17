@@ -373,6 +373,7 @@ fn test_cherry_pick_rejects_invalid_oid() {
         projects_file_lock: Arc::new(Mutex::new(())),
         project_env_file_lock: Arc::new(Mutex::new(())),
         rebase_state: Arc::new(Mutex::new(None)),
+        lsp_servers: Arc::new(Mutex::new(HashMap::new())),
     };
     // Tauri's State<T> is created via app handle; here we just verify the
     // validator path by calling the command body indirectly. Simplest:
@@ -2011,4 +2012,331 @@ fn test_fs_noise_nested_node_modules() {
         &root.join("packages/foo/node_modules/bar/index.js"),
         &root,
     ));
+}
+
+// ─── LSP message framing ────────────────────────────────────────────────
+#[test]
+fn test_encode_lsp_message_uses_byte_length() {
+    // ASCII: length == char count.
+    let framed = encode_lsp_message("{}");
+    assert_eq!(framed, b"Content-Length: 2\r\n\r\n{}");
+
+    // Non-ASCII: Content-Length must be the BYTE length, not char count.
+    // {"k":"é"} is 9 chars but 10 bytes ("é" is 2 bytes in UTF-8).
+    let body = "{\"k\":\"é\"}";
+    assert_eq!(body.chars().count(), 9);
+    assert_eq!(body.len(), 10);
+    let framed = encode_lsp_message(body);
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    assert!(framed.starts_with(header.as_bytes()));
+}
+
+#[test]
+fn test_read_lsp_message_roundtrip() {
+    let body = "{\"jsonrpc\":\"2.0\",\"id\":1}";
+    let framed = encode_lsp_message(body);
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(framed));
+    let got = read_lsp_message(&mut reader).unwrap();
+    assert_eq!(got.as_deref(), Some(body));
+}
+
+#[test]
+fn test_read_lsp_message_back_to_back() {
+    // Two messages concatenated in one stream must decode as two reads.
+    let mut bytes = encode_lsp_message("{\"a\":1}");
+    bytes.extend(encode_lsp_message("{\"b\":2}"));
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some("{\"a\":1}"));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some("{\"b\":2}"));
+    // Stream exhausted → clean EOF.
+    assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
+}
+
+#[test]
+fn test_read_lsp_message_ignores_extra_headers() {
+    // A Content-Type header (which some servers send) must be skipped.
+    let body = "{\"ok\":true}";
+    let mut framed =
+        format!("Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n", body.len())
+            .into_bytes();
+    framed.extend_from_slice(body.as_bytes());
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(framed));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some(body));
+}
+
+#[test]
+fn test_read_lsp_message_clean_eof_on_empty() {
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+    assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
+}
+
+// End-to-end LSP host proof: drive a REAL language server through the same
+// framing functions lsp_start/lsp_send use, and assert diagnostics come back for
+// a file with a type error. #[ignore]d because each needs its server binary
+// installed (not present in CI); run locally with:
+//   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored lsp_e2e
+//
+// Drives `program` from `cwd`, opens `open_file` (already written) with
+// `language_id`, and returns whether a non-empty publishDiagnostics arrives
+// within `timeout_secs`. Replies to any server→client request with a null
+// result so servers that gate on registerCapability / workDoneProgress
+// (pyright, rust-analyzer) don't stall.
+fn lsp_diagnostics_probe(
+    program: &std::ffi::OsStr,
+    args: &[&str],
+    cwd: &std::path::Path,
+    open_file: &std::path::Path,
+    language_id: &str,
+    timeout_secs: u64,
+) -> bool {
+    use std::io::{BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root_uri = format!("file://{}", cwd.display());
+    let uri = format!("file://{}", open_file.display());
+    let text = serde_json::to_string(&std::fs::read_to_string(open_file).unwrap()).unwrap();
+
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut send = |stdin: &mut std::process::ChildStdin, body: String| {
+        stdin.write_all(&encode_lsp_message(&body)).unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"window":{{"workDoneProgress":true}},"textDocument":{{"synchronization":{{}},"publishDiagnostics":{{}}}}}}}}}}"#
+    ));
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string());
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"{language_id}","version":1,"text":{text}}}}}}}"#
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut got = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(msg) => {
+                let v: serde_json::Value = match serde_json::from_str(&msg) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // A server→client request (has both id and method) — answer null
+                // so the server doesn't block waiting on us.
+                if v.get("id").is_some() && v.get("method").is_some() {
+                    let id = &v["id"];
+                    send(&mut stdin, format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+                    continue;
+                }
+                if v["method"] == "textDocument/publishDiagnostics" {
+                    let diags = &v["params"]["diagnostics"];
+                    if diags.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        got = true;
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    got
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_typescript_diagnostics() {
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin/typescript-language-server");
+    if !bin.exists() {
+        eprintln!("skipping: {} not found", bin.display());
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("bad.ts");
+    std::fs::write(&file, "const x: number = \"not a number\";\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(bin.as_os_str(), &["--stdio"], work.path(), &file, "typescript", 20),
+        "expected diagnostics from typescript-language-server"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_python_diagnostics() {
+    if which_on_path("pyright-langserver").is_none() {
+        eprintln!("skipping: pyright-langserver not on PATH");
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("bad.py");
+    std::fs::write(&file, "x: int = \"not an int\"\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(
+            std::ffi::OsStr::new("pyright-langserver"),
+            &["--stdio"],
+            work.path(),
+            &file,
+            "python",
+            30,
+        ),
+        "expected diagnostics from pyright"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_rust_diagnostics() {
+    if which_on_path("rust-analyzer").is_none() {
+        eprintln!("skipping: rust-analyzer not on PATH");
+        return;
+    }
+    // rust-analyzer needs a real Cargo project to analyze.
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(
+        work.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(work.path().join("src")).unwrap();
+    let file = work.path().join("src/main.rs");
+    std::fs::write(&file, "fn main() { let _x: u32 = \"not a u32\"; }\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(
+            std::ffi::OsStr::new("rust-analyzer"),
+            &[],
+            work.path(),
+            &file,
+            "rust",
+            60,
+        ),
+        "expected diagnostics from rust-analyzer"
+    );
+}
+
+// Proves the documentSymbol round-trip (the request that powers the Cmd+Shift+O
+// outline's LSP upgrade): initialize → didOpen → textDocument/documentSymbol,
+// asserting a non-empty result. Uses the same framing fns the host uses.
+#[test]
+#[ignore]
+fn test_lsp_e2e_typescript_document_symbols() {
+    use std::io::{BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin/typescript-language-server");
+    if !bin.exists() {
+        eprintln!("skipping: {} not found", bin.display());
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("sym.ts");
+    std::fs::write(&file, "function alpha() {}\nclass Beta { gamma() {} }\n").unwrap();
+    let root_uri = format!("file://{}", work.path().display());
+    let uri = format!("file://{}", file.display());
+
+    let mut child = Command::new(&bin)
+        .arg("--stdio")
+        .current_dir(work.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut send = |stdin: &mut std::process::ChildStdin, body: String| {
+        stdin.write_all(&encode_lsp_message(&body)).unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"textDocument":{{"documentSymbol":{{"hierarchicalDocumentSymbolSupport":true}}}}}}}}}}"#
+    ));
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string());
+    let text = serde_json::to_string("function alpha() {}\nclass Beta { gamma() {} }\n").unwrap();
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"typescript","version":1,"text":{text}}}}}}}"#
+    ));
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut got_symbols = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(msg) => {
+                let v: serde_json::Value = match serde_json::from_str(&msg) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v.get("id").is_some() && v.get("method").is_some() {
+                    let id = &v["id"];
+                    send(&mut stdin, format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+                    continue;
+                }
+                if v["id"] == 2 {
+                    let result = &v["result"];
+                    if result.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        got_symbols = true;
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    assert!(got_symbols, "expected documentSymbol result from typescript-language-server");
+}
+
+// Minimal `which`: is `name` resolvable on PATH? Keeps the e2e probes skippable
+// when a server isn't installed.
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
 }

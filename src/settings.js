@@ -19,6 +19,7 @@ let settings = {
   editorIndentGuides: true,
   editorFormatOnSave: false,
   editorFollowActiveFile: false,
+  editorLanguageServer: false,
   // Git
   gitPollInterval: 3,
   gitDefaultPrefix: "",

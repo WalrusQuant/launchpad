@@ -275,15 +275,24 @@ forward since it's tiny and currently misleading.
      so they're parked until someone can iterate on them live (or a package
      appears). Tracked here rather than dropped.
 
-### Phase 3 — Track B: Language Intelligence (LSP)
-9. Rust LSP host (`lsp.rs`): spawn + JSON-RPC framing for one server
-   (typescript-language-server is the easiest first target).
-10. Diagnostics end-to-end (server → event → lint gutter).
-11. Hover.
-12. Completion (replace word-completion).
-13. Go-to-definition.
-14. Upgrade symbol outline to `documentSymbol`; then references/rename/code
-    actions as follow-ons.
+### Phase 3 — Track B: Language Intelligence (LSP)  🚧 IN PROGRESS
+9. ✅ Rust LSP host (`lsp.rs`): spawn + `Content-Length` framing, one server per
+   `{language}:{project_path}`. Servers wired: typescript-language-server (JS/TS),
+   rust-analyzer (Rust), pyright (Python). Pure framing unit-tested; `#[ignore]`d
+   e2e tests prove a real initialize→didOpen→diagnostics round-trip against each.
+10. ✅ Diagnostics end-to-end (server → `lsp-message` event →
+    `@codemirror/lsp-client` → lint gutter), behind the `editorLanguageServer`
+    setting (default off).
+11. ✅ Hover, 12. ✅ Completion, 13. ✅ Go-to-definition — all wired via the
+    full `languageServerExtensions()` bundle (also brings signature help and the
+    rename / format / find-references keymaps). **Interactive layer not yet
+    live-verified** (needs a Mac GUI); the diagnostics path is proven by the
+    e2e test.
+14. ✅ Symbol outline upgraded to LSP `documentSymbol`: Cmd+Shift+O opens
+    instantly with syntax-tree symbols, then swaps in the server's richer
+    result when available (`normalizeLspSymbols` handles both hierarchical
+    DocumentSymbol[] and flat SymbolInformation[]). Pure normalizer unit-tested;
+    the request round-trip proven by an e2e probe. Code actions deferred.
 
 Rationale for the order: Phase 1 (git-aware) is the highest value-per-effort and
 reuses infra we already own. Phase 2 (polish) is low-risk warm-up that hardens
