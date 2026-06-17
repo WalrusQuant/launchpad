@@ -1569,6 +1569,47 @@ export function getCurrentPath() {
   return currentPath;
 }
 
+// Reveal a file in the tree: expand every ancestor folder, then select and
+// scroll its row into view. No-ops for files outside the project. If the user
+// has navigated into a subfolder that doesn't contain the file, pop back to the
+// project root first so it's reachable. Best-effort — a missing row just means
+// the file was filtered out (hidden / gitignored view), and we skip silently.
+export async function revealPath(absPath) {
+  if (!absPath || !projectRoot) return;
+  const root = projectRoot.replace(/\/+$/, "");
+  if (!absPath.startsWith(root + "/")) return;
+
+  if (!absPath.startsWith(currentPath.replace(/\/+$/, "") + "/")) {
+    await setRoot(projectRoot);
+  }
+
+  const base = currentPath.replace(/\/+$/, "");
+  const parts = absPath.slice(base.length + 1).split("/");
+  parts.pop(); // drop the filename — only ancestor dirs get expanded
+  let acc = base;
+  for (const part of parts) {
+    acc = `${acc}/${part}`;
+    expandedDirs.add(acc);
+  }
+  await refreshFileBrowser();
+
+  // Find the row by exact dataset match while toggling selection — avoids a
+  // querySelector with the path interpolated into an attribute selector (which
+  // needs delicate escaping for paths with spaces/quotes). dataset.path holds
+  // the raw path, so a direct === comparison is exact.
+  let matchRow = null;
+  document.querySelectorAll(".file-entry").forEach((r) => {
+    const on = r.dataset.path === absPath;
+    r.classList.toggle("selected", on);
+    r.setAttribute("aria-selected", on ? "true" : "false");
+    if (on) matchRow = r;
+  });
+  if (matchRow) {
+    setSingleSelection(absPath);
+    matchRow.scrollIntoView({ block: "center" });
+  }
+}
+
 export function openFileByPath(fullPath) {
   if (openFileCallback) {
     openFileCallback(fullPath);

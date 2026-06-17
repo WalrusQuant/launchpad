@@ -195,6 +195,18 @@ export function stopGitPolling() {
   }
 }
 
+// Convert an absolute file path to the path git uses internally
+// (workdir-relative), or null when the file is outside the current repo/project.
+// Same anchoring as getGitFileStatus: strip the project root, then prepend the
+// project's subdir-within-repo prefix (empty when the project IS the repo root).
+// Used as the pathspec for per-file diff commands (e.g. the editor change gutter).
+export function toRepoRelativePath(filePath) {
+  if (!currentGitRoot) return null;
+  const rootWithSlash = currentGitRoot.replace(/\/+$/, "") + "/";
+  if (!filePath.startsWith(rootWithSlash)) return null;
+  return currentGitSubdir + filePath.slice(rootWithSlash.length);
+}
+
 export function getGitFileStatus(filePath) {
   if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return null;
   // Anchor on the project root and compare git-relative paths exactly, the

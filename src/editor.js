@@ -19,6 +19,9 @@ import { toml } from "@codemirror/legacy-modes/mode/toml";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { vim } from "@replit/codemirror-vim";
 import { conflictExtension } from "./conflictmarkers.js";
+import { changeGutter } from "./changegutter.js";
+import { blameField, blameGutterView, setBlame } from "./blamegutter.js";
+import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 
 const langMap = {
   js: javascript,
@@ -87,7 +90,6 @@ const launchpadTheme = EditorView.theme({
   "&": {
     backgroundColor: "var(--surface-4)",
     color: "var(--text-8)",
-    fontSize: "12px",
     height: "100%",
   },
   ".cm-content": {
@@ -148,18 +150,50 @@ const launchpadTheme = EditorView.theme({
   },
 });
 
+// Font size lives in its own reconfigurable theme so the `editorFontSize`
+// setting can be applied live (via the handle's setFontSize), the same way the
+// terminal honors termFontSize. Set on "&" so the whole editor — content and
+// gutters — scales together.
+const fontSizeTheme = (px) => EditorView.theme({ "&": { fontSize: `${px}px` } });
+
+const DEFAULT_FONT_SIZE = 12;
+
+// Optional visual extensions toggled live via a compartment. Kept in one place
+// so a single reconfigure (setVisualExtras on the handle) can flip any of them.
+function buildVisualExtras({ indentGuides } = {}) {
+  const ext = [];
+  if (indentGuides) ext.push(indentationMarkers({ hideFirstIndent: true, highlightActiveBlock: true }));
+  return ext;
+}
+
 /**
  * Create a CodeMirror editor instance.
- * Returns { view, setTabSize, setWordWrap } — caller owns the view's lifecycle.
+ * Returns { view, setTabSize, setWordWrap, setFontSize } — caller owns the
+ * view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme, conflictMode, readOnly, onOpenThreeWay } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter, onGutterMarkerClick, visualExtras } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
+  const fontSizeCompartment = new Compartment();
+  const blameCompartment = new Compartment();
+  const visualExtrasCompartment = new Compartment();
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
     lineNumbers(),
+    // Change gutter sits just right of the line numbers (VS Code-style). Only
+    // wired for real on-disk files in a repo; the host pushes classifications
+    // via updateChangeGutter after open / save / external change.
+    ...(gitGutter
+      ? [
+          changeGutter({ onMarkerClick: onGutterMarkerClick }),
+          // Blame field is always live; the gutter column is shown/hidden via
+          // the compartment (toggled by the handle's showBlame/hideBlame).
+          blameField,
+          blameCompartment.of([]),
+        ]
+      : []),
     highlightActiveLine(),
     highlightActiveLineGutter(),
     bracketMatching(),
@@ -187,6 +221,8 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     EditorState.allowMultipleSelections.of(true),
     tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
+    fontSizeCompartment.of(fontSizeTheme(fontSize || DEFAULT_FONT_SIZE)),
+    visualExtrasCompartment.of(buildVisualExtras(visualExtras || {})),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());
@@ -214,6 +250,26 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     },
     setWordWrap(on) {
       view.dispatch({ effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []) });
+    },
+    setFontSize(px) {
+      view.dispatch({ effects: fontSizeCompartment.reconfigure(fontSizeTheme(px || DEFAULT_FONT_SIZE)) });
+    },
+    // Show the blame gutter with the given { hunks, onClick } payload. The
+    // field always lives in the config, so set the data first, then reveal the
+    // column — a single transaction can't both add the gutter and have the
+    // (already-present) field consume the effect, but two ordered effects work.
+    showBlame(payload) {
+      view.dispatch({
+        effects: [setBlame.of(payload), blameCompartment.reconfigure(blameGutterView)],
+      });
+    },
+    hideBlame() {
+      view.dispatch({
+        effects: [blameCompartment.reconfigure([]), setBlame.of(null)],
+      });
+    },
+    setVisualExtras(flags) {
+      view.dispatch({ effects: visualExtrasCompartment.reconfigure(buildVisualExtras(flags || {})) });
     },
   };
 }

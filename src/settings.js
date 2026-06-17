@@ -16,6 +16,9 @@ let settings = {
   editorTabSize: 2,
   editorWordWrap: false,
   editorVimMode: false,
+  editorIndentGuides: true,
+  editorFormatOnSave: false,
+  editorFollowActiveFile: false,
   // Git
   gitPollInterval: 3,
   gitDefaultPrefix: "",

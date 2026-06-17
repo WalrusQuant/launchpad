@@ -4,10 +4,12 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
+import { updateChangeGutter, deriveLineChanges } from "./changegutter.js";
+import { collectSymbols } from "./symbols.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
-import { fetchGitStatus, startGitPolling, getGitFileStatus, setInFlightOp } from "./git.js";
+import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser, revealPath } from "./filebrowser.js";
+import { fetchGitStatus, startGitPolling, getGitFileStatus, setInFlightOp, toRepoRelativePath } from "./git.js";
 import { parseConflictBlocks } from "./conflictmarkers.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { buildFileDiffSection } from "./diffrender.js";
@@ -523,6 +525,13 @@ function switchTab(uiId) {
     });
   } else if (tab.type === "editor") {
     setTimeout(() => tab.editorView.focus(), 10);
+    // HEAD may have moved while away (staged/committed in the git panel) —
+    // recompute the change gutter on focus.
+    refreshEditorGutter(tab);
+    // Optionally sync the file tree to the now-active file.
+    if (getSettings().editorFollowActiveFile && tab.filePath) {
+      revealPath(tab.filePath);
+    }
   } else if (tab.type === "merge") {
     setTimeout(() => tab.mergedView.focus(), 10);
   }
@@ -649,6 +658,305 @@ function renderBreadcrumb(breadcrumbEl, filePath) {
 }
 
 // Editor tab management
+const EMPTY_CHANGES = { added: new Set(), modified: new Set(), deleted: new Set() };
+
+// Recompute the change gutter for an editor tab from the working-tree-vs-HEAD
+// diff. Best-effort: a file outside the repo, or any backend error, just clears
+// the gutter. Markers reflect disk-vs-HEAD, so they update on save / external
+// change, not on every keystroke (see editor-spec Track A).
+async function refreshEditorGutter(tab) {
+  if (!tab || tab.type !== "editor" || !tab.editorView) return;
+  const project = getActiveProject();
+  const rel = project ? toRepoRelativePath(tab.filePath) : null;
+  if (!rel) {
+    tab.lineDiff = null;
+    updateChangeGutter(tab.editorView, EMPTY_CHANGES);
+    return;
+  }
+  try {
+    const diff = await invoke("get_file_diff_vs_head", { path: project.path, filePath: rel });
+    tab.lineDiff = diff;
+    updateChangeGutter(tab.editorView, deriveLineChanges(diff));
+  } catch (_) {
+    tab.lineDiff = null;
+    updateChangeGutter(tab.editorView, EMPTY_CHANGES);
+  }
+}
+
+// Locate the hunk responsible for a marker on `lineNo` (1-based, new side).
+// A line is "in" a hunk if it falls in the hunk's new-side span; a pure
+// deletion (new_lines === 0) attaches to the line just above the gap.
+function findHunkForLine(diff, lineNo) {
+  if (!diff || !Array.isArray(diff.hunks)) return null;
+  for (const h of diff.hunks) {
+    if (h.new_lines > 0) {
+      if (lineNo >= h.new_start && lineNo <= h.new_start + h.new_lines - 1) return h;
+    } else if (lineNo === h.new_start - 1 || lineNo === h.new_start) {
+      return h;
+    }
+  }
+  return null;
+}
+
+// Replace a hunk's new-side text with its HEAD (old-side) text in the buffer.
+// Correctness rests on the buffer matching disk (and thus the diff's new side):
+// when not modified, the concatenated content of the hunk's new-side lines is an
+// exact substring of the document starting at new_start, so its length pins the
+// replace range without any newline bookkeeping. Deletions (no new-side lines)
+// insert the old text at the gap.
+function revertHunkInBuffer(view, hunk) {
+  const doc = view.state.doc;
+  const newSide = hunk.lines.filter((l) => l.origin === "add" || l.origin === "context");
+  const oldSide = hunk.lines.filter((l) => l.origin === "remove" || l.origin === "context");
+  const newText = newSide.map((l) => l.content).join("");
+  const oldText = oldSide.map((l) => l.content).join("");
+
+  let from, to;
+  if (hunk.new_lines > 0) {
+    from = doc.line(hunk.new_start).from;
+    to = from + newText.length;
+  } else {
+    // Pure deletion: insert the removed lines at the start of the line below
+    // the gap (new_start is that line), or at end-of-doc when past the last line.
+    if (hunk.new_start >= 1 && hunk.new_start <= doc.lines) {
+      from = to = doc.line(hunk.new_start).from;
+    } else {
+      from = to = doc.length;
+    }
+  }
+  if (to > doc.length) return false; // stale diff — bail rather than corrupt
+  view.dispatch({ changes: { from, to, insert: oldText } });
+  return true;
+}
+
+function uiIdForTab(tab) {
+  for (const [uiId, t] of tabs) if (t === tab) return uiId;
+  return null;
+}
+
+// Popover shown when a change-gutter marker is clicked: revert the hunk in the
+// buffer (HEAD content, then the user saves), or stage the whole file.
+function showHunkMenu(tab, view, lineNo, event) {
+  document.getElementById("context-menu")?.remove();
+  const hunk = findHunkForLine(tab.lineDiff, lineNo);
+  if (!hunk) return;
+
+  const menu = document.createElement("div");
+  menu.id = "context-menu";
+  menu.className = "context-menu";
+
+  const addItem = (label, fn, disabled = false) => {
+    const item = document.createElement("div");
+    item.className = "context-menu-item" + (disabled ? " context-menu-item-disabled" : "");
+    item.textContent = label;
+    if (!disabled) {
+      item.addEventListener("click", () => {
+        menu.remove();
+        fn();
+      });
+    }
+    menu.appendChild(item);
+  };
+
+  // Revert's line math needs the buffer to match disk; gate it when dirty.
+  if (tab.modified) {
+    addItem("Revert hunk (save first)", null, true);
+  } else {
+    addItem("Revert hunk", () => {
+      // Buffer edit only — leaves the tab dirty so the user can review and
+      // Cmd+Z, then Cmd+S to persist (gutter recomputes on save).
+      if (!revertHunkInBuffer(view, hunk)) {
+        showToast("Couldn't revert — the diff is stale, try reopening", "error");
+      } else {
+        view.focus();
+      }
+    });
+  }
+
+  addItem("Stage file", async () => {
+    const project = getActiveProject();
+    if (!project) return;
+    const uiId = uiIdForTab(tab);
+    if (tab.modified && uiId != null) await saveEditorTab(uiId);
+    const rel = toRepoRelativePath(tab.filePath);
+    if (!rel) return;
+    try {
+      await invoke("git_stage_file", { path: project.path, filePath: rel });
+      showToast(`Staged ${tab.fileName}`, "info");
+      refreshPanel(null, true);
+      refreshEditorGutter(tab);
+    } catch (err) {
+      showToast(`Stage failed: ${err}`, "error");
+    }
+  });
+
+  menu.style.left = event.clientX + "px";
+  menu.style.top = event.clientY + "px";
+  document.body.appendChild(menu);
+  // Clamp into the viewport if it would overflow the right/bottom edge.
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+
+  setTimeout(() => {
+    document.addEventListener("click", () => menu.remove(), { once: true });
+  }, 0);
+}
+
+// Toggle the opt-in blame gutter for an editor tab. Blames committed content
+// (HEAD), so it's best-effort against unsaved edits; clicking a line opens that
+// commit's diff (compared with its parent).
+async function toggleBlame(tab) {
+  if (!tab || tab.type !== "editor" || !tab.editorHandle) return;
+  if (tab.blameOn) {
+    tab.editorHandle.hideBlame();
+    tab.blameOn = false;
+    return;
+  }
+  const project = getActiveProject();
+  const rel = project ? toRepoRelativePath(tab.filePath) : null;
+  if (!rel) {
+    showToast("Blame is only available for files tracked in this project's repo", "error");
+    return;
+  }
+  try {
+    const hunks = await invoke("git_blame_file", { path: project.path, filePath: rel });
+    tab.editorHandle.showBlame({
+      hunks,
+      onClick: (oid) => createDiffTab({ fromRef: `${oid}^`, toRef: oid }),
+    });
+    tab.blameOn = true;
+  } catch (err) {
+    showToast(`Blame failed: ${err}`, "error");
+  }
+}
+
+// ─── Symbol outline (Cmd+Shift+O) ───────────────────────────────────────────
+let symbolOutlineEl = null;
+let symbolOutlineState = null; // { view, all, filtered, active }
+
+function ensureSymbolOutline() {
+  if (symbolOutlineEl) return symbolOutlineEl;
+  const overlay = document.createElement("div");
+  overlay.id = "symbol-outline";
+  overlay.innerHTML =
+    '<div class="so-dialog"><input class="so-input" type="text" placeholder="Go to symbol…" />' +
+    '<div class="so-results"></div></div>';
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) hideSymbolOutline();
+  });
+
+  const input = overlay.querySelector(".so-input");
+  input.addEventListener("input", () => renderSymbolResults(input.value.trim().toLowerCase()));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideSymbolOutline();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      commitSymbolSelection();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveSymbolSelection(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveSymbolSelection(-1);
+    }
+    e.stopPropagation();
+  });
+
+  symbolOutlineEl = overlay;
+  return overlay;
+}
+
+const SYMBOL_KIND_BADGE = {
+  function: "ƒ", fn: "ƒ", method: "ƒ", class: "C", struct: "S",
+  enum: "E", trait: "T", impl: "I", mod: "M", heading: "#",
+};
+
+function renderSymbolResults(query) {
+  const st = symbolOutlineState;
+  if (!st) return;
+  st.filtered = query ? st.all.filter((s) => s.name.toLowerCase().includes(query)) : st.all;
+  st.active = 0;
+  const results = symbolOutlineEl.querySelector(".so-results");
+  if (st.filtered.length === 0) {
+    results.innerHTML = '<div class="qo-hint">No symbols</div>';
+    return;
+  }
+  results.innerHTML = st.filtered
+    .map((s, i) => {
+      const indent = s.kind === "heading" && s.level ? (s.level - 1) * 12 : 0;
+      const badge = SYMBOL_KIND_BADGE[s.kind] || "•";
+      return (
+        `<div class="qo-result so-result ${i === 0 ? "qo-result-active" : ""}" data-idx="${i}" style="padding-left:${16 + indent}px">` +
+        `<span class="so-kind">${badge}</span>` +
+        `<span class="qo-result-name">${escapeText(s.name)}</span>` +
+        `<span class="qo-result-dir">${s.kind}</span></div>`
+      );
+    })
+    .join("");
+  results.querySelectorAll(".so-result").forEach((el) => {
+    el.addEventListener("click", () => {
+      st.active = parseInt(el.dataset.idx, 10);
+      commitSymbolSelection();
+    });
+  });
+}
+
+function moveSymbolSelection(dir) {
+  const st = symbolOutlineState;
+  if (!st || st.filtered.length === 0) return;
+  st.active = Math.min(Math.max(st.active + dir, 0), st.filtered.length - 1);
+  const rows = [...symbolOutlineEl.querySelectorAll(".so-result")];
+  rows.forEach((el, i) => el.classList.toggle("qo-result-active", i === st.active));
+  rows[st.active]?.scrollIntoView({ block: "nearest" });
+}
+
+function commitSymbolSelection() {
+  const st = symbolOutlineState;
+  if (!st) return;
+  const sym = st.filtered[st.active];
+  hideSymbolOutline();
+  if (!sym) return;
+  const view = st.view;
+  view.dispatch({
+    selection: { anchor: sym.from },
+    effects: EditorView.scrollIntoView(sym.from, { y: "center" }),
+  });
+  view.focus();
+}
+
+function hideSymbolOutline() {
+  if (!symbolOutlineEl) return;
+  symbolOutlineEl.classList.remove("visible");
+  symbolOutlineState = null;
+  popEscape(hideSymbolOutline);
+}
+
+function showSymbolOutline(tab) {
+  const overlay = ensureSymbolOutline();
+  let symbols;
+  try {
+    symbols = collectSymbols(tab.editorView.state);
+  } catch (_) {
+    symbols = [];
+  }
+  if (symbols.length === 0) {
+    showToast("No symbols found in this file", "info");
+    return;
+  }
+  symbolOutlineState = { view: tab.editorView, all: symbols, filtered: symbols, active: 0 };
+  overlay.classList.add("visible");
+  const input = overlay.querySelector(".so-input");
+  input.value = "";
+  renderSymbolResults("");
+  input.focus();
+  pushEscape(hideSymbolOutline);
+}
+
 async function createEditorTab(filePath, options = {}) {
   const { line, column } = options;
   // Deduplicate: if already open, switch to it
@@ -748,9 +1056,13 @@ async function createEditorTab(filePath, options = {}) {
     },
     tabSize: effectiveTabSize,
     wordWrap: effectiveWordWrap,
+    fontSize: editorSettings.editorFontSize,
     vimMode: editorSettings.editorVimMode,
     theme: getResolvedTheme(),
     conflictMode,
+    gitGutter: true,
+    onGutterMarkerClick: (view, lineNo, event) => showHunkMenu(tab, view, lineNo, event),
+    visualExtras: { indentGuides: editorSettings.editorIndentGuides },
     // Phase 6: when a conflict block's [Open 3-Way] button is clicked, we
     // open the dedicated 3-pane merge tab for this file. Only wired when
     // the file is actually conflicted — otherwise the button never renders.
@@ -763,6 +1075,9 @@ async function createEditorTab(filePath, options = {}) {
   tab.editorHandle = editorHandle;
   tabs.set(uiId, tab);
   updateStatus();
+
+  // Paint the change gutter from the working-tree-vs-HEAD diff.
+  refreshEditorGutter(tab);
 
   // Right-click context menu for editor
   editorContent.addEventListener("contextmenu", (e) => {
@@ -1479,7 +1794,9 @@ export async function createMergeTab({ filePath }) {
   const baseOptions = {
     tabSize: editorSettings.editorTabSize,
     wordWrap: editorSettings.editorWordWrap,
+    fontSize: editorSettings.editorFontSize,
     theme: getResolvedTheme(),
+    visualExtras: { indentGuides: editorSettings.editorIndentGuides },
   };
 
   // Side panes: read-only, no vim (vim's command mode would intercept
@@ -1520,6 +1837,9 @@ export async function createMergeTab({ filePath }) {
     conflictMode: true,
   });
   tab.mergedView = mergedHandle.view;
+  // Keep the handles so live settings (e.g. editorFontSize) can reconfigure
+  // all three panes the same way single-editor tabs do.
+  tab.editorHandles = [oursHandle, theirsHandle, mergedHandle];
 
   tabs.set(uiId, tab);
 
@@ -1664,6 +1984,17 @@ function renderEditorStatus(tab, statusBar) {
   });
   statusBar.appendChild(wrap);
 
+  addSep();
+  const blame = document.createElement("span");
+  blame.className = "esb-item esb-click" + (tab.blameOn ? " esb-active" : "");
+  blame.title = "Toggle git blame";
+  blame.textContent = "Blame";
+  blame.addEventListener("click", async () => {
+    await toggleBlame(tab);
+    renderEditorStatus(tab, statusBar);
+  });
+  statusBar.appendChild(blame);
+
   if (ud || rd) {
     addSep();
     const hist = document.createElement("span");
@@ -1697,9 +2028,36 @@ async function saveEditorTab(uiId) {
       content = content.replace(/\r?\n/g, "\r\n");
     }
     await invoke("write_file", { path: tab.filePath, content });
-    tab.originalContent = rawContent;
+
+    // Format on save (opt-in): the formatter rewrites the file in place; sync
+    // the buffer to its output. Best-effort — a missing formatter or a format
+    // error toasts but doesn't fail the save (the file is already written).
+    let savedContent = rawContent;
+    if (getSettings().editorFormatOnSave) {
+      try {
+        const formatted = await invoke("format_file", {
+          projectPath: getActiveProject()?.path || "",
+          filePath: tab.filePath,
+        });
+        if (formatted != null && formatted !== rawContent) {
+          const view = tab.editorView;
+          const caret = Math.min(view.state.selection.main.head, formatted.length);
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: formatted },
+            selection: { anchor: caret },
+          });
+          savedContent = formatted;
+        }
+      } catch (err) {
+        showToast(`Format on save: ${err}`, "error");
+      }
+    }
+
+    tab.originalContent = savedContent;
     tab.modified = false;
     renderTabBar();
+    // Disk now differs from HEAD by the just-saved content — repaint the gutter.
+    refreshEditorGutter(tab);
     // Flash the tab label green briefly to confirm save
     const tabEl = document.querySelector(`.tab[data-tab-id="${uiId}"] .tab-label`);
     if (tabEl) {
@@ -1710,7 +2068,7 @@ async function saveEditorTab(uiId) {
     // Gate is `parseConflictBlocks` returning [] — not a substring scan —
     // so source files containing literal "<<<<<<< HEAD" (e.g. test fixtures)
     // never wrongly trigger a stage.
-    if (tab.conflictMode && parseConflictBlocks(rawContent).length === 0) {
+    if (tab.conflictMode && parseConflictBlocks(savedContent).length === 0) {
       const project = getActiveProject();
       if (project) {
         try {
@@ -1780,6 +2138,30 @@ function applySettingLive(key, value) {
       // Route through the gated/awaited resize path so font-metric changes
       // can't race with PTY output (Race #2 fix).
       fitAllPanes(tab, { immediate: true });
+    }
+  }
+
+  // Apply editor settings to all open editor / merge tabs. Only the keys with
+  // a live reconfigure path are handled here; others (vimMode, etc.) still take
+  // effect on the next file open.
+  if (key === "editorFontSize") {
+    for (const tab of tabs.values()) {
+      if (tab.type === "editor" && tab.editorHandle) {
+        tab.editorHandle.setFontSize(value);
+      } else if (tab.type === "merge" && tab.editorHandles) {
+        for (const h of tab.editorHandles) h.setFontSize(value);
+      }
+    }
+  }
+
+  if (key === "editorIndentGuides") {
+    const flags = { indentGuides: value };
+    for (const tab of tabs.values()) {
+      if (tab.type === "editor" && tab.editorHandle) {
+        tab.editorHandle.setVisualExtras(flags);
+      } else if (tab.type === "merge" && tab.editorHandles) {
+        for (const h of tab.editorHandles) h.setVisualExtras(flags);
+      }
     }
   }
 
@@ -2066,6 +2448,7 @@ listen(FS_CHANGED, (event) => {
               changes: { from: 0, to: editorContent.length, insert: diskContent },
             });
             tab.originalContent = diskContent;
+            refreshEditorGutter(tab);
           } else {
             // User has unsaved changes — prompt
             showConfirmDialog(
@@ -2077,6 +2460,7 @@ listen(FS_CHANGED, (event) => {
                 tab.originalContent = diskContent;
                 tab.modified = false;
                 renderTabBar();
+                refreshEditorGutter(tab);
               }
             );
           }
@@ -2369,6 +2753,13 @@ document.addEventListener("keydown", (e) => {
     }
     return;
   }
+  if (keyMatches(e, "gotoSymbol")) {
+    e.preventDefault();
+    const tab = tabs.get(isSplit && focusedGroup === "right" ? rightActiveTabUiId : activeTabUiId);
+    if (tab && tab.type === "editor") showSymbolOutline(tab);
+    return;
+  }
+
   if (keyMatches(e, "quickOpen")) {
     e.preventDefault();
     showQuickOpen(getCurrentPath());

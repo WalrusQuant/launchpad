@@ -586,6 +586,36 @@ pub(crate) async fn get_file_diff(path: String, file_path: String, staged: Optio
     .await
 }
 
+// Working-tree-vs-HEAD diff for a single file, used by the editor change
+// gutter. Deliberately distinct from `get_file_diff` (workdir-vs-index with a
+// staged fallback): the gutter wants "everything different from the last
+// commit" so a hunk that gets staged still shows a marker. `diff_tree_to_
+// workdir_with_index` folds the index in, giving exactly that view. Returns an
+// empty FileDiff (no hunks) when the file matches HEAD or there is no HEAD yet
+// (unborn branch) so the frontend can no-op cleanly.
+#[tauri::command]
+pub(crate) async fn get_file_diff_vs_head(path: String, file_path: String) -> Result<FileDiff, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+
+        let mut diff_opts = git2::DiffOptions::new();
+        diff_opts.pathspec(&file_path);
+
+        // No HEAD (fresh repo, unborn branch): everything is "new", but there's
+        // no tree to diff against — treat as no tracked changes for the gutter.
+        let head_tree = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+            Some(t) => t,
+            None => return Ok(FileDiff { old_path: None, new_path: None, hunks: vec![] }),
+        };
+
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut diff_opts))
+            .map_err(|e| e.to_string())?;
+        collect_structured_diff(&diff)
+    })
+    .await
+}
+
 #[tauri::command]
 pub(crate) async fn git_stage_all(path: String) -> Result<(), String> {
     blocking(move || {
@@ -2371,6 +2401,56 @@ pub(crate) async fn list_remote_branches(path: String) -> Result<Vec<BranchInfo>
             .collect();
 
         Ok(result)
+    })
+    .await
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct BlameHunk {
+    pub(crate) start_line: usize,
+    pub(crate) line_count: usize,
+    pub(crate) oid: String,
+    pub(crate) author: String,
+    pub(crate) timestamp: i64,
+    pub(crate) summary: String,
+}
+
+// Per-line authorship for a file, as contiguous hunks (a run of lines sharing
+// the same commit). Blames the committed file (HEAD); local unsaved edits won't
+// be attributed and may shift line alignment — blame is an opt-in, best-effort
+// overlay. A zero/uncommitted OID (e.g. a not-yet-committed line) surfaces with
+// the all-zero short id so the frontend can render it as "uncommitted".
+#[tauri::command]
+pub(crate) async fn git_blame_file(path: String, file_path: String) -> Result<Vec<BlameHunk>, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+        let blame = repo
+            .blame_file(std::path::Path::new(&file_path), None)
+            .map_err(|e| e.to_string())?;
+
+        let mut out = Vec::with_capacity(blame.len());
+        for hunk in blame.iter() {
+            let oid = hunk.final_commit_id();
+            let oid_str = oid.to_string();
+            let short = if oid_str.len() >= 7 { oid_str[..7].to_string() } else { oid_str };
+            let sig = hunk.final_signature();
+            let author = sig.name().unwrap_or("Unknown").to_string();
+            let timestamp = sig.when().seconds();
+            let summary = repo
+                .find_commit(oid)
+                .ok()
+                .and_then(|c| c.summary().map(String::from))
+                .unwrap_or_default();
+            out.push(BlameHunk {
+                start_line: hunk.final_start_line(),
+                line_count: hunk.lines_in_hunk(),
+                oid: short,
+                author,
+                timestamp,
+                summary,
+            });
+        }
+        Ok(out)
     })
     .await
 }
