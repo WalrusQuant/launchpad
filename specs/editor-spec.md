@@ -282,17 +282,14 @@ forward since it's tiny and currently misleading.
    initialize→didOpen→diagnostics round-trip.
 10. ✅ Diagnostics end-to-end (server → `lsp-message` event →
     `@codemirror/lsp-client` → lint gutter), behind the `editorLanguageServer`
-    setting (default off). **Visual/interactive layer not yet live-verified.**
-11. Hover. (deferred — needs live verification)
-12. Completion (replace word-completion). (deferred)
-13. Go-to-definition. (deferred)
-14. Upgrade symbol outline to `documentSymbol`; then references/rename/code
-    actions as follow-ons. (deferred)
-
-Note: hover/completion/go-to-def are all available "for free" from
-`languageServerSupport()` in `@codemirror/lsp-client` — switching from the
-diagnostics-only `serverDiagnostics()` wiring to the full bundle is a small
-change, deferred until the interactive features can be live-tested.
+    setting (default off).
+11. ✅ Hover, 12. ✅ Completion, 13. ✅ Go-to-definition — all wired via the
+    full `languageServerExtensions()` bundle (also brings signature help and the
+    rename / format / find-references keymaps). **Interactive layer not yet
+    live-verified** (needs a Mac GUI); the diagnostics path is proven by the
+    e2e test.
+14. Upgrade symbol outline to `documentSymbol` (deferred); then code actions as
+    follow-ons.
 
 Rationale for the order: Phase 1 (git-aware) is the highest value-per-effort and
 reuses infra we already own. Phase 2 (polish) is low-risk warm-up that hardens

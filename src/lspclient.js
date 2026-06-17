@@ -5,10 +5,10 @@
 //   client.send(msg)  --invoke lsp_send-->  Rust  -->  server stdin
 //   server stdout  -->  Rust  --emit lsp-message-->  transport subscribers
 //
-// Foundation scope: diagnostics only (the empty lint gutter finally gets fed).
-// Hover / completion / go-to-definition are deliberately NOT wired yet — they're
-// the interactive features that need live verification.
-import { LSPClient, serverDiagnostics } from "@codemirror/lsp-client";
+// Full language support: diagnostics (lint gutter), completion, hover tooltips,
+// signature help, and the keymaps for go-to-definition / rename / format /
+// find-references — all bundled by languageServerExtensions().
+import { LSPClient, languageServerExtensions } from "@codemirror/lsp-client";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -74,7 +74,7 @@ async function getClient(language, projectPath) {
     return null;
   }
 
-  const client = new LSPClient({ extensions: [serverDiagnostics()] });
+  const client = new LSPClient({ extensions: languageServerExtensions() });
   client.connect(tauriTransport(serverId));
   const entry = { client, serverId };
   clients.set(key, entry);
@@ -82,9 +82,10 @@ async function getClient(language, projectPath) {
 }
 
 // Build the editor extension that syncs `filePath` with its language server and
-// feeds diagnostics into the lint gutter. Resolves to `[]` when LSP is
-// unavailable for the file (no server, no project, or start failed), so callers
-// can always spread the result into a config.
+// enables the full feature set (diagnostics, completion, hover, signature help,
+// go-to-def / rename / format / find-references keymaps). Resolves to `[]` when
+// LSP is unavailable for the file (no server, no project, or start failed), so
+// callers can always spread the result into a config.
 export async function lspExtensionForFile(filePath, fileName, projectPath) {
   const language = lspLanguageForFile(fileName);
   if (!language || !projectPath) return [];

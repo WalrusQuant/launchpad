@@ -1080,9 +1080,10 @@ async function createEditorTab(filePath, options = {}) {
   // Paint the change gutter from the working-tree-vs-HEAD diff.
   refreshEditorGutter(tab);
 
-  // Wire language-server diagnostics (opt-in). Async: the server connects in
-  // the background and the lint gutter fills in once it does. Guarded so a
-  // closed/replaced tab doesn't get a late reconfigure.
+  // Wire language-server support (opt-in): diagnostics, completion, hover,
+  // go-to-def, etc. Async — the server connects in the background and features
+  // light up once it does. Guarded so a closed/replaced tab doesn't get a late
+  // reconfigure.
   if (getSettings().editorLanguageServer) {
     const projectPath = getActiveProject()?.path;
     lspExtensionForFile(filePath, fileName, projectPath)

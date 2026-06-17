@@ -147,7 +147,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
       </div>
 
       <div class="settings-row">
-        <label class="settings-label" for="set-editorLanguageServer">Language Server (diagnostics)</label>
+        <label class="settings-label" for="set-editorLanguageServer">Language Server</label>
         <label class="settings-toggle">
           <input type="checkbox" id="set-editorLanguageServer" ${settings.editorLanguageServer ? "checked" : ""} />
           <span class="settings-toggle-slider"></span>
