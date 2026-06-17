@@ -23,6 +23,7 @@ import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
 import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE } from "./events.js";
+import { lspExtensionForFile, shutdownAllLsp } from "./lspclient.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -1078,6 +1079,20 @@ async function createEditorTab(filePath, options = {}) {
 
   // Paint the change gutter from the working-tree-vs-HEAD diff.
   refreshEditorGutter(tab);
+
+  // Wire language-server diagnostics (opt-in). Async: the server connects in
+  // the background and the lint gutter fills in once it does. Guarded so a
+  // closed/replaced tab doesn't get a late reconfigure.
+  if (getSettings().editorLanguageServer) {
+    const projectPath = getActiveProject()?.path;
+    lspExtensionForFile(filePath, fileName, projectPath)
+      .then((ext) => {
+        if (tabs.get(uiId) === tab && (!Array.isArray(ext) || ext.length)) {
+          editorHandle.setLspExtension(ext);
+        }
+      })
+      .catch((err) => console.warn("[lsp] wiring failed:", err));
+  }
 
   // Right-click context menu for editor
   editorContent.addEventListener("contextmenu", (e) => {
@@ -3050,6 +3065,10 @@ document.getElementById("back-to-projects").addEventListener("click", async () =
     // when watch_directory failed at init.
     invoke("unwatch_directory", { path: watchedProjectPath || project.path }).catch(() => {});
   }
+
+  // Stop language servers before the reload drops the webview — the Rust-side
+  // registry outlives it, so without this a project switch orphans them.
+  await shutdownAllLsp();
 
   // Full reload resets all module state and triggers boot() → picker.
   setActiveProject(null);

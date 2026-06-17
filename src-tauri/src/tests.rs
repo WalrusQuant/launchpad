@@ -373,6 +373,7 @@ fn test_cherry_pick_rejects_invalid_oid() {
         projects_file_lock: Arc::new(Mutex::new(())),
         project_env_file_lock: Arc::new(Mutex::new(())),
         rebase_state: Arc::new(Mutex::new(None)),
+        lsp_servers: Arc::new(Mutex::new(HashMap::new())),
     };
     // Tauri's State<T> is created via app handle; here we just verify the
     // validator path by calling the command body indirectly. Simplest:
@@ -2011,4 +2012,147 @@ fn test_fs_noise_nested_node_modules() {
         &root.join("packages/foo/node_modules/bar/index.js"),
         &root,
     ));
+}
+
+// ─── LSP message framing ────────────────────────────────────────────────
+#[test]
+fn test_encode_lsp_message_uses_byte_length() {
+    // ASCII: length == char count.
+    let framed = encode_lsp_message("{}");
+    assert_eq!(framed, b"Content-Length: 2\r\n\r\n{}");
+
+    // Non-ASCII: Content-Length must be the BYTE length, not char count.
+    // {"k":"é"} is 9 chars but 10 bytes ("é" is 2 bytes in UTF-8).
+    let body = "{\"k\":\"é\"}";
+    assert_eq!(body.chars().count(), 9);
+    assert_eq!(body.len(), 10);
+    let framed = encode_lsp_message(body);
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    assert!(framed.starts_with(header.as_bytes()));
+}
+
+#[test]
+fn test_read_lsp_message_roundtrip() {
+    let body = "{\"jsonrpc\":\"2.0\",\"id\":1}";
+    let framed = encode_lsp_message(body);
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(framed));
+    let got = read_lsp_message(&mut reader).unwrap();
+    assert_eq!(got.as_deref(), Some(body));
+}
+
+#[test]
+fn test_read_lsp_message_back_to_back() {
+    // Two messages concatenated in one stream must decode as two reads.
+    let mut bytes = encode_lsp_message("{\"a\":1}");
+    bytes.extend(encode_lsp_message("{\"b\":2}"));
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some("{\"a\":1}"));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some("{\"b\":2}"));
+    // Stream exhausted → clean EOF.
+    assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
+}
+
+#[test]
+fn test_read_lsp_message_ignores_extra_headers() {
+    // A Content-Type header (which some servers send) must be skipped.
+    let body = "{\"ok\":true}";
+    let mut framed =
+        format!("Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n", body.len())
+            .into_bytes();
+    framed.extend_from_slice(body.as_bytes());
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(framed));
+    assert_eq!(read_lsp_message(&mut reader).unwrap().as_deref(), Some(body));
+}
+
+#[test]
+fn test_read_lsp_message_clean_eof_on_empty() {
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+    assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
+}
+
+// End-to-end LSP host proof: drive a REAL typescript-language-server through the
+// same framing functions lsp_start/lsp_send use, and assert diagnostics come
+// back for a file with a type error. #[ignore]d because it needs the server
+// binary on disk (not present in CI); run locally with:
+//   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored lsp_e2e
+#[test]
+#[ignore]
+fn test_lsp_e2e_typescript_diagnostics() {
+    use std::io::{BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Locate the server installed under the repo's node_modules.
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin/typescript-language-server");
+    if !bin.exists() {
+        eprintln!("skipping: {} not found", bin.display());
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("bad.ts");
+    std::fs::write(&file, "const x: number = \"not a number\";\n").unwrap();
+    let uri = format!("file://{}", file.display());
+    let root_uri = format!("file://{}", work.path().display());
+
+    let mut child = Command::new(&bin)
+        .arg("--stdio")
+        .current_dir(work.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // Pump messages off a thread so reads can't hang the test.
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let send = |stdin: &mut std::process::ChildStdin, body: String| {
+        stdin.write_all(&encode_lsp_message(&body)).unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"textDocument":{{"synchronization":{{}},"publishDiagnostics":{{}}}}}}}}}}"#
+    ));
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string());
+
+    let text = serde_json::to_string("const x: number = \"not a number\";\n").unwrap();
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"typescript","version":1,"text":{text}}}}}}}"#
+    ));
+
+    // Wait (bounded) for a publishDiagnostics with a non-empty diagnostics array.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut got_diagnostics = false;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(msg) => {
+                if msg.contains("textDocument/publishDiagnostics") {
+                    let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                    let diags = &v["params"]["diagnostics"];
+                    if diags.is_array() && !diags.as_array().unwrap().is_empty() {
+                        got_diagnostics = true;
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    assert!(got_diagnostics, "expected diagnostics from typescript-language-server");
 }

@@ -145,6 +145,14 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
           <span class="settings-toggle-slider"></span>
         </label>
       </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-editorLanguageServer">Language Server (diagnostics)</label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="set-editorLanguageServer" ${settings.editorLanguageServer ? "checked" : ""} />
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -217,6 +225,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   wireCheckbox("editorIndentGuides");
   wireCheckbox("editorFormatOnSave");
   wireCheckbox("editorFollowActiveFile");
+  wireCheckbox("editorLanguageServer");
   wireInput("gitPollInterval", "input", (v) => parseInt(v) || 3);
   wireInput("gitDefaultPrefix", "change", (v) => v);
 
