@@ -385,7 +385,8 @@ pub fn run() {
             unregister_window_label,
             lsp_start,
             lsp_send,
-            lsp_stop
+            lsp_stop,
+            lsp_server_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
