@@ -22,7 +22,11 @@ src/                    # Frontend (JS/CSS/HTML)
   projects.js           # Active project state + thin wrappers around project Tauri commands
   projectpicker.js      # Project picker UI (welcome state / recent list) shown before any workspace exists
   filebrowser.js        # File tree rooted at project.path, context menu, drag & drop, git status colors, CRUD operations
-  editor.js             # CodeMirror factory — creates independent editor instances with search, cursor tracking
+  editor.js             # CodeMirror factory — creates independent editor instances (search, cursor, compartments for live settings)
+  changegutter.js       # Git change gutter — diff-vs-HEAD markers, hunk nav (Alt+J/K), inline revert/stage
+  blamegutter.js        # Opt-in inline blame gutter (short OID + age per commit-hunk)
+  symbols.js            # Symbol outline (Cmd+Shift+O) — syntax tree + LSP documentSymbol
+  lspclient.js          # Language-server client (@codemirror/lsp-client) over a Tauri-IPC transport
   git.js                # Git status polling, file status colors in tree
   gitpanel.js           # Full git panel UI (toolbar, staged/unstaged, commit + amend, branches, history with cherry-pick / rebase-from-here / compare context menu, pending-op banner, conflicts, cheatsheet)
   diffrender.js         # Renders structured diffs (file list + hunks) for the diff tab and commit-detail view
@@ -31,8 +35,14 @@ src/                    # Frontend (JS/CSS/HTML)
   settings.js           # Persistent settings store (~/.launchpad/config.json)
   settingspanel.js      # Settings form UI (General, Terminal, Editor, Git sections)
   styles.css            # All styles (organized by section with comment headers)
-src-tauri/              # Rust backend
-  src/lib.rs            # All Tauri commands (PTY, filesystem, git, settings, projects)
+src-tauri/              # Rust backend — lib.rs is a thin shell; commands live in per-concern modules
+  src/lib.rs            # AppState, event names, run()/invoke_handler, shared helpers (atomic_write)
+  src/pty.rs            # PTY spawn / reader / backpressure
+  src/fs.rs             # Filesystem ops, search, format_file
+  src/git.rs            # All git commands (libgit2 + system git)
+  src/lsp.rs            # Language-server process host + JSON-RPC framing
+  src/{projects,project_env,windows,watcher,settings}.rs
+  src/tests.rs          # Unit + #[ignore]d e2e tests (LSP probes against real servers)
   Cargo.toml            # Rust dependencies
   tauri.conf.json       # App configuration
 index.html              # Main HTML shell — picker-root + workspace-root sibling containers

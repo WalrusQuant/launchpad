@@ -50,7 +50,7 @@
           <li><strong>Rust</strong> — PTY management (<code>portable-pty</code>), filesystem ops, git via <code>git2</code> (libgit2 bindings) plus shelled-out system <code>git</code> for network operations. Filesystem watching via <code>notify</code> (FSEvents on macOS).</li>
           <li><strong>Vanilla JS</strong> — all frontend logic, direct DOM manipulation.</li>
           <li><strong>xterm.js 6</strong> — the terminal emulator, with WebGL renderer and Unicode 11 width tables.</li>
-          <li><strong>CodeMirror 6</strong> — the editor, with syntax highlighting, search, autocompletion, bracket matching, code folding.</li>
+          <li><strong>CodeMirror 6</strong> — the editor: syntax highlighting, search, folding, a git change gutter, blame, and an opt-in language-server client (<code>@codemirror/lsp-client</code>).</li>
           <li><strong>Vite</strong> — frontend bundler.</li>
         </ul>
 
@@ -59,8 +59,12 @@
   main.js             # App entry, tab mgmt, split workspace, panes, shortcuts
   projects.js         # Active project state + project Tauri command wrappers
   projectpicker.js    # Project picker UI (welcome / recents)
-  filebrowser.js      # File tree, context menu, DnD, git colors, CRUD
+  filebrowser.js      # File tree, context menu, DnD, git colors, CRUD, reveal
   editor.js           # CodeMirror factory — creates independent editor instances
+  changegutter.js     # Git change gutter (diff-vs-HEAD markers, hunk nav/revert)
+  blamegutter.js      # Opt-in inline blame gutter
+  symbols.js          # Symbol outline (syntax tree + LSP documentSymbol)
+  lspclient.js        # Language-server client over a Tauri-IPC transport
   git.js              # Git status polling, file status colors, pending-op snapshot
   gitpanel.js         # Full git panel UI (incl. amend, cherry-pick, rebase ctx menu)
   diffrender.js       # Renders structured diffs for the diff tab + commit detail
@@ -70,13 +74,18 @@
   settingspanel.js    # Settings form UI
   styles.css          # All styles, organized by section
 
-src-tauri/            # Rust backend
-  src/lib.rs          # All Tauri commands (PTY, fs, git, settings, projects)
-  Cargo.toml          # Rust deps
-  tauri.conf.json     # App config
+src-tauri/            # Rust backend — lib.rs is a thin shell; commands live in
+  src/lib.rs          #   per-concern modules re-exported into the handler:
+  src/pty.rs          # PTY spawn / reader / backpressure
+  src/fs.rs           # Filesystem ops, search, format_file
+  src/git.rs          # All git commands (libgit2 + system git)
+  src/lsp.rs          # Language-server process host + JSON-RPC framing
+  src/{projects,project_env,windows,watcher,settings}.rs
+  src/tests.rs        # Unit + #[ignore]d e2e tests
+  Cargo.toml          # Rust deps · tauri.conf.json — app config
 
 index.html            # HTML shell — picker-root + workspace-root siblings
-specs/                # Design specs (project model, agent model, etc.)</code></pre>
+specs/                # Design specs (project, editor, agent models)</code></pre>
 
         <h2 id="projects">Projects model</h2>
         <p>
@@ -125,11 +134,13 @@ specs/                # Design specs (project model, agent model, etc.)</code></
 
         <h2 id="tabs">Tab system &amp; split workspace</h2>
         <p>
-          <strong>Unified tab bar.</strong> Terminal tabs, editor tabs, and the
-          settings tab share one tab bar. Each tab has a <code>type</code> field
-          (<code>"terminal"</code>, <code>"editor"</code>, or <code>"settings"</code>)
-          and tab-type guards protect terminal-specific code (fitAllPanes, PTY
-          writes, split panes).
+          <strong>Unified tab bar.</strong> Terminal, editor, and settings tabs
+          share one tab bar with the diff (compare refs), rebase (interactive
+          rebase composer), and merge (3-pane conflict) tabs. Each tab has a
+          <code>type</code> field (<code>"terminal"</code>, <code>"editor"</code>,
+          <code>"settings"</code>, <code>"diff"</code>, <code>"rebase"</code>,
+          <code>"merge"</code>) and tab-type guards protect terminal-specific
+          code (fitAllPanes, PTY writes, split panes).
         </p>
         <p>
           <strong>Split workspace.</strong> <kbd>⌘\</kbd> toggles a vertical
@@ -298,6 +309,14 @@ specs/                # Design specs (project model, agent model, etc.)</code></
           <li><code>git_amend_commit</code>, <code>git_head_on_remote</code>, <code>git_cherry_pick</code> / <code>_continue</code> / <code>_abort</code>, <code>get_pending_op_state</code></li>
           <li><code>get_rebase_candidate_commits</code>, <code>git_rebase_interactive_apply</code>, <code>git_rebase_continue</code> / <code>_skip</code> / <code>_abort</code></li>
           <li><code>get_conflict_versions</code> — libgit2 index stages 1 / 2 / 3 + working tree, powers the 3-pane merge tab</li>
+          <li><code>get_file_diff_vs_head</code>, <code>git_blame_file</code> — back the editor change gutter and blame margin</li>
+        </ul>
+
+        <h3>Language server</h3>
+        <ul>
+          <li><code>lsp_start(project_path, language)</code> — spawn (or reuse) a language server, returns a server id; idempotent</li>
+          <li><code>lsp_send(server_id, message)</code> — frame a JSON-RPC message and write it to the server's stdin</li>
+          <li><code>lsp_stop(server_id)</code> — kill the server and drop its slot. Emits <code>lsp-message</code> / <code>lsp-exit</code> events to the frontend.</li>
         </ul>
 
         <h3>Projects &amp; windows</h3>
