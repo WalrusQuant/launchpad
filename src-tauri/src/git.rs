@@ -31,6 +31,36 @@ pub(crate) struct GitInfo {
     pub(crate) ahead: usize,
     pub(crate) behind: usize,
     pub(crate) has_upstream: bool,
+    // The project path's location relative to the git workdir, as a
+    // "/"-terminated prefix ("" when the project IS the workdir root). git2's
+    // status/index paths are workdir-relative, but the frontend anchors DOM
+    // paths on the *project* path; when a project is opened as a subdirectory
+    // of a larger repo (monorepo, worktree, opening src/ of a repo) the two
+    // diverge by exactly this prefix. The frontend prepends it to convert a
+    // project-relative path to the workdir-relative key git2 uses.
+    pub(crate) subdir: String,
+}
+
+// Compute the project's location relative to the repo workdir as a
+// "/"-terminated prefix, or "" when the project is the workdir root (or the
+// relationship can't be resolved). Both paths are canonicalized so a symlinked
+// project alias doesn't defeat the strip_prefix.
+pub(crate) fn repo_subdir_prefix(repo: &Repository, path: &str) -> String {
+    let Some(workdir) = repo.workdir() else {
+        return String::new();
+    };
+    let (Ok(wd), Ok(proj)) = (
+        std::fs::canonicalize(workdir),
+        std::fs::canonicalize(path),
+    ) else {
+        return String::new();
+    };
+    match proj.strip_prefix(&wd) {
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            format!("{}/", rel.to_string_lossy().replace('\\', "/").trim_end_matches('/'))
+        }
+        _ => String::new(),
+    }
 }
 
 pub(crate) fn get_git_status_inner(path: &str) -> Result<GitInfo, String> {
@@ -44,6 +74,7 @@ pub(crate) fn get_git_status_inner(path: &str) -> Result<GitInfo, String> {
                 ahead: 0,
                 behind: 0,
                 has_upstream: false,
+                subdir: String::new(),
             });
         }
     };
@@ -108,6 +139,7 @@ pub(crate) fn get_git_status_inner(path: &str) -> Result<GitInfo, String> {
         ahead,
         behind,
         has_upstream,
+        subdir: repo_subdir_prefix(&repo, path),
     })
 }
 
@@ -2025,7 +2057,13 @@ pub(crate) async fn get_conflict_versions(path: String, file_path: String) -> Re
         let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
         let index = repo.index().map_err(|e| e.to_string())?;
 
-        let path_bytes = file_path.as_bytes();
+        // file_path arrives project-relative; the index keys paths
+        // workdir-relative. They differ by the subdir prefix when the project is
+        // a subdirectory of the repo, so prepend it before matching index entries
+        // (the working-tree `merged` read below joins the project path + the
+        // project-relative file_path, which is already correct).
+        let workdir_rel = format!("{}{}", repo_subdir_prefix(&repo, &path), file_path);
+        let path_bytes = workdir_rel.as_bytes();
         let mut base = None;
         let mut ours = None;
         let mut theirs = None;

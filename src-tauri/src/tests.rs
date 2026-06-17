@@ -1487,6 +1487,39 @@ fn test_git_status_reports_untracked_as_new() {
 }
 
 #[test]
+fn test_git_status_subdir_empty_at_repo_root() {
+    // When the project IS the repo root, the subdir prefix is empty so the
+    // frontend's project-relative paths already equal git's workdir-relative.
+    let dir = setup_git_repo();
+    let info = get_git_status_inner(&dir.path().to_string_lossy()).unwrap();
+    assert_eq!(info.subdir, "", "repo-root project has no subdir prefix");
+}
+
+#[test]
+fn test_git_status_subdir_for_nested_project() {
+    // A project opened as a SUBDIRECTORY of the repo: Repository::discover walks
+    // up to the repo root, status paths come back workdir-relative
+    // ("frontend/..."), and `subdir` carries the prefix the frontend needs to
+    // convert its project-relative paths. Regression guard for the
+    // monorepo/worktree case where coloring + conflict-mode previously broke.
+    let dir = setup_git_repo();
+    let nested = dir.path().join("frontend");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("app.js"), b"x").unwrap();
+
+    let info = get_git_status_inner(&nested.to_string_lossy()).unwrap();
+    assert!(info.is_repo);
+    assert_eq!(info.subdir, "frontend/", "subdir prefix should be the project's path under the workdir");
+    // The untracked file is reported workdir-relative, so prefix + project-rel
+    // ("frontend/" + "app.js") is what the frontend must match against.
+    assert!(
+        info.files.iter().any(|f| f.path == "frontend/app.js" && f.status == "new"),
+        "nested untracked file should be keyed workdir-relative, got: {:?}",
+        info.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn test_git_status_reports_staged_as_index_new() {
     let dir = setup_git_repo();
     fs::write(dir.path().join("added.txt"), b"x").unwrap();

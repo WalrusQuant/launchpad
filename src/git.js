@@ -4,6 +4,12 @@ const { invoke } = window.__TAURI__.core;
 
 let currentGitInfo = null;
 let currentGitRoot = null;
+// The project path relative to the git workdir ("" when the project IS the repo
+// root). git status/index paths are workdir-relative, but DOM entries are
+// anchored on the project path — when a project is opened as a subdirectory of
+// a larger repo the two differ by this prefix. Prepended to project-relative
+// paths to get the workdir-relative key used in currentGitInfo.files.
+let currentGitSubdir = "";
 let gitPollInterval = null;
 
 // Snapshot of `get_pending_op_state` from the most recent poll. Exposed via
@@ -60,6 +66,7 @@ export async function fetchGitStatus(path) {
   try {
     currentGitInfo = await invoke("get_git_status", { path });
     currentGitRoot = path;
+    currentGitSubdir = currentGitInfo?.subdir || "";
     applyGitColors();
     return currentGitInfo;
   } catch (err) {
@@ -127,7 +134,9 @@ export function applyGitColors() {
 
     const filePath = el.dataset.path;
     if (!filePath || !filePath.startsWith(rootWithSlash)) return;
-    const rel = filePath.slice(rootWithSlash.length);
+    // Project-relative, then prefixed to workdir-relative (no-op when the
+    // project is the repo root, i.e. currentGitSubdir === "").
+    const rel = currentGitSubdir + filePath.slice(rootWithSlash.length);
 
     // First check exact match. Then check if this entry is an ancestor
     // directory of a modified file (so a folder containing modified
@@ -195,7 +204,9 @@ export function getGitFileStatus(filePath) {
   // because this status gates conflict-mode on editor open.
   const rootWithSlash = currentGitRoot.replace(/\/+$/, "") + "/";
   if (!filePath.startsWith(rootWithSlash)) return null;
-  const rel = filePath.slice(rootWithSlash.length);
+  // Project-relative, then prefixed to the workdir-relative key git2 uses
+  // (no-op when the project is the repo root).
+  const rel = currentGitSubdir + filePath.slice(rootWithSlash.length);
   for (const f of currentGitInfo.files) {
     if (f.path === rel) return f.status;
   }
