@@ -15,6 +15,7 @@ export const ACTIONS = [
   { id: "gitPanel",            label: "Toggle git panel",        default: "Cmd+G" },
   { id: "toggleSidebar",       label: "Toggle sidebar",          default: "Cmd+B" },
   { id: "quickOpen",           label: "Quick open file",         default: "Cmd+P" },
+  { id: "gotoSymbol",          label: "Go to symbol in file",    default: "Cmd+Shift+O" },
   { id: "projectFind",         label: "Find in project",         default: "Cmd+Shift+F" },
   { id: "findInEditor",        label: "Find in editor",          default: "Cmd+F" },
   { id: "findReplace",         label: "Find and replace",        default: "Cmd+H" },

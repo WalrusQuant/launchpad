@@ -2247,6 +2247,61 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   text-align: center;
 }
 
+/* ===== Symbol Outline (Cmd+Shift+O) ===== */
+#symbol-outline {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 200;
+  display: none;
+  justify-content: center;
+  padding-top: 80px;
+  pointer-events: none;
+}
+#symbol-outline.visible {
+  display: flex;
+  pointer-events: auto;
+}
+.so-dialog {
+  width: 500px;
+  max-width: 90%;
+  background: var(--surface-8);
+  border: 1px solid var(--border-3);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  max-height: 400px;
+  display: flex;
+  flex-direction: column;
+}
+.so-input {
+  width: 100%;
+  background: var(--surface-8);
+  border: none;
+  border-bottom: 1px solid var(--border-3);
+  color: var(--text-11);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 14px;
+  padding: 14px 16px;
+  outline: none;
+}
+.so-results {
+  overflow-y: auto;
+  max-height: 340px;
+}
+.so-kind {
+  display: inline-block;
+  width: 16px;
+  text-align: center;
+  color: var(--accent-teal);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.so-result .qo-result-dir {
+  margin-left: auto;
+}
+
 /* ===== Project Search (Cmd+Shift+F) ===== */
 #project-search {
   position: fixed;
