@@ -381,9 +381,14 @@ pub(crate) fn collect_structured_diff(diff: &git2::Diff) -> Result<FileDiff, Str
             true
         }),
         Some(&mut |_delta, _hunk, line| {
+            // libgit2 emits a synthetic "\ No newline at end of file" line with an
+            // EOFNL origin ('=', '>', '<'). It carries no real file content — folding
+            // it into a hunk inflates the reconstructed text and breaks length-based
+            // hunk revert (the new-side text no longer matches the buffer). Skip it.
             let origin = match line.origin() {
                 '+' => "add",
                 '-' => "remove",
+                '=' | '>' | '<' => return true,
                 _ => "context",
             }.to_string();
             current_lines.borrow_mut().push(DiffLine {
@@ -457,9 +462,11 @@ pub(crate) fn collect_structured_files_diff(diff: &git2::Diff) -> Result<Vec<Fil
             true
         }),
         Some(&mut |_delta, _hunk, line| {
+            // Skip the synthetic EOFNL marker line (see collect_structured_diff).
             let origin = match line.origin() {
                 '+' => "add",
                 '-' => "remove",
+                '=' | '>' | '<' => return true,
                 _ => "context",
             }.to_string();
             current_lines.borrow_mut().push(DiffLine {

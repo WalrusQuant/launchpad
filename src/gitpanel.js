@@ -3,7 +3,7 @@ import { setPanelTransitioning } from "./main.js";
 import { matches as keyMatches } from "./keymap.js";
 import { buildDiffHtml } from "./diffrender.js";
 import { inFlightOp, setInFlightOp, invokeWithTimeout, getPendingOp } from "./git.js";
-import { PANEL_TRANSITION_DONE } from "./events.js";
+import { PANEL_TRANSITION_DONE, HEAD_MOVED } from "./events.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -439,6 +439,7 @@ async function startAmendFlow(anchorEl, includeStaged) {
       } else {
         showGitFeedback("Amended", "success");
       }
+      window.dispatchEvent(new CustomEvent(HEAD_MOVED));
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
@@ -1300,6 +1301,7 @@ function renderPanel(status, branches, remoteBranches, commits, remoteUrl, stash
     try {
       await invoke("git_commit", { path: currentPath, message: msg });
       showGitFeedback("Committed successfully", "success");
+      window.dispatchEvent(new CustomEvent(HEAD_MOVED));
       await refreshPanel(null, true);
       refreshFileBrowser();
     } catch (err) {
