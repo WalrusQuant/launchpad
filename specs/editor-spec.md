@@ -288,8 +288,11 @@ forward since it's tiny and currently misleading.
     rename / format / find-references keymaps). **Interactive layer not yet
     live-verified** (needs a Mac GUI); the diagnostics path is proven by the
     e2e test.
-14. Upgrade symbol outline to `documentSymbol` (deferred); then code actions as
-    follow-ons.
+14. ✅ Symbol outline upgraded to LSP `documentSymbol`: Cmd+Shift+O opens
+    instantly with syntax-tree symbols, then swaps in the server's richer
+    result when available (`normalizeLspSymbols` handles both hierarchical
+    DocumentSymbol[] and flat SymbolInformation[]). Pure normalizer unit-tested;
+    the request round-trip proven by an e2e probe. Code actions deferred.
 
 Rationale for the order: Phase 1 (git-aware) is the highest value-per-effort and
 reuses infra we already own. Phase 2 (polish) is low-risk warm-up that hardens

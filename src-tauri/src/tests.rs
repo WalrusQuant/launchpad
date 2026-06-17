@@ -2235,6 +2235,98 @@ fn test_lsp_e2e_rust_diagnostics() {
     );
 }
 
+// Proves the documentSymbol round-trip (the request that powers the Cmd+Shift+O
+// outline's LSP upgrade): initialize → didOpen → textDocument/documentSymbol,
+// asserting a non-empty result. Uses the same framing fns the host uses.
+#[test]
+#[ignore]
+fn test_lsp_e2e_typescript_document_symbols() {
+    use std::io::{BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin/typescript-language-server");
+    if !bin.exists() {
+        eprintln!("skipping: {} not found", bin.display());
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("sym.ts");
+    std::fs::write(&file, "function alpha() {}\nclass Beta { gamma() {} }\n").unwrap();
+    let root_uri = format!("file://{}", work.path().display());
+    let uri = format!("file://{}", file.display());
+
+    let mut child = Command::new(&bin)
+        .arg("--stdio")
+        .current_dir(work.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut send = |stdin: &mut std::process::ChildStdin, body: String| {
+        stdin.write_all(&encode_lsp_message(&body)).unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"textDocument":{{"documentSymbol":{{"hierarchicalDocumentSymbolSupport":true}}}}}}}}}}"#
+    ));
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string());
+    let text = serde_json::to_string("function alpha() {}\nclass Beta { gamma() {} }\n").unwrap();
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"typescript","version":1,"text":{text}}}}}}}"#
+    ));
+    send(&mut stdin, format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut got_symbols = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(msg) => {
+                let v: serde_json::Value = match serde_json::from_str(&msg) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v.get("id").is_some() && v.get("method").is_some() {
+                    let id = &v["id"];
+                    send(&mut stdin, format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+                    continue;
+                }
+                if v["id"] == 2 {
+                    let result = &v["result"];
+                    if result.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        got_symbols = true;
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    assert!(got_symbols, "expected documentSymbol result from typescript-language-server");
+}
+
 // Minimal `which`: is `name` resolvable on PATH? Keeps the e2e probes skippable
 // when a server isn't installed.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {

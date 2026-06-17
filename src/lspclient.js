@@ -98,6 +98,28 @@ export async function lspExtensionForFile(filePath, fileName, projectPath) {
   return entry.client.plugin(uri, language);
 }
 
+// Request textDocument/documentSymbol for an open file. Returns the raw LSP
+// result (DocumentSymbol[] or SymbolInformation[]) or null when LSP is
+// unavailable. Only uses an already-connected client — never spawns a server
+// just for the outline (the editor wiring starts one on open when enabled).
+export async function lspDocumentSymbols(filePath, fileName, projectPath) {
+  const language = lspLanguageForFile(fileName);
+  if (!language || !projectPath) return null;
+  const entry = clients.get(`${language}:${projectPath}`);
+  if (!entry || !entry.client) return null;
+  try {
+    await entry.client.initializing;
+    entry.client.sync(); // flush pending edits so positions are current
+    const result = await entry.client.request("textDocument/documentSymbol", {
+      textDocument: { uri: `file://${filePath}` },
+    });
+    return result ?? null;
+  } catch (err) {
+    console.warn("[lsp] documentSymbol failed:", err);
+    return null;
+  }
+}
+
 // Stop every running server and clear the cache. Called on window teardown so
 // project switches (which reload the webview) don't orphan server processes in
 // the Rust-side registry, which outlives the webview.

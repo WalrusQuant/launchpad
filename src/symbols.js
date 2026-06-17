@@ -79,3 +79,69 @@ export function extractSymbols(tree, docText) {
 export function collectSymbols(state) {
   return extractSymbols(syntaxTree(state), state.doc.toString());
 }
+
+// LSP SymbolKind (1-26) → our short label. Unmapped kinds fall back to "symbol".
+const LSP_SYMBOL_KIND = {
+  2: "mod", // Module
+  3: "mod", // Namespace
+  4: "mod", // Package
+  5: "class",
+  6: "method",
+  7: "property",
+  8: "field",
+  9: "method", // Constructor
+  10: "enum",
+  11: "interface",
+  12: "function",
+  13: "variable",
+  14: "constant",
+  22: "enum", // EnumMember
+  23: "struct",
+  26: "type", // TypeParameter
+};
+
+// Flatten an LSP textDocument/documentSymbol result into the same shape the
+// palette uses, but keyed by 0-based line/character (the caller maps those to
+// editor offsets, since that needs the live document). Handles both response
+// forms: hierarchical DocumentSymbol[] (with selectionRange/range + children)
+// and flat SymbolInformation[] (with location). Pure + testable.
+export function normalizeLspSymbols(result) {
+  const out = [];
+  if (!Array.isArray(result)) return out;
+
+  const walk = (nodes, level) => {
+    for (const s of nodes) {
+      if (!s) continue;
+      // SymbolInformation: position lives in location.range.
+      if (s.location && !s.selectionRange && !s.range) {
+        const start = s.location.range && s.location.range.start;
+        if (start) {
+          out.push({
+            name: s.name,
+            kind: LSP_SYMBOL_KIND[s.kind] || "symbol",
+            line: start.line,
+            character: start.character,
+            level: 0,
+          });
+        }
+        continue;
+      }
+      // DocumentSymbol: prefer the selectionRange (the name) over the full range.
+      const range = s.selectionRange || s.range;
+      if (!range || !range.start) continue;
+      out.push({
+        name: s.name,
+        kind: LSP_SYMBOL_KIND[s.kind] || "symbol",
+        line: range.start.line,
+        character: range.start.character,
+        level,
+      });
+      if (Array.isArray(s.children) && s.children.length) {
+        walk(s.children, level + 1);
+      }
+    }
+  };
+
+  walk(result, 0);
+  return out;
+}
