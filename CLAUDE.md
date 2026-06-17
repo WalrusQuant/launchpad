@@ -135,6 +135,18 @@ cargo build --manifest-path src-tauri/Cargo.toml     # Build debug
 cargo test --manifest-path src-tauri/Cargo.toml      # Run Rust tests
 ```
 
+### Frontend tests
+```bash
+npm test                       # Run Vitest once (CI mode)
+npm run test:watch             # Watch mode
+```
+Vitest (jsdom env) covers the pure frontend logic. Tests live next to the
+module as `<name>.test.js` (e.g. `src/conflictmarkers.test.js`). Config in
+`vitest.config.js`, kept separate from `vite.config.js` so the Tauri dev-server
+config doesn't bleed into the test run. Good targets are the framework-free pure
+functions — diff/HTML builders, the conflict-marker parser, path matching —
+rather than DOM-wiring code.
+
 ## Keyboard Shortcuts
 | Shortcut | Action |
 |----------|--------|
