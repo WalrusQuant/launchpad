@@ -148,7 +148,11 @@ export async function refreshPanel(path, force = false, preloadedStatus = null, 
     ]);
     currentPendingOp = pendingOp || { kind: "none" };
 
-    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, stashes, pendingOp });
+    // remoteUrl is part of the rendered output (Repo / Branch / PR buttons), so
+    // it must be in the snapshot — otherwise a `git remote set-url` that changes
+    // nothing else short-circuits the re-render and the buttons keep pointing at
+    // the old host.
+    const snapshot = JSON.stringify({ status, branches, remoteBranches, commits, remoteUrl, stashes, pendingOp });
     if (snapshot === lastSnapshot && !force) return;
     lastSnapshot = snapshot;
 

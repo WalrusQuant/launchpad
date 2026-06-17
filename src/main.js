@@ -2462,9 +2462,16 @@ document.addEventListener("keydown", (e) => {
   if (e.metaKey && e.key >= "1" && e.key <= "9") {
     e.preventDefault();
     const idx = parseInt(e.key) - 1;
-    const tabIds = [...tabs.keys()];
-    if (idx < tabIds.length) {
-      switchTab(tabIds[idx]);
+    // Index into the FOCUSED group's visible tabs, using the same sources the
+    // two tab bars render from (left skips _rightGroup tabs; right is
+    // rightGroupTabIds). The old code indexed the unified map, so Cmd+N could
+    // land on a right-group tab and drive it through switchTab — desyncing the
+    // left/right active tracking.
+    if (isSplit && focusedGroup === "right") {
+      if (idx < rightGroupTabIds.length) switchRightTab(rightGroupTabIds[idx]);
+    } else {
+      const leftIds = [...tabs.entries()].filter(([, t]) => !t._rightGroup).map(([id]) => id);
+      if (idx < leftIds.length) switchTab(leftIds[idx]);
     }
   }
 });
@@ -2525,15 +2532,27 @@ function showDropIndicator(tabBar, insertIndex) {
   }
 }
 
-function reorderTabs(tabsMap, fromKey, toIndex) {
-  const entries = [...tabsMap.entries()];
-  const fromIdx = entries.findIndex(([k]) => k === fromKey);
+// Reorder a left-group tab. `toIndex` is an index into the LEFT bar's visible
+// tabs (which excludes right-group tabs). The old code reordered the full
+// `tabs` map using a fromIdx computed against ALL entries but a toIndex in the
+// left-only space — the two index spaces diverge whenever a right-group tab
+// sits earlier in the map, dropping the tab at the wrong position. This
+// permutes only the left tabs among their own map slots and leaves right-group
+// entries exactly where they are.
+function reorderLeftTab(fromKey, toIndex) {
+  const entries = [...tabs.entries()];
+  const leftPositions = [];
+  entries.forEach(([, t], i) => { if (!t._rightGroup) leftPositions.push(i); });
+  const leftOrder = leftPositions.map((i) => entries[i]);
+  const fromIdx = leftOrder.findIndex(([k]) => k === fromKey);
   if (fromIdx === -1 || fromIdx === toIndex) return;
-  const [entry] = entries.splice(fromIdx, 1);
+  const [moved] = leftOrder.splice(fromIdx, 1);
   if (toIndex > fromIdx) toIndex--;
-  entries.splice(toIndex, 0, entry);
-  tabsMap.clear();
-  entries.forEach(([k, v]) => tabsMap.set(k, v));
+  leftOrder.splice(toIndex, 0, moved);
+  // Write the reordered left tabs back into the same slots they occupied.
+  leftPositions.forEach((pos, j) => { entries[pos] = leftOrder[j]; });
+  tabs.clear();
+  entries.forEach(([k, v]) => tabs.set(k, v));
 }
 
 function startTabDrag(tabEl, uiId, sourceGroup, e) {
@@ -2599,7 +2618,7 @@ function startTabDrag(tabEl, uiId, sourceGroup, e) {
           const leftEntries = [...tabs.entries()].filter(([, t]) => !t._rightGroup);
           const fromIdx = leftEntries.findIndex(([k]) => k === uiId);
           if (fromIdx !== -1 && fromIdx !== insertIdx) {
-            reorderTabs(tabs, uiId, insertIdx);
+            reorderLeftTab(uiId, insertIdx);
             renderTabBar();
           }
         } else {
