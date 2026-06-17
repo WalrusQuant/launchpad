@@ -1,5 +1,20 @@
 # Launchpad Built-in Coding Agent — Technical Spec
 
+> **Status: DECLINED for the Launchpad app (2026-06) — archived design doc.**
+>
+> Launchpad will **not** ship a native in-app agent. The decision: a built-in
+> agent blurs the product's single clear idea — *"the home where you run CLI
+> coding agents"* — and would commit the project to indefinitely competing with
+> the very agents it hosts (Claude Code, Aider, …), on their turf, while the
+> actual edge (the terminal-first workspace) stagnates. Launchpad's role is to
+> be the best *host* for CLI agents, not to be one.
+>
+> This document is kept as-is for its design work, which may be ported to a
+> **separate standalone agent repo (`launchpad-agent`)** where a CLI coding
+> agent is the whole point. Nothing below is on the Launchpad app's roadmap.
+> For what Launchpad *does* do around agents (hosting, tab labeling, status
+> indicators), see the "Agent Strategy" section of `specs/project-model-spec.md`.
+
 ## Context
 
 Launchpad is a terminal-first Tauri v2 desktop workspace. The user wants a built-in coding agent — not a wrapper around an external CLI, but a native feature that deeply integrates with the file browser, editor tabs, git panel, and terminal. We're using the architecture of [claw-code-rust](https://github.com/7df-lab/claw-code-rust) (MIT, Rust coding agent) as a reference for the hard parts: agentic loop, patch application, provider abstraction, token management.
