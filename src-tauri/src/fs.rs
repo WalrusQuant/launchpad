@@ -359,6 +359,68 @@ pub(crate) async fn write_file(path: String, content: String) -> Result<(), Stri
     .await
 }
 
+// Map a file extension to a formatter binary and its in-place rewrite flags.
+// Formatters are user-installed and resolved on PATH; None means "no formatter
+// for this type" (a silent no-op, not an error). The file path is appended as
+// the final argument by the caller.
+fn formatter_for(ext: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match ext {
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "json" | "css" | "scss" | "html" | "htm"
+        | "md" | "mdx" | "yaml" | "yml" => Some(("prettier", &["--write"])),
+        "rs" => Some(("rustfmt", &[])),
+        "py" => Some(("black", &["-q"])),
+        "go" => Some(("gofmt", &["-w"])),
+        "sh" | "bash" => Some(("shfmt", &["-w"])),
+        _ => None,
+    }
+}
+
+// Run the configured formatter for `file_path` in place, with `project_path` as
+// the working directory so the formatter can discover project config
+// (.prettierrc, rustfmt.toml, …). Returns:
+//   Ok(None)          — no formatter for this file type (caller stays silent)
+//   Ok(Some(content)) — formatted; the new on-disk content
+//   Err(msg)          — formatter missing on PATH or exited non-zero
+#[tauri::command]
+pub(crate) async fn format_file(project_path: String, file_path: String) -> Result<Option<String>, String> {
+    blocking(move || {
+        let ext = std::path::Path::new(&file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let Some((cmd, pre_args)) = formatter_for(&ext) else {
+            return Ok(None);
+        };
+
+        let output = std::process::Command::new(cmd)
+            .args(pre_args)
+            .arg(&file_path)
+            .current_dir(&project_path)
+            .output();
+
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("{cmd} not found on PATH — install it or disable format-on-save"));
+            }
+            Err(e) => return Err(format!("Failed to run {cmd}: {e}")),
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = stderr.lines().next().unwrap_or("formatter failed").to_string();
+            return Err(format!("{cmd}: {msg}"));
+        }
+
+        // The formatter rewrote the file in place — hand back the new content so
+        // the editor can sync its buffer without a second read round-trip.
+        let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+        Ok(Some(content))
+    })
+    .await
+}
+
 #[tauri::command]
 pub(crate) async fn create_file(path: String) -> Result<(), String> {
     blocking(move || {

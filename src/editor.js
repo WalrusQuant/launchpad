@@ -21,6 +21,7 @@ import { vim } from "@replit/codemirror-vim";
 import { conflictExtension } from "./conflictmarkers.js";
 import { changeGutter } from "./changegutter.js";
 import { blameField, blameGutterView, setBlame } from "./blamegutter.js";
+import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 
 const langMap = {
   js: javascript,
@@ -157,17 +158,26 @@ const fontSizeTheme = (px) => EditorView.theme({ "&": { fontSize: `${px}px` } })
 
 const DEFAULT_FONT_SIZE = 12;
 
+// Optional visual extensions toggled live via a compartment. Kept in one place
+// so a single reconfigure (setVisualExtras on the handle) can flip any of them.
+function buildVisualExtras({ indentGuides } = {}) {
+  const ext = [];
+  if (indentGuides) ext.push(indentationMarkers({ hideFirstIndent: true, highlightActiveBlock: true }));
+  return ext;
+}
+
 /**
  * Create a CodeMirror editor instance.
  * Returns { view, setTabSize, setWordWrap, setFontSize } — caller owns the
  * view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter, onGutterMarkerClick } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter, onGutterMarkerClick, visualExtras } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
   const fontSizeCompartment = new Compartment();
   const blameCompartment = new Compartment();
+  const visualExtrasCompartment = new Compartment();
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
@@ -212,6 +222,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
     fontSizeCompartment.of(fontSizeTheme(fontSize || DEFAULT_FONT_SIZE)),
+    visualExtrasCompartment.of(buildVisualExtras(visualExtras || {})),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());
@@ -256,6 +267,9 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
       view.dispatch({
         effects: [blameCompartment.reconfigure([]), setBlame.of(null)],
       });
+    },
+    setVisualExtras(flags) {
+      view.dispatch({ effects: visualExtrasCompartment.reconfigure(buildVisualExtras(flags || {})) });
     },
   };
 }

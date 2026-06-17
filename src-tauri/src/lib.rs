@@ -326,6 +326,7 @@ pub fn run() {
             create_directory,
             delete_path,
             rename_path,
+            format_file,
             get_file_inode,
             find_path_by_inode,
             get_file_diff,

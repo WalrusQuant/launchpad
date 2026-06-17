@@ -8,7 +8,7 @@ import { updateChangeGutter } from "./changegutter.js";
 import { deriveLineChanges } from "./changegutter.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
+import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser, revealPath } from "./filebrowser.js";
 import { fetchGitStatus, startGitPolling, getGitFileStatus, setInFlightOp, toRepoRelativePath } from "./git.js";
 import { parseConflictBlocks } from "./conflictmarkers.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
@@ -528,6 +528,10 @@ function switchTab(uiId) {
     // HEAD may have moved while away (staged/committed in the git panel) —
     // recompute the change gutter on focus.
     refreshEditorGutter(tab);
+    // Optionally sync the file tree to the now-active file.
+    if (getSettings().editorFollowActiveFile && tab.filePath) {
+      revealPath(tab.filePath);
+    }
   } else if (tab.type === "merge") {
     setTimeout(() => tab.mergedView.focus(), 10);
   }
@@ -932,6 +936,7 @@ async function createEditorTab(filePath, options = {}) {
     conflictMode,
     gitGutter: true,
     onGutterMarkerClick: (view, lineNo, event) => showHunkMenu(tab, view, lineNo, event),
+    visualExtras: { indentGuides: editorSettings.editorIndentGuides },
     // Phase 6: when a conflict block's [Open 3-Way] button is clicked, we
     // open the dedicated 3-pane merge tab for this file. Only wired when
     // the file is actually conflicted — otherwise the button never renders.
@@ -1896,7 +1901,32 @@ async function saveEditorTab(uiId) {
       content = content.replace(/\r?\n/g, "\r\n");
     }
     await invoke("write_file", { path: tab.filePath, content });
-    tab.originalContent = rawContent;
+
+    // Format on save (opt-in): the formatter rewrites the file in place; sync
+    // the buffer to its output. Best-effort — a missing formatter or a format
+    // error toasts but doesn't fail the save (the file is already written).
+    let savedContent = rawContent;
+    if (getSettings().editorFormatOnSave) {
+      try {
+        const formatted = await invoke("format_file", {
+          projectPath: getActiveProject()?.path || "",
+          filePath: tab.filePath,
+        });
+        if (formatted != null && formatted !== rawContent) {
+          const view = tab.editorView;
+          const caret = Math.min(view.state.selection.main.head, formatted.length);
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: formatted },
+            selection: { anchor: caret },
+          });
+          savedContent = formatted;
+        }
+      } catch (err) {
+        showToast(`Format on save: ${err}`, "error");
+      }
+    }
+
+    tab.originalContent = savedContent;
     tab.modified = false;
     renderTabBar();
     // Disk now differs from HEAD by the just-saved content — repaint the gutter.
@@ -1994,6 +2024,13 @@ function applySettingLive(key, value) {
       } else if (tab.type === "merge" && tab.editorHandles) {
         for (const h of tab.editorHandles) h.setFontSize(value);
       }
+    }
+  }
+
+  if (key === "editorIndentGuides") {
+    const flags = { indentGuides: value };
+    for (const tab of tabs.values()) {
+      if (tab.type === "editor" && tab.editorHandle) tab.editorHandle.setVisualExtras(flags);
     }
   }
 

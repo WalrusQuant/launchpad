@@ -121,6 +121,30 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
           <span class="settings-toggle-slider"></span>
         </label>
       </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-editorIndentGuides">Indent Guides</label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="set-editorIndentGuides" ${settings.editorIndentGuides ? "checked" : ""} />
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-editorFormatOnSave">Format on Save</label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="set-editorFormatOnSave" ${settings.editorFormatOnSave ? "checked" : ""} />
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="set-editorFollowActiveFile">Reveal Active File in Tree</label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="set-editorFollowActiveFile" ${settings.editorFollowActiveFile ? "checked" : ""} />
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -190,6 +214,9 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   wireInput("editorTabSize", "change", (v) => parseInt(v) || 2);
   wireCheckbox("editorWordWrap");
   wireCheckbox("editorVimMode");
+  wireCheckbox("editorIndentGuides");
+  wireCheckbox("editorFormatOnSave");
+  wireCheckbox("editorFollowActiveFile");
   wireInput("gitPollInterval", "input", (v) => parseInt(v) || 3);
   wireInput("gitDefaultPrefix", "change", (v) => v);
 
