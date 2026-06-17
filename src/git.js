@@ -87,7 +87,23 @@ const GIT_STATUS_BADGE = {
   index_renamed: "R",
 };
 
-function applyGitColors() {
+// Severity ranking for folder rollup: when a directory has no exact status of
+// its own, it inherits the MOST important status among its descendants. Higher
+// wins. Without this the rollup took the first child git happened to list, so
+// a conflict could be silently masked by a modified sibling.
+const GIT_STATUS_SEVERITY = {
+  conflict: 6,
+  deleted: 5,
+  index_deleted: 5,
+  modified: 4,
+  index_modified: 4,
+  renamed: 3,
+  index_renamed: 3,
+  new: 2,
+  index_new: 1,
+};
+
+export function applyGitColors() {
   if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return;
 
   // Map of git-relative-path → status
@@ -120,11 +136,17 @@ function applyGitColors() {
     // files in sibling trees (src/foo.js vs lib/foo.js).
     let matched = statusMap.get(rel);
     if (!matched) {
+      // Roll up the highest-severity descendant status, not the first one git
+      // listed — otherwise a conflict can be masked by a modified sibling.
       const relWithSlash = rel + "/";
+      let bestSeverity = 0;
       for (const [gitPath, status] of statusMap) {
         if (gitPath.startsWith(relWithSlash)) {
-          matched = status;
-          break;
+          const sev = GIT_STATUS_SEVERITY[status] || 0;
+          if (sev > bestSeverity) {
+            bestSeverity = sev;
+            matched = status;
+          }
         }
       }
     }

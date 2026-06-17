@@ -11,6 +11,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
+// Poison-tolerant mutex locking. A thread panicking while holding one of our
+// process-lifetime mutexes (git op slots, rebase state, the SSH-sock cache)
+// would poison it, and a plain `.lock().unwrap()` then turns that one-off
+// panic into a permanent app-wide wedge — every later git op panics on lock.
+// None of these mutexes guard an invariant that a panic could leave half-built
+// (they hold maps/options of owned data), so recovering the inner value is
+// safe and strictly better than cascading panics. `into_inner()` reclaims the
+// guard from the poison error.
+trait MutexExt<T> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 async fn blocking<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -76,6 +93,12 @@ struct AppState {
     // Serializes read→mutate→write of ~/.launchpad/projects.json so concurrent
     // commands (e.g. two windows both hitting add_project) can't lose updates.
     projects_file_lock: Arc<Mutex<()>>,
+    // Same guarantee for ~/.launchpad/project-env.json. atomic_write makes each
+    // write atomic but does nothing for the read-modify-write race: two windows
+    // saving env for different projects concurrently could interleave and drop
+    // one project's entire secret set. Held across read→mutate→write in
+    // save_project_env_vars / forget_project_env.
+    project_env_file_lock: Arc<Mutex<()>>,
     // Active interactive rebase state. Set by git_rebase_interactive_apply
     // before spawn; consulted by abort/continue/skip for cleanup. None when
     // no rebase is in progress (or one was leaked across an app restart —
@@ -893,7 +916,13 @@ fn remove_project(path: String, state: State<AppState>) -> Result<(), String> {
     write_projects_file(&projects)?;
     // Best-effort: drop stored env vars for this project too. Deleting a project
     // is an explicit act; leaving the secrets behind would be a privacy leak.
-    let _ = forget_project_env(path);
+    // Acquire the env-file lock for the read-modify-write (distinct file, distinct
+    // lock). Ordering is always projects_file_lock → project_env_file_lock here
+    // and nowhere the reverse, so no deadlock.
+    {
+        let _eguard = state.project_env_file_lock.lock_safe();
+        let _ = forget_project_env_locked(&path);
+    }
     Ok(())
 }
 
@@ -1018,17 +1047,12 @@ fn load_project_env_vars(path: String) -> Result<Vec<ProjectEnvVar>, String> {
     Ok(store.get(&key).cloned().unwrap_or_default())
 }
 
-#[tauri::command]
-fn save_project_env_vars(path: String, vars: Vec<ProjectEnvVar>) -> Result<(), String> {
-    for v in &vars {
-        if !is_valid_env_key(&v.key) {
-            return Err(format!(
-                "Invalid env var name: {:?} (must match [A-Za-z_][A-Za-z0-9_]*)",
-                v.key
-            ));
-        }
-    }
-    let key = normalize_project_path(&path);
+// Read-modify-write of project-env.json. The caller MUST hold
+// project_env_file_lock — these do no locking themselves so that
+// remove_project (which already needs to mutate env under the lock) and the
+// command wrappers share one implementation.
+fn save_project_env_vars_locked(path: &str, vars: Vec<ProjectEnvVar>) -> Result<(), String> {
+    let key = normalize_project_path(path);
     let mut store = read_project_env_file().unwrap_or_default();
     if vars.is_empty() {
         store.remove(&key);
@@ -1038,9 +1062,8 @@ fn save_project_env_vars(path: String, vars: Vec<ProjectEnvVar>) -> Result<(), S
     write_project_env_file(&store)
 }
 
-#[tauri::command]
-fn forget_project_env(path: String) -> Result<(), String> {
-    let key = normalize_project_path(&path);
+fn forget_project_env_locked(path: &str) -> Result<(), String> {
+    let key = normalize_project_path(path);
     let mut store = match read_project_env_file() {
         Ok(s) => s,
         // Missing / unparseable file → nothing to forget. Don't propagate.
@@ -1050,6 +1073,32 @@ fn forget_project_env(path: String) -> Result<(), String> {
         write_project_env_file(&store)?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn save_project_env_vars(
+    path: String,
+    vars: Vec<ProjectEnvVar>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    for v in &vars {
+        if !is_valid_env_key(&v.key) {
+            return Err(format!(
+                "Invalid env var name: {:?} (must match [A-Za-z_][A-Za-z0-9_]*)",
+                v.key
+            ));
+        }
+    }
+    // Hold the lock across read→mutate→write so two windows saving env for
+    // different projects can't interleave and drop one's entire secret set.
+    let _guard = state.project_env_file_lock.lock_safe();
+    save_project_env_vars_locked(&path, vars)
+}
+
+#[tauri::command]
+fn forget_project_env(path: String, state: State<AppState>) -> Result<(), String> {
+    let _guard = state.project_env_file_lock.lock_safe();
+    forget_project_env_locked(&path)
 }
 
 // Recursive file search for quick open
@@ -1426,16 +1475,16 @@ async fn delete_path(path: String, project_root: Option<String>) -> Result<(), S
     // delete of node_modules/) can take seconds and would otherwise block
     // the IPC dispatch thread.
     blocking(move || {
-        // When a project_root is supplied, refuse deletions outside it. The
-        // context menu is the only caller today and always passes this, so in
-        // practice nothing unguarded reaches remove_dir_all. Cheap defense
-        // against a future caller handing an arbitrary path.
-        if let Some(root) = project_root {
-            let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
-            let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
-            if !target.starts_with(&root_canon) {
-                return Err("Refusing to delete path outside project root".into());
-            }
+        // Refuse any deletion not proven to be inside a project root. Every
+        // caller (the file-browser context menu) passes project_root, so a
+        // missing root means an unexpected/foreign caller — refuse rather than
+        // reach remove_dir_all unguarded. With a root, the target must canonicalize
+        // to a path inside it.
+        let root = project_root.ok_or("Refusing to delete: no project root supplied")?;
+        let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
+        let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+        if !target.starts_with(&root_canon) {
+            return Err("Refusing to delete path outside project root".into());
         }
         let p = std::path::Path::new(&path);
         if p.is_dir() {
@@ -1960,7 +2009,7 @@ static SSH_AUTH_SOCK_CACHE: Mutex<Option<(Option<String>, Instant)>> = Mutex::ne
 const SSH_AUTH_SOCK_NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 fn resolve_ssh_auth_sock() -> Option<String> {
-    let mut guard = SSH_AUTH_SOCK_CACHE.lock().unwrap();
+    let mut guard = SSH_AUTH_SOCK_CACHE.lock_safe();
     if let Some((cached, at)) = guard.as_ref() {
         if cached.is_some() || at.elapsed() < SSH_AUTH_SOCK_NEGATIVE_TTL {
             return cached.clone();
@@ -2032,7 +2081,7 @@ fn spawn_git_under_slot(
     let pid = child.id();
 
     let kill_now = {
-        let mut guard = slots.lock().unwrap();
+        let mut guard = slots.lock_safe();
         match guard.get_mut(label) {
             Some(s) if s.op_id == op_id => {
                 s.pid = Some(pid);
@@ -2054,7 +2103,7 @@ fn spawn_git_under_slot(
     // another spawn under the same reservation (git_push's auto-upstream
     // retry does this), and we want the shared `cancelled` flag to persist.
     {
-        let mut guard = slots.lock().unwrap();
+        let mut guard = slots.lock_safe();
         if let Some(s) = guard.get_mut(label) {
             if s.op_id == op_id {
                 s.pid = None;
@@ -2086,7 +2135,7 @@ fn run_git_cancellable(
     // spawn() and PID-record, it sets `cancelled=true` on our slot, which
     // spawn_git_under_slot observes and acts on by killing the child.
     let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    slots.lock().unwrap().insert(
+    slots.lock_safe().insert(
         label.to_string(),
         GitOpSlot {
             op_id,
@@ -2101,7 +2150,7 @@ fn run_git_cancellable(
     // in the same window may already have replaced it — in that case leave
     // it alone.
     {
-        let mut guard = slots.lock().unwrap();
+        let mut guard = slots.lock_safe();
         if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
                 guard.remove(label);
@@ -2149,7 +2198,7 @@ async fn git_push(
         // shared reservation, the cancelled flag persists and the retry's child
         // is killed as soon as it's spawned.
         let op_id = counter.fetch_add(1, Ordering::SeqCst);
-        slots.lock().unwrap().insert(
+        slots.lock_safe().insert(
             label.to_string(),
             GitOpSlot {
                 op_id,
@@ -2175,7 +2224,7 @@ async fn git_push(
 
         // Release the reservation.
         {
-            let mut guard = slots.lock().unwrap();
+            let mut guard = slots.lock_safe();
             if let Some(s) = guard.get(&label) {
                 if s.op_id == op_id {
                     guard.remove(&label);
@@ -2227,7 +2276,7 @@ async fn git_fetch(
 // newer op's registration. The cancelled flag persists so a still-spawning
 // op can observe it after recording its PID.
 fn cancel_git_op_inner(slots: &Mutex<GitOpSlots>, label: &str) -> Option<u32> {
-    let mut guard = slots.lock().unwrap();
+    let mut guard = slots.lock_safe();
     if let Some(slot) = guard.get_mut(label) {
         slot.cancelled = true;
         return slot.pid;
@@ -2806,7 +2855,7 @@ async fn git_rebase_interactive_apply(
         // refuses if our own AppState already has a rebase registered (i.e.
         // an earlier attempt is paused mid-conflict).
         let (backup_tag, state_dir) = {
-            let mut guard = rebase_state.lock().unwrap();
+            let mut guard = rebase_state.lock_safe();
             if guard.is_some() || rebase_in_progress(&path) {
                 return Err("A rebase is already in progress — abort or continue it before starting a new one".into());
             }
@@ -2857,7 +2906,7 @@ async fn git_rebase_interactive_apply(
                 // Clean completion — drop the state dir, KEEP the backup tag
                 // (user-visible safety net surfaced in the success toast).
                 cleanup_rebase_state_dir(&state_dir);
-                *rebase_state.lock().unwrap() = None;
+                *rebase_state.lock_safe() = None;
                 Ok(RebaseResult {
                     ok: true,
                     stopped_at: None,
@@ -2870,7 +2919,7 @@ async fn git_rebase_interactive_apply(
                 // Terminal failure — clean up everything we created.
                 cleanup_rebase_state_dir(&state_dir);
                 delete_rebase_backup_tag(&path, &backup_tag);
-                *rebase_state.lock().unwrap() = None;
+                *rebase_state.lock_safe() = None;
                 Err(err)
             }
         }
@@ -2910,7 +2959,7 @@ fn spawn_rebase(
     // overrides. Instead replicate its slot reservation pattern around a
     // bespoke spawn that sets the editor envs.
     let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    slots.lock().unwrap().insert(
+    slots.lock_safe().insert(
         label.to_string(),
         GitOpSlot {
             op_id,
@@ -2944,7 +2993,7 @@ fn spawn_rebase(
         let pid = child.id();
 
         let kill_now = {
-            let mut guard = slots.lock().unwrap();
+            let mut guard = slots.lock_safe();
             match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
@@ -2960,7 +3009,7 @@ fn spawn_rebase(
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
         {
-            let mut guard = slots.lock().unwrap();
+            let mut guard = slots.lock_safe();
             if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
@@ -2976,7 +3025,7 @@ fn spawn_rebase(
     })();
 
     {
-        let mut guard = slots.lock().unwrap();
+        let mut guard = slots.lock_safe();
         if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
                 guard.remove(label);
@@ -2991,7 +3040,7 @@ fn spawn_rebase(
 // `delete_tag` controls whether the backup tag is also removed (true on
 // abort; false on clean continue/skip — the tag is the user's safety net).
 fn finalize_rebase(rebase_state: &Arc<Mutex<Option<RebaseStateInfo>>>, repo_path: &str, delete_tag: bool) {
-    let info = rebase_state.lock().unwrap().take();
+    let info = rebase_state.lock_safe().take();
     if let Some(info) = info {
         cleanup_rebase_state_dir(&info.state_dir);
         if delete_tag {
@@ -3011,9 +3060,9 @@ fn run_git_with_rebase_env(
     // Rebase --continue/--skip may invoke commit_editor.sh again (for the
     // next reword/squash entry), so we have to keep the env vars set.
     // Replicate run_git_cancellable's slot pattern with the env overrides.
-    let info = rebase_state.lock().unwrap().clone();
+    let info = rebase_state.lock_safe().clone();
     let op_id = counter.fetch_add(1, Ordering::SeqCst);
-    slots.lock().unwrap().insert(
+    slots.lock_safe().insert(
         label.to_string(),
         GitOpSlot {
             op_id,
@@ -3042,7 +3091,7 @@ fn run_git_with_rebase_env(
         let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         let kill_now = {
-            let mut guard = slots.lock().unwrap();
+            let mut guard = slots.lock_safe();
             match guard.get_mut(label) {
                 Some(s) if s.op_id == op_id => {
                     s.pid = Some(pid);
@@ -3057,7 +3106,7 @@ fn run_git_with_rebase_env(
 
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
         {
-            let mut guard = slots.lock().unwrap();
+            let mut guard = slots.lock_safe();
             if let Some(s) = guard.get_mut(label) {
                 if s.op_id == op_id {
                     s.pid = None;
@@ -3073,7 +3122,7 @@ fn run_git_with_rebase_env(
     })();
 
     {
-        let mut guard = slots.lock().unwrap();
+        let mut guard = slots.lock_safe();
         if let Some(s) = guard.get(label) {
             if s.op_id == op_id {
                 guard.remove(label);
@@ -3201,7 +3250,7 @@ async fn git_rebase_abort(
             finalize_rebase(&rebase_state, &path, /*delete_tag=*/ true);
         } else {
             // Best-effort: clean the state dir without removing the tag.
-            let info = rebase_state.lock().unwrap().take();
+            let info = rebase_state.lock_safe().take();
             if let Some(info) = info {
                 cleanup_rebase_state_dir(&info.state_dir);
             }
@@ -3224,6 +3273,21 @@ struct ConflictVersions {
     ours: Option<String>,
     theirs: Option<String>,
     merged: Option<String>,
+}
+
+// True when `p` is a repo-relative path that stays inside the repo: not
+// absolute and with no `..` components. libgit2 always hands us such paths,
+// but get_conflict_versions is IPC-reachable with arbitrary args, so we guard
+// the working-tree read against `../../etc/passwd`-style escapes before
+// joining onto the repo root.
+fn is_safe_relative_path(p: &str) -> bool {
+    use std::path::Component;
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 // Reads index stages 1 (base), 2 (ours), 3 (theirs) for a conflicted file
@@ -3266,8 +3330,16 @@ async fn get_conflict_versions(path: String, file_path: String) -> Result<Confli
             }
         }
 
-        let abs_path = std::path::Path::new(&path).join(&file_path);
-        let merged = std::fs::read_to_string(&abs_path).ok();
+        // Only read the working tree for a contained relative path. A traversal
+        // or absolute file_path would have matched no index entry above (libgit2
+        // stores normalized repo-relative paths), so base/ours/theirs are
+        // already None; we just refuse to leak an out-of-repo file as `merged`.
+        let merged = if is_safe_relative_path(&file_path) {
+            let abs_path = std::path::Path::new(&path).join(&file_path);
+            std::fs::read_to_string(&abs_path).ok()
+        } else {
+            None
+        };
 
         Ok(ConflictVersions { base, ours, theirs, merged })
     })
@@ -3894,6 +3966,7 @@ pub fn run() {
         git_op_counter: Arc::new(AtomicU64::new(0)),
         project_windows: Arc::new(Mutex::new(HashMap::new())),
         projects_file_lock: Arc::new(Mutex::new(())),
+        project_env_file_lock: Arc::new(Mutex::new(())),
         rebase_state: Arc::new(Mutex::new(None)),
     };
 
@@ -4382,6 +4455,7 @@ mod tests {
             git_op_counter: Arc::new(AtomicU64::new(0)),
             project_windows: Arc::new(Mutex::new(HashMap::new())),
             projects_file_lock: Arc::new(Mutex::new(())),
+            project_env_file_lock: Arc::new(Mutex::new(())),
             rebase_state: Arc::new(Mutex::new(None)),
         };
         // Tauri's State<T> is created via app handle; here we just verify the
@@ -5008,16 +5082,30 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_path_no_guard_when_root_is_none() {
-        // When the caller doesn't pass project_root the guard is opt-out.
-        // Confirm that's what actually happens — proves the existing
-        // non-context-menu callers haven't accidentally been gated.
+    fn test_is_safe_relative_path() {
+        // Contained relative paths are allowed...
+        assert!(is_safe_relative_path("src/main.rs"));
+        assert!(is_safe_relative_path("a/b/c.txt"));
+        assert!(is_safe_relative_path("./file.txt"));
+        assert!(is_safe_relative_path("file.txt"));
+        // ...absolute and traversal paths are refused (the merge-tab read guard).
+        assert!(!is_safe_relative_path("/etc/passwd"));
+        assert!(!is_safe_relative_path("../secrets"));
+        assert!(!is_safe_relative_path("a/../../b"));
+        assert!(!is_safe_relative_path("../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_delete_path_refuses_when_root_is_none() {
+        // A delete with no project_root is refused outright — every real caller
+        // (the file-browser context menu) passes one, so a missing root means
+        // an unexpected/foreign caller. The target must survive untouched.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("file.txt");
         fs::write(&target, b"x").unwrap();
         let result = tauri::async_runtime::block_on(delete_path(target.to_string_lossy().to_string(), None));
-        assert!(result.is_ok());
-        assert!(!target.exists());
+        assert!(result.is_err(), "expected refusal, got: {:?}", result);
+        assert!(target.exists(), "guard must not delete the target");
     }
 
     #[test]
@@ -5122,7 +5210,7 @@ mod tests {
         let store: Mutex<GitOpSlots> = Mutex::new(GitOpSlots::new());
         let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, None);
-        assert!(store.lock().unwrap().is_empty());
+        assert!(store.lock_safe().is_empty());
     }
 
     #[test]
@@ -5138,7 +5226,7 @@ mod tests {
         let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, None, "no PID to kill yet");
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock_safe();
         let slot = guard.get("main").expect("slot must NOT be cleared");
         assert!(slot.cancelled, "flag must be set so spawn-window cancel survives");
         assert_eq!(slot.op_id, 42, "op_id must be preserved");
@@ -5153,7 +5241,7 @@ mod tests {
         });
         let pid = cancel_git_op_inner(&store, "main");
         assert_eq!(pid, Some(99999), "caller needs the PID to kill");
-        assert!(store.lock().unwrap().get("main").unwrap().cancelled);
+        assert!(store.lock_safe().get("main").unwrap().cancelled);
     }
 
     #[test]
@@ -5166,7 +5254,7 @@ mod tests {
         });
         assert_eq!(cancel_git_op_inner(&store, "main"), Some(123));
         assert_eq!(cancel_git_op_inner(&store, "main"), Some(123));
-        let guard = store.lock().unwrap();
+        let guard = store.lock_safe();
         let slot = guard.get("main").unwrap();
         assert!(slot.cancelled);
         assert_eq!(slot.pid, Some(123));
@@ -5184,7 +5272,7 @@ mod tests {
         });
         cancel_git_op_inner(&store, "main");
         assert!(
-            store.lock().unwrap().contains_key("main"),
+            store.lock_safe().contains_key("main"),
             "cancel must not wipe slot — cleanup is the spawning op's job"
         );
     }
@@ -5209,7 +5297,7 @@ mod tests {
         let pid = cancel_git_op_inner(&store, "window-a");
         assert_eq!(pid, Some(1111));
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock_safe();
         assert!(guard.get("window-a").unwrap().cancelled, "A is cancelled");
         assert!(!guard.get("window-b").unwrap().cancelled, "B must be untouched");
         assert_eq!(guard.get("window-b").unwrap().pid, Some(2222));
@@ -5225,7 +5313,7 @@ mod tests {
         let pid = cancel_git_op_inner(&store, "other-window");
         assert_eq!(pid, None);
         // Original window's slot untouched.
-        assert!(!store.lock().unwrap().get("main").unwrap().cancelled);
+        assert!(!store.lock_safe().get("main").unwrap().cancelled);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
