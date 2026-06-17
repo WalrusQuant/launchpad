@@ -1490,7 +1490,7 @@ pub(crate) fn create_rebase_state_dir(todo: &[RebaseTodoEntry]) -> Result<std::p
         .prefix("launchpad-rebase-")
         .tempdir()
         .map_err(|e| format!("create state dir: {}", e))?;
-    let dir = temp.into_path();
+    let dir = temp.keep();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("chmod state dir: {}", e))?;
 
