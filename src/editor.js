@@ -20,6 +20,7 @@ import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { vim } from "@replit/codemirror-vim";
 import { conflictExtension } from "./conflictmarkers.js";
 import { changeGutter } from "./changegutter.js";
+import { blameField, blameGutterView, setBlame } from "./blamegutter.js";
 
 const langMap = {
   js: javascript,
@@ -166,6 +167,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
   const fontSizeCompartment = new Compartment();
+  const blameCompartment = new Compartment();
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
@@ -173,7 +175,15 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     // Change gutter sits just right of the line numbers (VS Code-style). Only
     // wired for real on-disk files in a repo; the host pushes classifications
     // via updateChangeGutter after open / save / external change.
-    ...(gitGutter ? [changeGutter({ onMarkerClick: onGutterMarkerClick })] : []),
+    ...(gitGutter
+      ? [
+          changeGutter({ onMarkerClick: onGutterMarkerClick }),
+          // Blame field is always live; the gutter column is shown/hidden via
+          // the compartment (toggled by the handle's showBlame/hideBlame).
+          blameField,
+          blameCompartment.of([]),
+        ]
+      : []),
     highlightActiveLine(),
     highlightActiveLineGutter(),
     bracketMatching(),
@@ -232,6 +242,20 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     },
     setFontSize(px) {
       view.dispatch({ effects: fontSizeCompartment.reconfigure(fontSizeTheme(px || DEFAULT_FONT_SIZE)) });
+    },
+    // Show the blame gutter with the given { hunks, onClick } payload. The
+    // field always lives in the config, so set the data first, then reveal the
+    // column — a single transaction can't both add the gutter and have the
+    // (already-present) field consume the effect, but two ordered effects work.
+    showBlame(payload) {
+      view.dispatch({
+        effects: [setBlame.of(payload), blameCompartment.reconfigure(blameGutterView)],
+      });
+    },
+    hideBlame() {
+      view.dispatch({
+        effects: [blameCompartment.reconfigure([]), setBlame.of(null)],
+      });
     },
   };
 }

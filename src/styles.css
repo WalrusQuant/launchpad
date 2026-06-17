@@ -723,6 +723,39 @@ html, body, #app {
   border-top: 3px solid transparent;
 }
 
+/* Editor blame gutter (opt-in) — short OID + age per commit-hunk, shown only on
+   the hunk's first line. Muted so it reads as metadata, not content. */
+.cm-blame-gutter {
+  border-right: 1px solid var(--border-1);
+}
+.cm-blame-entry {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 0 8px 0 6px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 10px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.cm-blame-oid {
+  color: var(--accent-teal);
+  opacity: 0.85;
+}
+.cm-blame-age {
+  color: var(--text-1);
+  min-width: 18px;
+  text-align: right;
+}
+.cm-blame-clickable {
+  cursor: pointer;
+}
+.cm-blame-clickable:hover .cm-blame-oid {
+  opacity: 1;
+  text-decoration: underline;
+}
+
 /* Terminal */
 #terminal-container {
   flex: 1;

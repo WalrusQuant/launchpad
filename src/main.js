@@ -799,6 +799,34 @@ function showHunkMenu(tab, view, lineNo, event) {
   }, 0);
 }
 
+// Toggle the opt-in blame gutter for an editor tab. Blames committed content
+// (HEAD), so it's best-effort against unsaved edits; clicking a line opens that
+// commit's diff (compared with its parent).
+async function toggleBlame(tab) {
+  if (!tab || tab.type !== "editor" || !tab.editorHandle) return;
+  if (tab.blameOn) {
+    tab.editorHandle.hideBlame();
+    tab.blameOn = false;
+    return;
+  }
+  const project = getActiveProject();
+  const rel = project ? toRepoRelativePath(tab.filePath) : null;
+  if (!rel) {
+    showToast("Blame is only available for files tracked in this project's repo", "error");
+    return;
+  }
+  try {
+    const hunks = await invoke("git_blame_file", { path: project.path, filePath: rel });
+    tab.editorHandle.showBlame({
+      hunks,
+      onClick: (oid) => createDiffTab({ fromRef: `${oid}^`, toRef: oid }),
+    });
+    tab.blameOn = true;
+  } catch (err) {
+    showToast(`Blame failed: ${err}`, "error");
+  }
+}
+
 async function createEditorTab(filePath, options = {}) {
   const { line, column } = options;
   // Deduplicate: if already open, switch to it
@@ -1823,6 +1851,17 @@ function renderEditorStatus(tab, statusBar) {
     renderEditorStatus(tab, statusBar);
   });
   statusBar.appendChild(wrap);
+
+  addSep();
+  const blame = document.createElement("span");
+  blame.className = "esb-item esb-click" + (tab.blameOn ? " esb-active" : "");
+  blame.title = "Toggle git blame";
+  blame.textContent = "Blame";
+  blame.addEventListener("click", async () => {
+    await toggleBlame(tab);
+    renderEditorStatus(tab, statusBar);
+  });
+  statusBar.appendChild(blame);
 
   if (ud || rd) {
     addSep();

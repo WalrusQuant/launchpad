@@ -330,6 +330,7 @@ pub fn run() {
             find_path_by_inode,
             get_file_diff,
             get_file_diff_vs_head,
+            git_blame_file,
             get_diff_between_refs,
             git_stage_all,
             git_stage_file,
