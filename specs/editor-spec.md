@@ -275,15 +275,24 @@ forward since it's tiny and currently misleading.
      so they're parked until someone can iterate on them live (or a package
      appears). Tracked here rather than dropped.
 
-### Phase 3 — Track B: Language Intelligence (LSP)
-9. Rust LSP host (`lsp.rs`): spawn + JSON-RPC framing for one server
-   (typescript-language-server is the easiest first target).
-10. Diagnostics end-to-end (server → event → lint gutter).
-11. Hover.
-12. Completion (replace word-completion).
-13. Go-to-definition.
+### Phase 3 — Track B: Language Intelligence (LSP)  🚧 IN PROGRESS
+9. ✅ Rust LSP host (`lsp.rs`): spawn + `Content-Length` framing, one server per
+   `{language}:{project_path}`. typescript-language-server is the first target.
+   Pure framing unit-tested; an `#[ignore]`d e2e test proves a real
+   initialize→didOpen→diagnostics round-trip.
+10. ✅ Diagnostics end-to-end (server → `lsp-message` event →
+    `@codemirror/lsp-client` → lint gutter), behind the `editorLanguageServer`
+    setting (default off). **Visual/interactive layer not yet live-verified.**
+11. Hover. (deferred — needs live verification)
+12. Completion (replace word-completion). (deferred)
+13. Go-to-definition. (deferred)
 14. Upgrade symbol outline to `documentSymbol`; then references/rename/code
-    actions as follow-ons.
+    actions as follow-ons. (deferred)
+
+Note: hover/completion/go-to-def are all available "for free" from
+`languageServerSupport()` in `@codemirror/lsp-client` — switching from the
+diagnostics-only `serverDiagnostics()` wiring to the full bundle is a small
+change, deferred until the interactive features can be live-tested.
 
 Rationale for the order: Phase 1 (git-aware) is the highest value-per-effort and
 reuses infra we already own. Phase 2 (polish) is low-risk warm-up that hardens

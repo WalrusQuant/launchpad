@@ -90,6 +90,7 @@ specs/                  # Design specs (project model, agent model, etc.)
 - **Indent guides**: `@replit/codemirror-indentation-markers`, behind the `editorIndentGuides` setting (default on), wired through the `setVisualExtras` compartment.
 - **Format on save** (opt-in, `editorFormatOnSave`): the `format_file` Rust command runs a PATH-resolved formatter (prettier / rustfmt / black / gofmt / shfmt) in place with the project as cwd and returns the formatted content; `saveEditorTab` syncs the buffer to it (cursor preserved). Best-effort — a missing formatter or error toasts without failing the save.
 - **Reveal active file in tree** (opt-in, `editorFollowActiveFile`): `revealPath` (in `filebrowser.js`) expands ancestor folders via `expandedDirs`, selects and scrolls the row into view; `switchTab` calls it for editor tabs.
+- **Language server diagnostics (opt-in, `editorLanguageServer`, default off)**: `lsp.rs` is a process host modeled on `pty.rs` — it spawns external language servers (typescript-language-server for JS/TS today; rust-analyzer / pyright mapped for later), a reader thread parses `Content-Length`-framed messages and emits them as `lsp-message` events, `lsp_send` frames outgoing messages to stdin. One server per `{language}:{project_path}`. The pure framing fns (`encode_lsp_message` / `read_lsp_message`) are unit-tested, and an `#[ignore]`d e2e test drives a real server through `initialize`/`didOpen` and asserts diagnostics. Frontend `lspclient.js` runs `@codemirror/lsp-client` over a Tauri-IPC `Transport`, wired into the editor via an `lspCompartment` (diagnostics only — hover/completion/go-to-def deferred). `shutdownAllLsp` stops servers on project teardown so the reload doesn't orphan them.
 
 ### Git
 - **Git: libgit2 + system git**: Local operations (stage, unstage, stash, branch) use the `git2` crate. Network operations (push, pull, fetch, merge) shell out to system `git` via `std::process::Command` to respect the user's SSH keys and credential helpers. Network ops are cancellable via `cancel_git_op`.
@@ -185,6 +186,11 @@ rather than DOM-wiring code.
 - `pause_pty_reader(tab_id)` / `resume_pty_reader(tab_id)` — backpressure flow control
 - `close_pty(tab_id)` — close a PTY process
 - `write_debug_log(content)` — write debug capture to `~/.launchpad/debug.log`
+
+### Language Server (LSP)
+- `lsp_start(project_path, language) -> server_id` — spawn (or reuse) a language server for the project+language; idempotent. Returns `"{language}:{project_path}"`. Errors if no server is configured or the binary isn't on PATH (frontend degrades silently).
+- `lsp_send(server_id, message)` — frame a JSON-RPC message with `Content-Length` and write to the server's stdin.
+- `lsp_stop(server_id)` — kill the server and drop its slot.
 
 ### Filesystem
 - `read_directory(path)` — list directory contents (sorted: dirs first, then alpha). Tolerant: entries whose `metadata()` fails fall through to defaults instead of being dropped.
