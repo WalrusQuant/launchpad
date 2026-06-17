@@ -2070,36 +2070,37 @@ fn test_read_lsp_message_clean_eof_on_empty() {
     assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
 }
 
-// End-to-end LSP host proof: drive a REAL typescript-language-server through the
-// same framing functions lsp_start/lsp_send use, and assert diagnostics come
-// back for a file with a type error. #[ignore]d because it needs the server
-// binary on disk (not present in CI); run locally with:
+// End-to-end LSP host proof: drive a REAL language server through the same
+// framing functions lsp_start/lsp_send use, and assert diagnostics come back for
+// a file with a type error. #[ignore]d because each needs its server binary
+// installed (not present in CI); run locally with:
 //   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored lsp_e2e
-#[test]
-#[ignore]
-fn test_lsp_e2e_typescript_diagnostics() {
+//
+// Drives `program` from `cwd`, opens `open_file` (already written) with
+// `language_id`, and returns whether a non-empty publishDiagnostics arrives
+// within `timeout_secs`. Replies to any server→client request with a null
+// result so servers that gate on registerCapability / workDoneProgress
+// (pyright, rust-analyzer) don't stall.
+fn lsp_diagnostics_probe(
+    program: &std::ffi::OsStr,
+    args: &[&str],
+    cwd: &std::path::Path,
+    open_file: &std::path::Path,
+    language_id: &str,
+    timeout_secs: u64,
+) -> bool {
     use std::io::{BufReader, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    // Locate the server installed under the repo's node_modules.
-    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../node_modules/.bin/typescript-language-server");
-    if !bin.exists() {
-        eprintln!("skipping: {} not found", bin.display());
-        return;
-    }
+    let root_uri = format!("file://{}", cwd.display());
+    let uri = format!("file://{}", open_file.display());
+    let text = serde_json::to_string(&std::fs::read_to_string(open_file).unwrap()).unwrap();
 
-    let work = tempfile::tempdir().unwrap();
-    let file = work.path().join("bad.ts");
-    std::fs::write(&file, "const x: number = \"not a number\";\n").unwrap();
-    let uri = format!("file://{}", file.display());
-    let root_uri = format!("file://{}", work.path().display());
-
-    let mut child = Command::new(&bin)
-        .arg("--stdio")
-        .current_dir(work.path())
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2108,7 +2109,6 @@ fn test_lsp_e2e_typescript_diagnostics() {
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
 
-    // Pump messages off a thread so reads can't hang the test.
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -2119,32 +2119,39 @@ fn test_lsp_e2e_typescript_diagnostics() {
         }
     });
 
-    let send = |stdin: &mut std::process::ChildStdin, body: String| {
+    let mut send = |stdin: &mut std::process::ChildStdin, body: String| {
         stdin.write_all(&encode_lsp_message(&body)).unwrap();
         stdin.flush().unwrap();
     };
 
     send(&mut stdin, format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"textDocument":{{"synchronization":{{}},"publishDiagnostics":{{}}}}}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root_uri}","capabilities":{{"window":{{"workDoneProgress":true}},"textDocument":{{"synchronization":{{}},"publishDiagnostics":{{}}}}}}}}}}"#
     ));
     send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string());
-
-    let text = serde_json::to_string("const x: number = \"not a number\";\n").unwrap();
     send(&mut stdin, format!(
-        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"typescript","version":1,"text":{text}}}}}}}"#
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"{language_id}","version":1,"text":{text}}}}}}}"#
     ));
 
-    // Wait (bounded) for a publishDiagnostics with a non-empty diagnostics array.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut got_diagnostics = false;
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut got = false;
+    while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_secs(2)) {
             Ok(msg) => {
-                if msg.contains("textDocument/publishDiagnostics") {
-                    let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                let v: serde_json::Value = match serde_json::from_str(&msg) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // A server→client request (has both id and method) — answer null
+                // so the server doesn't block waiting on us.
+                if v.get("id").is_some() && v.get("method").is_some() {
+                    let id = &v["id"];
+                    send(&mut stdin, format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+                    continue;
+                }
+                if v["method"] == "textDocument/publishDiagnostics" {
                     let diags = &v["params"]["diagnostics"];
-                    if diags.is_array() && !diags.as_array().unwrap().is_empty() {
-                        got_diagnostics = true;
+                    if diags.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        got = true;
                         break;
                     }
                 }
@@ -2154,5 +2161,90 @@ fn test_lsp_e2e_typescript_diagnostics() {
         }
     }
     let _ = child.kill();
-    assert!(got_diagnostics, "expected diagnostics from typescript-language-server");
+    got
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_typescript_diagnostics() {
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin/typescript-language-server");
+    if !bin.exists() {
+        eprintln!("skipping: {} not found", bin.display());
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("bad.ts");
+    std::fs::write(&file, "const x: number = \"not a number\";\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(bin.as_os_str(), &["--stdio"], work.path(), &file, "typescript", 20),
+        "expected diagnostics from typescript-language-server"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_python_diagnostics() {
+    if which_on_path("pyright-langserver").is_none() {
+        eprintln!("skipping: pyright-langserver not on PATH");
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("bad.py");
+    std::fs::write(&file, "x: int = \"not an int\"\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(
+            std::ffi::OsStr::new("pyright-langserver"),
+            &["--stdio"],
+            work.path(),
+            &file,
+            "python",
+            30,
+        ),
+        "expected diagnostics from pyright"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_lsp_e2e_rust_diagnostics() {
+    if which_on_path("rust-analyzer").is_none() {
+        eprintln!("skipping: rust-analyzer not on PATH");
+        return;
+    }
+    // rust-analyzer needs a real Cargo project to analyze.
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(
+        work.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(work.path().join("src")).unwrap();
+    let file = work.path().join("src/main.rs");
+    std::fs::write(&file, "fn main() { let _x: u32 = \"not a u32\"; }\n").unwrap();
+    assert!(
+        lsp_diagnostics_probe(
+            std::ffi::OsStr::new("rust-analyzer"),
+            &[],
+            work.path(),
+            &file,
+            "rust",
+            60,
+        ),
+        "expected diagnostics from rust-analyzer"
+    );
+}
+
+// Minimal `which`: is `name` resolvable on PATH? Keeps the e2e probes skippable
+// when a server isn't installed.
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
 }

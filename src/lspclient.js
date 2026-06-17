@@ -13,8 +13,8 @@ import { LSPClient, languageServerExtensions } from "@codemirror/lsp-client";
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-// File extension → logical language id. Must match server_command() in lsp.rs.
-// Only the proven typescript-language-server languages for now.
+// File extension → logical language id. Must match server_command() in lsp.rs
+// (typescript-language-server, rust-analyzer, pyright).
 const LANG_BY_EXT = {
   ts: "typescript",
   tsx: "typescript",
@@ -24,6 +24,9 @@ const LANG_BY_EXT = {
   jsx: "javascript",
   mjs: "javascript",
   cjs: "javascript",
+  rs: "rust",
+  py: "python",
+  pyi: "python",
 };
 
 export function lspLanguageForFile(fileName) {

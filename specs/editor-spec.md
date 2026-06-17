@@ -277,9 +277,9 @@ forward since it's tiny and currently misleading.
 
 ### Phase 3 — Track B: Language Intelligence (LSP)  🚧 IN PROGRESS
 9. ✅ Rust LSP host (`lsp.rs`): spawn + `Content-Length` framing, one server per
-   `{language}:{project_path}`. typescript-language-server is the first target.
-   Pure framing unit-tested; an `#[ignore]`d e2e test proves a real
-   initialize→didOpen→diagnostics round-trip.
+   `{language}:{project_path}`. Servers wired: typescript-language-server (JS/TS),
+   rust-analyzer (Rust), pyright (Python). Pure framing unit-tested; `#[ignore]`d
+   e2e tests prove a real initialize→didOpen→diagnostics round-trip against each.
 10. ✅ Diagnostics end-to-end (server → `lsp-message` event →
     `@codemirror/lsp-client` → lint gutter), behind the `editorLanguageServer`
     setting (default off).
