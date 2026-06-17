@@ -12,6 +12,7 @@
 use crate::*;
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -45,6 +46,78 @@ fn server_command(language: &str) -> Option<(&'static str, &'static [&'static st
         "python" => Some(("pyright-langserver", &["--stdio"])),
         _ => None,
     }
+}
+
+// Common locations dev tools install to that a Finder/Dock-launched `.app` does
+// NOT inherit on its PATH — GUI bundles get a minimal PATH, unlike a process
+// started from a login shell. Without this, a server the user already has from
+// VS Code / their toolchain (rust-analyzer in ~/.cargo/bin, an nvm- or
+// Homebrew-installed typescript-language-server, etc.) is invisible to the app
+// when it's opened from Finder. Mirrors the SSH_AUTH_SOCK workaround in git.rs.
+fn extra_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join(".bun/bin"));
+        // nvm puts node + global npm bins under a per-version dir; add every
+        // installed version's bin so an nvm user's global server is found.
+        if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            for e in entries.flatten() {
+                dirs.push(e.path().join("bin"));
+            }
+        }
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/opt/homebrew/sbin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+// The PATH language servers run under: the inherited PATH plus the common dirs
+// above, deduped with inherited entries kept first so the user's own ordering
+// wins. Computed once — install locations don't move at runtime. Also used as
+// the search space for resolve_bin, so detection and spawning always agree.
+fn server_path_env() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut seen = std::collections::HashSet::new();
+            let mut parts: Vec<String> = Vec::new();
+            let inherited = std::env::var("PATH").unwrap_or_default();
+            for p in inherited.split(':') {
+                if !p.is_empty() && seen.insert(p.to_string()) {
+                    parts.push(p.to_string());
+                }
+            }
+            for d in extra_path_dirs() {
+                let s = d.to_string_lossy().into_owned();
+                if !s.is_empty() && seen.insert(s.clone()) {
+                    parts.push(s);
+                }
+            }
+            parts.join(":")
+        })
+        .clone()
+}
+
+// Resolve `bin` to an absolute path by scanning server_path_env(). Returns the
+// first match that exists as a regular file (symlinks are followed, so Homebrew
+// shims resolve). None means "not installed in any known location".
+fn resolve_bin(bin: &str) -> Option<PathBuf> {
+    for dir in server_path_env().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // Frame a JSON-RPC body with the LSP `Content-Length` header. Length is in
@@ -108,19 +181,29 @@ pub(crate) async fn lsp_start(
     let (cmd, args) = server_command(&language)
         .ok_or_else(|| format!("No language server configured for {language}"))?;
 
+    // Resolve to an absolute path against our augmented search path so a server
+    // the user already has (but that a Finder-launched bundle's PATH can't see)
+    // is found; fall back to the bare name so the NotFound message still fires.
+    // Run the child under the same augmented PATH so node-based servers locate
+    // `node` and their own helpers.
+    let program: std::ffi::OsString = resolve_bin(cmd)
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from(cmd));
+
     // Spawn outside the lock (spawn does I/O). A concurrent lsp_start for the
     // same key may also reach here; the re-check under the lock below resolves
     // the race by killing whichever child loses.
-    let mut child = Command::new(cmd)
+    let mut child = Command::new(&program)
         .args(args)
         .current_dir(&project_path)
+        .env("PATH", server_path_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                format!("{cmd} not found on PATH — install it to enable language features")
+                format!("{cmd} not found — install it to enable language features (Settings → Editor shows how)")
             } else {
                 format!("Failed to start {cmd}: {e}")
             }
@@ -196,6 +279,44 @@ pub(crate) async fn lsp_send(
     inst.stdin.write_all(&framed).map_err(|e| e.to_string())?;
     inst.stdin.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// Detection status for each supported language server, for the Settings UI.
+// `found`/`path` come from resolve_bin so they reflect exactly what lsp_start
+// would launch (same augmented search path).
+#[derive(Clone, Serialize)]
+pub(crate) struct LspServerStatus {
+    pub(crate) label: String,
+    pub(crate) binary: String,
+    pub(crate) found: bool,
+    pub(crate) path: Option<String>,
+    pub(crate) install: String,
+}
+
+#[tauri::command]
+pub(crate) fn lsp_server_status() -> Vec<LspServerStatus> {
+    const SERVERS: &[(&str, &str, &str)] = &[
+        ("Rust", "rust-analyzer", "rustup component add rust-analyzer"),
+        (
+            "JavaScript / TypeScript",
+            "typescript-language-server",
+            "npm i -g typescript-language-server",
+        ),
+        ("Python", "pyright-langserver", "npm i -g pyright"),
+    ];
+    SERVERS
+        .iter()
+        .map(|(label, binary, install)| {
+            let resolved = resolve_bin(binary);
+            LspServerStatus {
+                label: label.to_string(),
+                binary: binary.to_string(),
+                found: resolved.is_some(),
+                path: resolved.map(|p| p.to_string_lossy().into_owned()),
+                install: install.to_string(),
+            }
+        })
+        .collect()
 }
 
 // Stop a language server and drop its slot. Killing the child closes its stdout,

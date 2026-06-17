@@ -2838,6 +2838,73 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   border-radius: 2px;
 }
 
+/* ── Language server detection ────────────────────────────────────────── */
+.settings-lsp {
+  margin: 8px 0 4px 0;
+}
+
+.settings-lsp-help {
+  font-size: 11px;
+  color: var(--text-1);
+  line-height: 1.4;
+  margin: 0 0 8px 0;
+}
+
+.settings-lsp-help code {
+  color: var(--text-3);
+  background: var(--surface-7);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.settings-lsp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-1);
+}
+
+.settings-lsp-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-lsp-state {
+  flex-shrink: 0;
+  font-weight: 600;
+  width: 64px;
+}
+
+.settings-lsp-state.is-found {
+  color: #6ec46e;
+}
+
+.settings-lsp-state.is-missing {
+  color: var(--text-0);
+}
+
+.settings-lsp-label {
+  color: var(--text-3);
+  min-width: 150px;
+}
+
+.settings-lsp-bin {
+  color: var(--text-1);
+  background: var(--surface-7);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+
+.settings-lsp-install {
+  color: #d6a85a;
+  background: var(--surface-7);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+
 /* ── Per-project env vars ─────────────────────────────────────────────── */
 .settings-section-sub {
   color: var(--text-1);

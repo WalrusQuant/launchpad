@@ -153,6 +153,16 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
           <span class="settings-toggle-slider"></span>
         </label>
       </div>
+
+      <div class="settings-lsp">
+        <div class="settings-lsp-help">
+          Language servers aren't bundled. Install the one(s) you use — they're
+          auto-detected on your <code>PATH</code> and common locations
+          (<code>~/.cargo/bin</code>, Homebrew, nvm, volta). If you came from
+          another editor you likely already have them.
+        </div>
+        <div id="lsp-status-list" class="settings-lsp-list">Checking…</div>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -209,6 +219,7 @@ export function createSettingsPanel(containerEl, settings, onSettingChange) {
   containerEl.appendChild(content);
   renderKeybindings(content.querySelector("#keybindings-list"));
   renderProjectEnv(content);
+  renderLspStatus(content.querySelector("#lsp-status-list"));
 
   // Wire up all inputs
   wireInput("appTheme", "change", (v) => v);
@@ -313,6 +324,32 @@ function isSelected(current, match) {
 
 function escapeAttr(str) {
   return str.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ─── Language server detection status ────────────────────────────────────────
+// Asks the backend which servers resolve on the augmented search path (PATH +
+// common install dirs). Shows found / install-hint per language so someone
+// coming from another editor can see at a glance whether the app already sees
+// the servers they have. Async + best-effort: a backend error just leaves a
+// quiet fallback line.
+async function renderLspStatus(listEl) {
+  if (!listEl) return;
+  try {
+    const servers = await invoke("lsp_server_status");
+    listEl.innerHTML = servers
+      .map(
+        (s) => `
+      <div class="settings-lsp-item">
+        <span class="settings-lsp-state ${s.found ? "is-found" : "is-missing"}">${s.found ? "✓ found" : "✗ missing"}</span>
+        <span class="settings-lsp-label">${escapeAttr(s.label)}</span>
+        <code class="settings-lsp-bin">${escapeAttr(s.binary)}</code>
+        ${s.found ? "" : `<span class="settings-lsp-install">${escapeAttr(s.install)}</span>`}
+      </div>`
+      )
+      .join("");
+  } catch (_) {
+    listEl.textContent = "Couldn't check language-server status.";
+  }
 }
 
 // ─── Per-project environment variables ───────────────────────────────────────
