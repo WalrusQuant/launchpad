@@ -116,10 +116,16 @@ const changeField = StateField.define({
   },
 });
 
-const changeGutterView = gutter({
-  class: "cm-change-gutter",
-  markers: (view) => view.state.field(changeField),
-});
+// Whether a given 1-based line currently carries a change marker. Lets the
+// click handler ignore clicks on unchanged lines in the gutter strip.
+export function lineHasChange(state, lineNo) {
+  const set = state.field(changeField, false);
+  if (!set || lineNo < 1 || lineNo > state.doc.lines) return false;
+  const pos = state.doc.line(lineNo).from;
+  let hit = false;
+  set.between(pos, pos, () => { hit = true; return false; });
+  return hit;
+}
 
 // Line-start positions of every marked line, in document order. Drives hunk
 // navigation; reads straight off the gutter's RangeSet so it always matches
@@ -170,9 +176,27 @@ const changeNavKeymap = keymap.of([
  * Editor extension that renders the change gutter and wires hunk navigation
  * (Alt-j / Alt-k). Pair with `updateChangeGutter` to push a fresh
  * classification after open / save / external change.
+ *
+ * `onMarkerClick(view, lineNo, event)` fires when a marked line's gutter cell
+ * is clicked (clicks on unchanged lines are ignored) — the host uses it to pop
+ * the revert / stage menu.
  */
-export function changeGutter() {
-  return [changeField, changeGutterView, changeNavKeymap];
+export function changeGutter({ onMarkerClick } = {}) {
+  const view = gutter({
+    class: "cm-change-gutter",
+    markers: (v) => v.state.field(changeField),
+    domEventHandlers: onMarkerClick
+      ? {
+          mousedown(v, line, event) {
+            const lineNo = v.state.doc.lineAt(line.from).number;
+            if (!lineHasChange(v.state, lineNo)) return false;
+            onMarkerClick(v, lineNo, event);
+            return true;
+          },
+        }
+      : undefined,
+  });
+  return [changeField, view, changeNavKeymap];
 }
 
 /** Push a fresh { added, modified, deleted } classification into the view. */

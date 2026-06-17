@@ -161,7 +161,7 @@ const DEFAULT_FONT_SIZE = 12;
  * Returns { view, setTabSize, setWordWrap, setFontSize } — caller owns the
  * view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter, onGutterMarkerClick } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -173,7 +173,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     // Change gutter sits just right of the line numbers (VS Code-style). Only
     // wired for real on-disk files in a repo; the host pushes classifications
     // via updateChangeGutter after open / save / external change.
-    ...(gitGutter ? [changeGutter()] : []),
+    ...(gitGutter ? [changeGutter({ onMarkerClick: onGutterMarkerClick })] : []),
     highlightActiveLine(),
     highlightActiveLineGutter(),
     bracketMatching(),

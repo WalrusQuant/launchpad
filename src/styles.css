@@ -708,6 +708,7 @@ html, body, #app {
   padding: 0;
   display: flex;
   align-items: flex-end;
+  cursor: pointer;
 }
 .cm-change {
   width: 3px;

@@ -665,15 +665,138 @@ async function refreshEditorGutter(tab) {
   const project = getActiveProject();
   const rel = project ? toRepoRelativePath(tab.filePath) : null;
   if (!rel) {
+    tab.lineDiff = null;
     updateChangeGutter(tab.editorView, EMPTY_CHANGES);
     return;
   }
   try {
     const diff = await invoke("get_file_diff_vs_head", { path: project.path, filePath: rel });
+    tab.lineDiff = diff;
     updateChangeGutter(tab.editorView, deriveLineChanges(diff));
   } catch (_) {
+    tab.lineDiff = null;
     updateChangeGutter(tab.editorView, EMPTY_CHANGES);
   }
+}
+
+// Locate the hunk responsible for a marker on `lineNo` (1-based, new side).
+// A line is "in" a hunk if it falls in the hunk's new-side span; a pure
+// deletion (new_lines === 0) attaches to the line just above the gap.
+function findHunkForLine(diff, lineNo) {
+  if (!diff || !Array.isArray(diff.hunks)) return null;
+  for (const h of diff.hunks) {
+    if (h.new_lines > 0) {
+      if (lineNo >= h.new_start && lineNo <= h.new_start + h.new_lines - 1) return h;
+    } else if (lineNo === h.new_start - 1 || lineNo === h.new_start) {
+      return h;
+    }
+  }
+  return null;
+}
+
+// Replace a hunk's new-side text with its HEAD (old-side) text in the buffer.
+// Correctness rests on the buffer matching disk (and thus the diff's new side):
+// when not modified, the concatenated content of the hunk's new-side lines is an
+// exact substring of the document starting at new_start, so its length pins the
+// replace range without any newline bookkeeping. Deletions (no new-side lines)
+// insert the old text at the gap.
+function revertHunkInBuffer(view, hunk) {
+  const doc = view.state.doc;
+  const newSide = hunk.lines.filter((l) => l.origin === "add" || l.origin === "context");
+  const oldSide = hunk.lines.filter((l) => l.origin === "remove" || l.origin === "context");
+  const newText = newSide.map((l) => l.content).join("");
+  const oldText = oldSide.map((l) => l.content).join("");
+
+  let from, to;
+  if (hunk.new_lines > 0) {
+    from = doc.line(hunk.new_start).from;
+    to = from + newText.length;
+  } else {
+    // Pure deletion: insert the removed lines at the start of the line below
+    // the gap (new_start is that line), or at end-of-doc when past the last line.
+    if (hunk.new_start >= 1 && hunk.new_start <= doc.lines) {
+      from = to = doc.line(hunk.new_start).from;
+    } else {
+      from = to = doc.length;
+    }
+  }
+  if (to > doc.length) return false; // stale diff — bail rather than corrupt
+  view.dispatch({ changes: { from, to, insert: oldText } });
+  return true;
+}
+
+function uiIdForTab(tab) {
+  for (const [uiId, t] of tabs) if (t === tab) return uiId;
+  return null;
+}
+
+// Popover shown when a change-gutter marker is clicked: revert the hunk in the
+// buffer (HEAD content, then the user saves), or stage the whole file.
+function showHunkMenu(tab, view, lineNo, event) {
+  document.getElementById("context-menu")?.remove();
+  const hunk = findHunkForLine(tab.lineDiff, lineNo);
+  if (!hunk) return;
+
+  const menu = document.createElement("div");
+  menu.id = "context-menu";
+  menu.className = "context-menu";
+
+  const addItem = (label, fn, disabled = false) => {
+    const item = document.createElement("div");
+    item.className = "context-menu-item" + (disabled ? " context-menu-item-disabled" : "");
+    item.textContent = label;
+    if (!disabled) {
+      item.addEventListener("click", () => {
+        menu.remove();
+        fn();
+      });
+    }
+    menu.appendChild(item);
+  };
+
+  // Revert's line math needs the buffer to match disk; gate it when dirty.
+  if (tab.modified) {
+    addItem("Revert hunk (save first)", null, true);
+  } else {
+    addItem("Revert hunk", () => {
+      // Buffer edit only — leaves the tab dirty so the user can review and
+      // Cmd+Z, then Cmd+S to persist (gutter recomputes on save).
+      if (!revertHunkInBuffer(view, hunk)) {
+        showToast("Couldn't revert — the diff is stale, try reopening", "error");
+      } else {
+        view.focus();
+      }
+    });
+  }
+
+  addItem("Stage file", async () => {
+    const project = getActiveProject();
+    if (!project) return;
+    const uiId = uiIdForTab(tab);
+    if (tab.modified && uiId != null) await saveEditorTab(uiId);
+    const rel = toRepoRelativePath(tab.filePath);
+    if (!rel) return;
+    try {
+      await invoke("git_stage_file", { path: project.path, filePath: rel });
+      showToast(`Staged ${tab.fileName}`, "info");
+      refreshPanel(null, true);
+      refreshEditorGutter(tab);
+    } catch (err) {
+      showToast(`Stage failed: ${err}`, "error");
+    }
+  });
+
+  menu.style.left = event.clientX + "px";
+  menu.style.top = event.clientY + "px";
+  document.body.appendChild(menu);
+  // Clamp into the viewport if it would overflow the right/bottom edge.
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+
+  setTimeout(() => {
+    document.addEventListener("click", () => menu.remove(), { once: true });
+  }, 0);
 }
 
 async function createEditorTab(filePath, options = {}) {
@@ -780,6 +903,7 @@ async function createEditorTab(filePath, options = {}) {
     theme: getResolvedTheme(),
     conflictMode,
     gitGutter: true,
+    onGutterMarkerClick: (view, lineNo, event) => showHunkMenu(tab, view, lineNo, event),
     // Phase 6: when a conflict block's [Open 3-Way] button is clicked, we
     // open the dedicated 3-pane merge tab for this file. Only wired when
     // the file is actually conflicted — otherwise the button never renders.
