@@ -695,6 +695,33 @@ html, body, #app {
 .git-conflict  .file-git-badge { color: var(--accent-magenta); }
 .git-renamed   .file-git-badge { color: var(--accent-cyan); }
 
+/* Editor change gutter (git-aware) — a thin per-line bar showing how each line
+   differs from HEAD. Colors match the file-tree git convention (green added,
+   warm modified, red deleted) so the editor and tree read the same. The
+   deletion marker is a small wedge anchored to the bottom of the line above the
+   removed block. */
+.cm-change-gutter {
+  width: 3px;
+  padding: 0;
+}
+.cm-change-gutter .cm-gutterElement {
+  padding: 0;
+  display: flex;
+  align-items: flex-end;
+}
+.cm-change {
+  width: 3px;
+  height: 100%;
+}
+.cm-change-added { background: var(--accent-green); }
+.cm-change-modified { background: var(--accent-warm); }
+.cm-change-deleted {
+  height: 0;
+  background: none;
+  border-left: 3px solid var(--accent-red);
+  border-top: 3px solid transparent;
+}
+
 /* Terminal */
 #terminal-container {
   flex: 1;

@@ -586,6 +586,36 @@ pub(crate) async fn get_file_diff(path: String, file_path: String, staged: Optio
     .await
 }
 
+// Working-tree-vs-HEAD diff for a single file, used by the editor change
+// gutter. Deliberately distinct from `get_file_diff` (workdir-vs-index with a
+// staged fallback): the gutter wants "everything different from the last
+// commit" so a hunk that gets staged still shows a marker. `diff_tree_to_
+// workdir_with_index` folds the index in, giving exactly that view. Returns an
+// empty FileDiff (no hunks) when the file matches HEAD or there is no HEAD yet
+// (unborn branch) so the frontend can no-op cleanly.
+#[tauri::command]
+pub(crate) async fn get_file_diff_vs_head(path: String, file_path: String) -> Result<FileDiff, String> {
+    blocking(move || {
+        let repo = Repository::discover(&path).map_err(|e| e.to_string())?;
+
+        let mut diff_opts = git2::DiffOptions::new();
+        diff_opts.pathspec(&file_path);
+
+        // No HEAD (fresh repo, unborn branch): everything is "new", but there's
+        // no tree to diff against — treat as no tracked changes for the gutter.
+        let head_tree = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+            Some(t) => t,
+            None => return Ok(FileDiff { old_path: None, new_path: None, hunks: vec![] }),
+        };
+
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut diff_opts))
+            .map_err(|e| e.to_string())?;
+        collect_structured_diff(&diff)
+    })
+    .await
+}
+
 #[tauri::command]
 pub(crate) async fn git_stage_all(path: String) -> Result<(), String> {
     blocking(move || {

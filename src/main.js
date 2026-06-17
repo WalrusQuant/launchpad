@@ -4,10 +4,12 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
+import { updateChangeGutter } from "./changegutter.js";
+import { deriveLineChanges } from "./changegutter.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { initFileBrowser, getCurrentPath, closeFilePreview, refreshFileBrowser } from "./filebrowser.js";
-import { fetchGitStatus, startGitPolling, getGitFileStatus, setInFlightOp } from "./git.js";
+import { fetchGitStatus, startGitPolling, getGitFileStatus, setInFlightOp, toRepoRelativePath } from "./git.js";
 import { parseConflictBlocks } from "./conflictmarkers.js";
 import { initGitPanel, refreshPanel } from "./gitpanel.js";
 import { buildFileDiffSection } from "./diffrender.js";
@@ -523,6 +525,9 @@ function switchTab(uiId) {
     });
   } else if (tab.type === "editor") {
     setTimeout(() => tab.editorView.focus(), 10);
+    // HEAD may have moved while away (staged/committed in the git panel) —
+    // recompute the change gutter on focus.
+    refreshEditorGutter(tab);
   } else if (tab.type === "merge") {
     setTimeout(() => tab.mergedView.focus(), 10);
   }
@@ -649,6 +654,28 @@ function renderBreadcrumb(breadcrumbEl, filePath) {
 }
 
 // Editor tab management
+const EMPTY_CHANGES = { added: new Set(), modified: new Set(), deleted: new Set() };
+
+// Recompute the change gutter for an editor tab from the working-tree-vs-HEAD
+// diff. Best-effort: a file outside the repo, or any backend error, just clears
+// the gutter. Markers reflect disk-vs-HEAD, so they update on save / external
+// change, not on every keystroke (see editor-spec Track A).
+async function refreshEditorGutter(tab) {
+  if (!tab || tab.type !== "editor" || !tab.editorView) return;
+  const project = getActiveProject();
+  const rel = project ? toRepoRelativePath(tab.filePath) : null;
+  if (!rel) {
+    updateChangeGutter(tab.editorView, EMPTY_CHANGES);
+    return;
+  }
+  try {
+    const diff = await invoke("get_file_diff_vs_head", { path: project.path, filePath: rel });
+    updateChangeGutter(tab.editorView, deriveLineChanges(diff));
+  } catch (_) {
+    updateChangeGutter(tab.editorView, EMPTY_CHANGES);
+  }
+}
+
 async function createEditorTab(filePath, options = {}) {
   const { line, column } = options;
   // Deduplicate: if already open, switch to it
@@ -752,6 +779,7 @@ async function createEditorTab(filePath, options = {}) {
     vimMode: editorSettings.editorVimMode,
     theme: getResolvedTheme(),
     conflictMode,
+    gitGutter: true,
     // Phase 6: when a conflict block's [Open 3-Way] button is clicked, we
     // open the dedicated 3-pane merge tab for this file. Only wired when
     // the file is actually conflicted — otherwise the button never renders.
@@ -764,6 +792,9 @@ async function createEditorTab(filePath, options = {}) {
   tab.editorHandle = editorHandle;
   tabs.set(uiId, tab);
   updateStatus();
+
+  // Paint the change gutter from the working-tree-vs-HEAD diff.
+  refreshEditorGutter(tab);
 
   // Right-click context menu for editor
   editorContent.addEventListener("contextmenu", (e) => {
@@ -1705,6 +1736,8 @@ async function saveEditorTab(uiId) {
     tab.originalContent = rawContent;
     tab.modified = false;
     renderTabBar();
+    // Disk now differs from HEAD by the just-saved content — repaint the gutter.
+    refreshEditorGutter(tab);
     // Flash the tab label green briefly to confirm save
     const tabEl = document.querySelector(`.tab[data-tab-id="${uiId}"] .tab-label`);
     if (tabEl) {
@@ -2084,6 +2117,7 @@ listen(FS_CHANGED, (event) => {
               changes: { from: 0, to: editorContent.length, insert: diskContent },
             });
             tab.originalContent = diskContent;
+            refreshEditorGutter(tab);
           } else {
             // User has unsaved changes — prompt
             showConfirmDialog(
@@ -2095,6 +2129,7 @@ listen(FS_CHANGED, (event) => {
                 tab.originalContent = diskContent;
                 tab.modified = false;
                 renderTabBar();
+                refreshEditorGutter(tab);
               }
             );
           }

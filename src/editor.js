@@ -19,6 +19,7 @@ import { toml } from "@codemirror/legacy-modes/mode/toml";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { vim } from "@replit/codemirror-vim";
 import { conflictExtension } from "./conflictmarkers.js";
+import { changeGutter } from "./changegutter.js";
 
 const langMap = {
   js: javascript,
@@ -160,7 +161,7 @@ const DEFAULT_FONT_SIZE = 12;
  * Returns { view, setTabSize, setWordWrap, setFontSize } — caller owns the
  * view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay, gitGutter } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -169,6 +170,10 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
   const extensions = [
     ...(vimMode ? [vim()] : []),
     lineNumbers(),
+    // Change gutter sits just right of the line numbers (VS Code-style). Only
+    // wired for real on-disk files in a repo; the host pushes classifications
+    // via updateChangeGutter after open / save / external change.
+    ...(gitGutter ? [changeGutter()] : []),
     highlightActiveLine(),
     highlightActiveLineGutter(),
     bracketMatching(),

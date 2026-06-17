@@ -329,6 +329,7 @@ pub fn run() {
             get_file_inode,
             find_path_by_inode,
             get_file_diff,
+            get_file_diff_vs_head,
             get_diff_between_refs,
             git_stage_all,
             git_stage_file,
