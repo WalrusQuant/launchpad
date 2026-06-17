@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Launchpad — terminal-first macOS workspace</title>
-  <meta name="description" content="A native macOS workspace for running Claude Code and other CLI coding agents. Terminal, file browser, git panel, and a simple code editor — all scoped to a project. Apache 2.0 licensed." />
+  <meta name="description" content="A native macOS workspace for running Claude Code and other CLI coding agents. Terminal, file browser, git panel, and a git-aware code editor — all scoped to a project. Apache 2.0 licensed." />
   <meta property="og:title" content="Launchpad — terminal-first macOS workspace" />
-  <meta property="og:description" content="A native macOS workspace for running CLI coding agents. Terminal, file browser, git panel, simple editor — scoped to one project per window." />
+  <meta property="og:description" content="A native macOS workspace for running CLI coding agents. Terminal, file browser, git panel, git-aware editor — scoped to one project per window." />
   <meta property="og:image" content="media/landing.png" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
@@ -31,7 +31,7 @@
       <p class="lede">
         A native macOS workspace for running Claude Code, Aider, and other CLI
         coding agents. A real PTY terminal up front, with the visual tools you
-        actually want around it — a file browser, a git panel, and a simple
+        actually want around it — a file browser, a git panel, and a git-aware
         code editor.
       </p>
       <div class="cta-row">
@@ -96,12 +96,13 @@
             </p>
           </div>
           <div class="card">
-            <h3>// simple editor</h3>
+            <h3>// editor</h3>
             <p>
-              CodeMirror 6 with syntax highlighting for the languages I
-              actually use, find &amp; replace, bracket matching, autocompletion,
-              folding. Files open as tabs alongside your terminal tabs — one
-              unified tab bar.
+              CodeMirror 6, lean by default. Syntax highlighting, find &amp;
+              replace, folding — plus a git change-gutter (revert a hunk inline),
+              blame, and a symbol palette (<kbd>⌘⇧O</kbd>). Want real
+              diagnostics, completion, and go-to-definition? Flip on the language
+              server. Off until you ask.
             </p>
           </div>
           <div class="card">
@@ -118,7 +119,8 @@
             <p>
               The terminal is the center. Everything else orbits it and stays
               out of the way unless you need it. No extension marketplace, no
-              language servers chewing RAM, no dashboards I have to click past.
+              language servers chewing RAM unless you turn them on, no dashboards
+              I have to click past.
             </p>
           </div>
         </div>
@@ -159,6 +161,7 @@ cp -R src-tauri/target/release/bundle/macos/Launchpad.app /Applications/</code><
         <p class="subtitle">Everything is keyboard-first. Full list on the <a href="shortcuts.html">shortcuts page</a>.</p>
         <table class="kbd-table">
           <tr><td><kbd>⌘P</kbd></td><td>Quick open file (fuzzy search across the project)</td></tr>
+          <tr><td><kbd>⌘⇧O</kbd></td><td>Go to symbol in the current file</td></tr>
           <tr><td><kbd>⌘T</kbd> / <kbd>⌘W</kbd></td><td>New terminal tab / close tab</td></tr>
           <tr><td><kbd>⌘D</kbd></td><td>Split terminal pane (two PTYs in one tab)</td></tr>
           <tr><td><kbd>⌘\</kbd></td><td>Split workspace into left/right groups</td></tr>

@@ -101,20 +101,36 @@
         <p>
           Files open as tabs alongside your terminal tabs — one unified tab bar.
           Click a file in the sidebar or use <kbd>⌘P</kbd>, and it opens in a full
-          CodeMirror 6 editor.
+          CodeMirror 6 editor. Lean by default — the heavier features below are
+          opt-in, so the editor stays out of the way until you want them.
         </p>
+
+        <h3>Editing</h3>
         <ul>
           <li>Syntax highlighting for JS, TS, JSX, TSX, Python, Rust, HTML, CSS, JSON, Markdown, SCSS, TOML, YAML, Shell</li>
           <li>Find and replace (<kbd>⌘F</kbd> / <kbd>⌘H</kbd>)</li>
-          <li>Bracket matching, close brackets, code folding</li>
-          <li>Autocompletion, highlight selection matches</li>
-          <li>Rectangular selection, crosshair cursor</li>
-          <li>Line numbers, active line highlight, indent guides</li>
-          <li>File path breadcrumb with <code>›</code> separators + line/column status bar</li>
-          <li>Modified indicator in tab (yellow dot)</li>
-          <li>Unsaved changes warning on close</li>
-          <li>Right-click context menu (Cut, Copy, Paste, Select All)</li>
-          <li>Save with <kbd>⌘S</kbd></li>
+          <li>Bracket matching, close brackets, code folding, indent guides</li>
+          <li>Autocompletion, highlight selection matches, rectangular selection, crosshair cursor</li>
+          <li>File path breadcrumb + line/column status bar — click to toggle line endings, tab size, word wrap</li>
+          <li>Modified indicator, unsaved-changes warning on close, right-click context menu</li>
+          <li>Optional vim mode · save with <kbd>⌘S</kbd></li>
+        </ul>
+
+        <h3>Git-aware</h3>
+        <ul>
+          <li><strong>Change gutter</strong> — a per-line bar showing what changed vs HEAD (added / modified / deleted), matching the file-tree colors. Reflects disk-vs-HEAD, so a staged hunk still shows.</li>
+          <li><strong>Hunk navigation</strong> — jump between changed hunks with <kbd>⌥J</kbd> / <kbd>⌥K</kbd></li>
+          <li><strong>Inline hunk actions</strong> — click a gutter marker to <em>Revert hunk</em> (restore the HEAD version of those lines) or <em>Stage file</em></li>
+          <li><strong>Blame</strong> — a status-bar toggle reveals a left margin with short commit + age per line; hover for author + summary, click to open that commit's diff</li>
+          <li><strong>Inline conflict editor</strong> — Accept Ours / Theirs / Both above each conflict block, auto-stages when resolved (see the <a href="#git">git panel</a>)</li>
+        </ul>
+
+        <h3>Navigation &amp; intelligence</h3>
+        <ul>
+          <li><strong>Symbol outline</strong> (<kbd>⌘⇧O</kbd>) — a fuzzy palette of the file's functions / classes / methods / headings, derived from the syntax tree and upgraded to the language server's richer <code>documentSymbol</code> list when LSP is enabled</li>
+          <li><strong>Reveal active file in tree</strong> (opt-in) — keep the sidebar synced to the file you're editing</li>
+          <li><strong>Language server</strong> (opt-in, off by default) — flip it on and the editor connects to <code>typescript-language-server</code>, <code>rust-analyzer</code>, or <code>pyright</code> for real diagnostics, completion, hover, signature help, go-to-definition, rename, and find-references. Nothing spawns a server until you ask for it.</li>
+          <li><strong>Format on save</strong> (opt-in) — runs prettier / rustfmt / black / gofmt / shfmt on the saved file</li>
         </ul>
 
         <h2 id="git">Git panel</h2>
@@ -204,7 +220,7 @@
         <ul>
           <li><strong>General</strong> — sidebar width</li>
           <li><strong>Terminal</strong> — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink</li>
-          <li><strong>Editor</strong> — font size, tab size, word wrap</li>
+          <li><strong>Editor</strong> — font size, tab size, word wrap, vim mode, indent guides, format on save, reveal active file in tree, language server</li>
           <li><strong>Git</strong> — auto-refresh interval, default commit prefix</li>
         </ul>
         <p>Settings saved to <code>~/.launchpad/config.json</code>. Project list saved to <code>~/.launchpad/projects.json</code>.</p>

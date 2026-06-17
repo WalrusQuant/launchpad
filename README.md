@@ -1,6 +1,6 @@
 # Launchpad
 
-A terminal-first macOS workspace. Terminal, file browser, git panel, and a simple code editor — scoped to one project per window.
+A terminal-first macOS workspace. Terminal, file browser, git panel, and a git-aware code editor — scoped to one project per window.
 
 ![Built with Tauri](https://img.shields.io/badge/Tauri-v2-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey) ![License](https://img.shields.io/badge/license-Apache_2.0-green)
 
@@ -79,20 +79,30 @@ Full PTY-backed terminal with tabs, split panes, and a split workspace. Spawns r
 - Backpressure flow control prevents xterm.js write queue overflow
 
 ### Code Editor
-Files open as tabs alongside your terminal tabs — one unified tab bar. Click a file in the sidebar or use Cmd+P, and it opens in a full CodeMirror 6 editor.
+Files open as tabs alongside your terminal tabs — one unified tab bar. Click a file in the sidebar or use Cmd+P, and it opens in a full CodeMirror 6 editor. Lean by default; the heavier features are opt-in, so it stays out of the way until you want them.
 
+**Editing**
 - Syntax highlighting for JS, TS, JSX, TSX, Python, Rust, HTML, CSS, JSON, Markdown, SCSS, TOML, YAML, Shell
 - Find and replace (Cmd+F / Cmd+H)
-- Bracket matching, close brackets, code folding
-- Autocompletion, highlight selection matches
-- Rectangular selection, crosshair cursor
-- Line numbers, active line highlight, indent guides
-- File path breadcrumb with › separators + line/column status bar
-- Modified indicator in tab (yellow dot)
-- Unsaved changes warning on close
-- Right-click context menu with Cut, Copy, Paste, Select All
-- Open multiple files — each gets its own tab
+- Bracket matching, close brackets, code folding, indent guides
+- Autocompletion, highlight selection matches, rectangular selection, crosshair cursor
+- File path breadcrumb + line/column status bar (click to toggle line endings, tab size, word wrap)
+- Modified indicator, unsaved-changes warning on close, right-click context menu
+- Optional vim mode
 - Save with Cmd+S
+
+**Git-aware**
+- **Change gutter** — a per-line bar showing what changed vs HEAD (added / modified / deleted), matching the file-tree colors
+- **Hunk navigation** — jump between changed hunks with Alt+J / Alt+K
+- **Inline hunk actions** — click a gutter marker to **Revert hunk** (restore HEAD content) or **Stage file**
+- **Blame** — a status-bar toggle reveals a margin with short commit + age per line; click to open that commit's diff
+- **Inline conflict editor** — Accept Ours / Theirs / Both above each conflict block; auto-stages when resolved (see Git Panel)
+
+**Navigation & intelligence**
+- **Symbol outline** (Cmd+Shift+O) — fuzzy palette of the file's functions / classes / methods / headings, from the syntax tree (and upgraded to the language server's richer list when enabled)
+- **Reveal active file in tree** (opt-in) — keep the sidebar synced to the file you're editing
+- **Language server** (opt-in, off by default) — flip it on and the editor connects to `typescript-language-server`, `rust-analyzer`, or `pyright` for real diagnostics, completion, hover, signature help, go-to-definition, rename, and find-references. No servers run until you ask for them.
+- **Format on save** (opt-in) — runs prettier / rustfmt / black / gofmt / shfmt on the file you saved
 
 ### Git Panel
 Open with Cmd+G. A visual git workflow designed so you never have to remember git commands. Stage, commit, push, pull, stash, merge, create branches, amend, cherry-pick, rebase — all from buttons.
@@ -143,7 +153,7 @@ All preferences in one place, applied live:
 
 - **General** — sidebar width
 - **Terminal** — font family (SF Mono, Menlo, Fira Code, JetBrains Mono...), font size, scrollback, cursor style, cursor blink
-- **Editor** — font size, tab size, word wrap
+- **Editor** — font size, tab size, word wrap, vim mode, indent guides, format on save, reveal active file in tree, language server
 - **Git** — auto-refresh interval, default commit prefix
 
 Settings saved to `~/.launchpad/config.json`. Project list saved to `~/.launchpad/projects.json`.
@@ -170,9 +180,11 @@ A compact header bar with quick access to:
 | Cmd+Shift+M | Move tab to other group |
 | Cmd+K | Clear terminal |
 | Cmd+P | Quick open (fuzzy file search) |
+| Cmd+Shift+O | Go to symbol in current file |
 | Cmd+G | Toggle git panel |
 | Cmd+F | Find in editor / search sidebar |
 | Cmd+H | Find and replace in editor |
+| Alt+J / Alt+K | Jump to next / previous changed hunk (editor) |
 | Cmd+S | Save file in editor |
 | Cmd+, | Open settings |
 | Escape | Close diff preview / dialog |
