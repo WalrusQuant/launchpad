@@ -4,6 +4,12 @@ const { invoke } = window.__TAURI__.core;
 
 let currentGitInfo = null;
 let currentGitRoot = null;
+// The project path relative to the git workdir ("" when the project IS the repo
+// root). git status/index paths are workdir-relative, but DOM entries are
+// anchored on the project path — when a project is opened as a subdirectory of
+// a larger repo the two differ by this prefix. Prepended to project-relative
+// paths to get the workdir-relative key used in currentGitInfo.files.
+let currentGitSubdir = "";
 let gitPollInterval = null;
 
 // Snapshot of `get_pending_op_state` from the most recent poll. Exposed via
@@ -60,6 +66,7 @@ export async function fetchGitStatus(path) {
   try {
     currentGitInfo = await invoke("get_git_status", { path });
     currentGitRoot = path;
+    currentGitSubdir = currentGitInfo?.subdir || "";
     applyGitColors();
     return currentGitInfo;
   } catch (err) {
@@ -87,7 +94,23 @@ const GIT_STATUS_BADGE = {
   index_renamed: "R",
 };
 
-function applyGitColors() {
+// Severity ranking for folder rollup: when a directory has no exact status of
+// its own, it inherits the MOST important status among its descendants. Higher
+// wins. Without this the rollup took the first child git happened to list, so
+// a conflict could be silently masked by a modified sibling.
+const GIT_STATUS_SEVERITY = {
+  conflict: 6,
+  deleted: 5,
+  index_deleted: 5,
+  modified: 4,
+  index_modified: 4,
+  renamed: 3,
+  index_renamed: 3,
+  new: 2,
+  index_new: 1,
+};
+
+export function applyGitColors() {
   if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return;
 
   // Map of git-relative-path → status
@@ -111,7 +134,9 @@ function applyGitColors() {
 
     const filePath = el.dataset.path;
     if (!filePath || !filePath.startsWith(rootWithSlash)) return;
-    const rel = filePath.slice(rootWithSlash.length);
+    // Project-relative, then prefixed to workdir-relative (no-op when the
+    // project is the repo root, i.e. currentGitSubdir === "").
+    const rel = currentGitSubdir + filePath.slice(rootWithSlash.length);
 
     // First check exact match. Then check if this entry is an ancestor
     // directory of a modified file (so a folder containing modified
@@ -120,11 +145,17 @@ function applyGitColors() {
     // files in sibling trees (src/foo.js vs lib/foo.js).
     let matched = statusMap.get(rel);
     if (!matched) {
+      // Roll up the highest-severity descendant status, not the first one git
+      // listed — otherwise a conflict can be masked by a modified sibling.
       const relWithSlash = rel + "/";
+      let bestSeverity = 0;
       for (const [gitPath, status] of statusMap) {
         if (gitPath.startsWith(relWithSlash)) {
-          matched = status;
-          break;
+          const sev = GIT_STATUS_SEVERITY[status] || 0;
+          if (sev > bestSeverity) {
+            bestSeverity = sev;
+            matched = status;
+          }
         }
       }
     }
@@ -165,9 +196,19 @@ export function stopGitPolling() {
 }
 
 export function getGitFileStatus(filePath) {
-  if (!currentGitInfo || !currentGitInfo.is_repo) return null;
+  if (!currentGitInfo || !currentGitInfo.is_repo || !currentGitRoot) return null;
+  // Anchor on the project root and compare git-relative paths exactly, the
+  // same way applyGitColors does. The old endsWith("/" + f.path) match
+  // collided between same-named files in sibling trees (src/foo.js vs
+  // lib/foo.js) and could even match across unrelated roots — wrong here
+  // because this status gates conflict-mode on editor open.
+  const rootWithSlash = currentGitRoot.replace(/\/+$/, "") + "/";
+  if (!filePath.startsWith(rootWithSlash)) return null;
+  // Project-relative, then prefixed to the workdir-relative key git2 uses
+  // (no-op when the project is the repo root).
+  const rel = currentGitSubdir + filePath.slice(rootWithSlash.length);
   for (const f of currentGitInfo.files) {
-    if (filePath.endsWith("/" + f.path)) return f.status;
+    if (f.path === rel) return f.status;
   }
   return null;
 }

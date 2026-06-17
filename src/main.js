@@ -225,6 +225,34 @@ function getTerminalTheme() {
   return getResolvedTheme() === "light" ? lightTerminalTheme : darkTerminalTheme;
 }
 
+// Load the WebGL renderer for a pane and, critically, recover from context
+// loss. Browsers cap the number of live WebGL contexts (~8-16) and evict the
+// least-recently-used one when the cap is hit. With a split workspace you have
+// 2+ live terminal canvases; clicking from one group to the other makes the
+// group you just LEFT the eviction candidate — its context is lost and, with
+// no handler, its canvas stops painting (the "one terminal goes blank" bug,
+// issue #3). On loss we dispose the dead addon and load a fresh one so the
+// terminal repaints; if WebGL is unavailable entirely we fall back to canvas.
+function loadWebgl(pane) {
+  try {
+    const addon = new WebglAddon();
+    addon.onContextLoss(() => {
+      addon.dispose();
+      // Re-create on the next frame so the GL stack has settled after the loss.
+      // Guard on our own `disposed` flag, not term.element: xterm's element
+      // getter survives term.dispose(), so a context-loss whose rAF fires after
+      // destroyPane would otherwise call loadAddon on a dead terminal and leak
+      // a GL context.
+      requestAnimationFrame(() => {
+        if (!pane.disposed) loadWebgl(pane);
+      });
+    });
+    pane.term.loadAddon(addon);
+  } catch (e) {
+    console.warn("WebGL renderer not available, using default");
+  }
+}
+
 async function createPane(parentEl, cwd) {
   const s = getSettings();
   const term = new Terminal({
@@ -255,6 +283,7 @@ async function createPane(parentEl, cwd) {
     ptyId: null,
     term,
     fitAddon,
+    disposed: false,
     el,
     // Flow control — backpressure replaces gate/buffer/settle resize coordination
     unackedChars: 0,
@@ -280,11 +309,7 @@ async function createPane(parentEl, cwd) {
       await document.fonts.ready;
     }
     term.open(el);
-    try {
-      term.loadAddon(new WebglAddon());
-    } catch (e) {
-      console.warn("WebGL renderer not available, using default");
-    }
+    loadWebgl(pane);
     fitAddon.fit();
     // Pass actual dimensions so the PTY starts at the right size — no resize race.
     // projectPath is the key Rust uses to look up per-project env vars (see
@@ -312,6 +337,9 @@ async function createPane(parentEl, cwd) {
 }
 
 function destroyPane(pane) {
+  // Mark disposed BEFORE term.dispose() so a WebGL context-loss rAF queued by
+  // this pane's renderer can't re-create an addon on the dead terminal.
+  pane.disposed = true;
   pane.term.dispose();
   pane.el.remove();
   if (pane.ptyId !== null) {
@@ -2168,26 +2196,16 @@ const resizeObserver = new ResizeObserver((entries) => {
     w: Math.round(entry?.contentRect?.width ?? 0),
     h: Math.round(entry?.contentRect?.height ?? 0),
   });
-  const tab = tabs.get(activeTabUiId);
-  if (tab?.type === "terminal") fitAllPanes(tab);
-  // When workspace is split, the right group's terminal needs refitting too
-  // — ResizeObserver only watches the left container, so without this the
-  // right group's xterm grid stays CSS-stretched after window resizes.
-  if (isSplit && rightActiveTabUiId !== -1) {
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
-  }
+  // Fit both groups' active terminals — the ResizeObserver only watches the
+  // left container, so without the right-group refit its xterm grid stays
+  // CSS-stretched after window resizes.
+  refitGroupTerminals();
 });
 resizeObserver.observe(terminalContainer);
 
 // Refit terminal after git panel close transition (ResizeObserver is blocked during transition)
 window.addEventListener(PANEL_TRANSITION_DONE, () => {
-  const tab = tabs.get(activeTabUiId);
-  if (tab?.type === "terminal") fitAllPanes(tab);
-  if (isSplit && rightActiveTabUiId !== -1) {
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
-  }
+  refitGroupTerminals();
 });
 
 // Sidebar resize
@@ -2229,10 +2247,7 @@ function setSidebarCollapsed(collapsed, { persist = true } = {}) {
   if (persist) saveSetting("sidebarCollapsed", collapsed);
   // Reflow terminals after width change settles
   requestAnimationFrame(() => {
-    const tab = tabs.get(activeTabUiId);
-    if (tab?.type === "terminal") fitAllPanes(tab);
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+    refitGroupTerminals();
   });
 }
 
@@ -2341,10 +2356,16 @@ document.addEventListener("keydown", (e) => {
   }
   if (keyMatches(e, "saveFile")) {
     e.preventDefault();
-    if (isEditorTab) {
-      saveEditorTab(activeTabUiId);
-    } else if (isMergeTab) {
-      saveMergeTab(activeTabUiId);
+    // Save the tab in the FOCUSED group, not always the left group. When the
+    // workspace is split and the user is editing a file in the right group,
+    // Cmd+S must save that tab — routing to activeTabUiId (always left) would
+    // silently save the wrong tab or no-op, and the user thinks they saved.
+    const saveId = isSplit && focusedGroup === "right" ? rightActiveTabUiId : activeTabUiId;
+    const saveTab = tabs.get(saveId);
+    if (saveTab?.type === "editor") {
+      saveEditorTab(saveId);
+    } else if (saveTab?.type === "merge") {
+      saveMergeTab(saveId);
     }
     return;
   }
@@ -2431,9 +2452,16 @@ document.addEventListener("keydown", (e) => {
   if (e.metaKey && e.key >= "1" && e.key <= "9") {
     e.preventDefault();
     const idx = parseInt(e.key) - 1;
-    const tabIds = [...tabs.keys()];
-    if (idx < tabIds.length) {
-      switchTab(tabIds[idx]);
+    // Index into the FOCUSED group's visible tabs, using the same sources the
+    // two tab bars render from (left skips _rightGroup tabs; right is
+    // rightGroupTabIds). The old code indexed the unified map, so Cmd+N could
+    // land on a right-group tab and drive it through switchTab — desyncing the
+    // left/right active tracking.
+    if (isSplit && focusedGroup === "right") {
+      if (idx < rightGroupTabIds.length) switchRightTab(rightGroupTabIds[idx]);
+    } else {
+      const leftIds = [...tabs.entries()].filter(([, t]) => !t._rightGroup).map(([id]) => id);
+      if (idx < leftIds.length) switchTab(leftIds[idx]);
     }
   }
 });
@@ -2453,7 +2481,9 @@ terminalContainer.addEventListener("click", (e) => {
 // Unsaved changes warning
 window.addEventListener("beforeunload", (e) => {
   for (const tab of tabs.values()) {
-    if (tab.type === "editor" && tab.modified) {
+    // Merge tabs track `modified` and are saveable too — a reload/quit must
+    // warn before silently dropping unsaved conflict resolutions.
+    if ((tab.type === "editor" || tab.type === "merge") && tab.modified) {
       e.preventDefault();
       e.returnValue = "";
       return;
@@ -2492,15 +2522,27 @@ function showDropIndicator(tabBar, insertIndex) {
   }
 }
 
-function reorderTabs(tabsMap, fromKey, toIndex) {
-  const entries = [...tabsMap.entries()];
-  const fromIdx = entries.findIndex(([k]) => k === fromKey);
+// Reorder a left-group tab. `toIndex` is an index into the LEFT bar's visible
+// tabs (which excludes right-group tabs). The old code reordered the full
+// `tabs` map using a fromIdx computed against ALL entries but a toIndex in the
+// left-only space — the two index spaces diverge whenever a right-group tab
+// sits earlier in the map, dropping the tab at the wrong position. This
+// permutes only the left tabs among their own map slots and leaves right-group
+// entries exactly where they are.
+function reorderLeftTab(fromKey, toIndex) {
+  const entries = [...tabs.entries()];
+  const leftPositions = [];
+  entries.forEach(([, t], i) => { if (!t._rightGroup) leftPositions.push(i); });
+  const leftOrder = leftPositions.map((i) => entries[i]);
+  const fromIdx = leftOrder.findIndex(([k]) => k === fromKey);
   if (fromIdx === -1 || fromIdx === toIndex) return;
-  const [entry] = entries.splice(fromIdx, 1);
+  const [moved] = leftOrder.splice(fromIdx, 1);
   if (toIndex > fromIdx) toIndex--;
-  entries.splice(toIndex, 0, entry);
-  tabsMap.clear();
-  entries.forEach(([k, v]) => tabsMap.set(k, v));
+  leftOrder.splice(toIndex, 0, moved);
+  // Write the reordered left tabs back into the same slots they occupied.
+  leftPositions.forEach((pos, j) => { entries[pos] = leftOrder[j]; });
+  tabs.clear();
+  entries.forEach(([k, v]) => tabs.set(k, v));
 }
 
 function startTabDrag(tabEl, uiId, sourceGroup, e) {
@@ -2566,7 +2608,7 @@ function startTabDrag(tabEl, uiId, sourceGroup, e) {
           const leftEntries = [...tabs.entries()].filter(([, t]) => !t._rightGroup);
           const fromIdx = leftEntries.findIndex(([k]) => k === uiId);
           if (fromIdx !== -1 && fromIdx !== insertIdx) {
-            reorderTabs(tabs, uiId, insertIdx);
+            reorderLeftTab(uiId, insertIdx);
             renderTabBar();
           }
         } else {
@@ -2651,6 +2693,25 @@ function setFocusedGroup(group) {
   const right = document.getElementById("group-right");
   if (left) left.classList.toggle("group-focused", group === "left");
   if (right) right.classList.toggle("group-focused", group === "right");
+  // The .group-focused class can change a group's box sizing (focus border),
+  // which resizes BOTH groups' panes. Nothing else re-fits on a focus switch,
+  // so a group could be left with a stale xterm grid (contributing cause of
+  // issue #3). Re-fit each group's active terminal after the class flip.
+  refitGroupTerminals({ immediate: true });
+}
+
+// Re-fit the active terminal tab in each group. Cheap no-op for non-terminal
+// active tabs. Used after focus switches and other layout-affecting changes
+// (window/sidebar resize, panel transition) that the ResizeObserver on the
+// shared outer container doesn't catch for the right group. `immediate`
+// matches the caller's needs: focus switches fit synchronously; rapid resize
+// events use the debounced default to avoid thrashing.
+function refitGroupTerminals({ immediate = false } = {}) {
+  for (const id of [activeTabUiId, isSplit ? rightActiveTabUiId : -1]) {
+    if (id === -1) continue;
+    const tab = tabs.get(id);
+    if (tab && tab.type === "terminal") fitAllPanes(tab, { immediate });
+  }
 }
 
 function renderRightTabBar() {
@@ -2745,8 +2806,10 @@ function switchRightTab(uiId) {
   rightActiveTabUiId = uiId;
 
   if (tab.type === "terminal") {
+    // Fit immediately (parity with switchTab) so the grid matches the
+    // container before paint; focus on the next frame.
+    fitAllPanes(tab, { immediate: true });
     requestAnimationFrame(() => {
-      fitAllPanes(tab);
       const activePane = tab.panes[tab.activePane] || tab.panes[0];
       if (activePane) activePane.term.focus();
     });

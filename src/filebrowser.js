@@ -1,6 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 import { pushEscape, popEscape, showConfirmDialog } from "./main.js";
 import { PATH_RENAMED } from "./events.js";
+import { applyGitColors } from "./git.js";
 
 let currentPath = "";
 let projectRoot = ""; // set by initFileBrowser; navigation is capped at or within this
@@ -436,6 +437,12 @@ async function _doLoadDirectory(path, parentEl, depth = 0) {
     // Swap in the complete tree atomically — no flash of empty content
     parentEl.innerHTML = "";
     parentEl.appendChild(fragment);
+
+    // Recolor immediately from the latest git status. The freshly-built rows
+    // carry no git classes, and the 3s poll's applyGitColors won't run for up
+    // to an interval — without this, a rebuilt tree (or a just-expanded folder)
+    // shows uncolored until the next tick.
+    applyGitColors();
 
     // After every top-level rebuild, re-anchor the roving tabindex so
     // exactly one row is Tab-focusable. Sub-tree loads (depth > 0) skip
@@ -1387,6 +1394,7 @@ async function renderSearchResults(query) {
 
   tree.innerHTML = "";
   tree.appendChild(fragment);
+  applyGitColors();
   applyRovingTabIndex();
 }
 
