@@ -87,7 +87,6 @@ const launchpadTheme = EditorView.theme({
   "&": {
     backgroundColor: "var(--surface-4)",
     color: "var(--text-8)",
-    fontSize: "12px",
     height: "100%",
   },
   ".cm-content": {
@@ -148,14 +147,24 @@ const launchpadTheme = EditorView.theme({
   },
 });
 
+// Font size lives in its own reconfigurable theme so the `editorFontSize`
+// setting can be applied live (via the handle's setFontSize), the same way the
+// terminal honors termFontSize. Set on "&" so the whole editor — content and
+// gutters — scales together.
+const fontSizeTheme = (px) => EditorView.theme({ "&": { fontSize: `${px}px` } });
+
+const DEFAULT_FONT_SIZE = 12;
+
 /**
  * Create a CodeMirror editor instance.
- * Returns { view, setTabSize, setWordWrap } — caller owns the view's lifecycle.
+ * Returns { view, setTabSize, setWordWrap, setFontSize } — caller owns the
+ * view's lifecycle.
  */
-export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, vimMode, theme, conflictMode, readOnly, onOpenThreeWay } = {}) {
+export function createEditor(parentEl, content, fileName, { onChange, onCursorChange, tabSize, wordWrap, fontSize, vimMode, theme, conflictMode, readOnly, onOpenThreeWay } = {}) {
   const isLight = theme === "light";
   const tabSizeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
+  const fontSizeCompartment = new Compartment();
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
@@ -187,6 +196,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     EditorState.allowMultipleSelections.of(true),
     tabSizeCompartment.of(EditorState.tabSize.of(tabSize || 2)),
     wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
+    fontSizeCompartment.of(fontSizeTheme(fontSize || DEFAULT_FONT_SIZE)),
     EditorView.updateListener.of((update) => {
       if (update.docChanged && onChange) {
         onChange(update.view.state.doc.toString());
@@ -214,6 +224,9 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     },
     setWordWrap(on) {
       view.dispatch({ effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []) });
+    },
+    setFontSize(px) {
+      view.dispatch({ effects: fontSizeCompartment.reconfigure(fontSizeTheme(px || DEFAULT_FONT_SIZE)) });
     },
   };
 }

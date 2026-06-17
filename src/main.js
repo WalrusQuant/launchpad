@@ -748,6 +748,7 @@ async function createEditorTab(filePath, options = {}) {
     },
     tabSize: effectiveTabSize,
     wordWrap: effectiveWordWrap,
+    fontSize: editorSettings.editorFontSize,
     vimMode: editorSettings.editorVimMode,
     theme: getResolvedTheme(),
     conflictMode,
@@ -1479,6 +1480,7 @@ export async function createMergeTab({ filePath }) {
   const baseOptions = {
     tabSize: editorSettings.editorTabSize,
     wordWrap: editorSettings.editorWordWrap,
+    fontSize: editorSettings.editorFontSize,
     theme: getResolvedTheme(),
   };
 
@@ -1520,6 +1522,9 @@ export async function createMergeTab({ filePath }) {
     conflictMode: true,
   });
   tab.mergedView = mergedHandle.view;
+  // Keep the handles so live settings (e.g. editorFontSize) can reconfigure
+  // all three panes the same way single-editor tabs do.
+  tab.editorHandles = [oursHandle, theirsHandle, mergedHandle];
 
   tabs.set(uiId, tab);
 
@@ -1780,6 +1785,19 @@ function applySettingLive(key, value) {
       // Route through the gated/awaited resize path so font-metric changes
       // can't race with PTY output (Race #2 fix).
       fitAllPanes(tab, { immediate: true });
+    }
+  }
+
+  // Apply editor settings to all open editor / merge tabs. Only the keys with
+  // a live reconfigure path are handled here; others (vimMode, etc.) still take
+  // effect on the next file open.
+  if (key === "editorFontSize") {
+    for (const tab of tabs.values()) {
+      if (tab.type === "editor" && tab.editorHandle) {
+        tab.editorHandle.setFontSize(value);
+      } else if (tab.type === "merge" && tab.editorHandles) {
+        for (const h of tab.editorHandles) h.setFontSize(value);
+      }
     }
   }
 
