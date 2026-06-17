@@ -26,18 +26,18 @@ your `PATH`: `typescript-language-server` (JS/TS), `rust-analyzer` (Rust),
 ## Phase 1 — Git-aware editor
 **Setup:** open a tracked file in a repo with some uncommitted changes.
 
-- [ ] Change gutter shows per-line bars: added (green) / modified (warm) / deleted (red wedge), matching the file-tree colors and the right lines
-- [ ] Stage a hunk in the git panel → the gutter marker still shows (reflects disk-vs-HEAD, not vs-index)
-- [ ] Alt+J / Alt+K jump to next / previous changed hunk
-- [ ] Click a marker → popover with **Revert hunk** / **Stage file**
-  - [ ] Revert hunk restores HEAD content correctly for a **modification**
-  - [ ] Revert hunk correct for a **pure-deletion** hunk (lines come back in the right place)
-  - [ ] Revert hunk correct for an **end-of-file** hunk (no stray/missing trailing newline)
-  - [ ] Revert is disabled/gated when the tab has unsaved edits
-  - [ ] Stage file works and the git panel refreshes
-- [ ] Blame toggle (status bar) → left margin shows short OID + age; hover shows author + summary; click opens that commit's diff
-- [ ] After committing, the gutter clears for the now-committed lines
-- [ ] A file opened from outside the repo → gutter no-ops (no errors)
+- [x] Change gutter shows per-line bars: added (green) / modified (warm) / deleted (red wedge), matching the file-tree colors and the right lines
+- [x] Stage a hunk in the git panel → the gutter marker still shows (reflects disk-vs-HEAD, not vs-index)
+- [x] Alt+J / Alt+K jump to next / previous changed hunk (fixed: macOS Option-compose made the keymap binding dead; now matches on physical key code)
+- [x] Click a marker → popover with **Revert hunk** / **Stage file** (fixed: popover opened on mousedown but dismissed on the completing click; now opens on click and stays)
+  - [x] Revert hunk restores HEAD content correctly for a **modification**
+  - [x] Revert hunk correct for a **pure-deletion** hunk (lines come back in the right place)
+  - [!] Revert hunk correct for an **end-of-file** hunk — FOUND+FIXED: "Couldn't revert — the diff is stale". Root cause: libgit2's synthetic "\ No newline at end of file" EOFNL line ('=','>','<') was bucketed as context and inflated the hunk's reconstructed text, so revert bailed. Now skipped in collect_structured_diff/_files_diff (git.rs). Pending live re-verify after Rust rebuild.
+  - [x] Revert is disabled/gated when the tab has unsaved edits
+  - [x] Stage file works and the git panel refreshes
+- [x] Blame toggle (status bar) → left margin shows short OID + age; hover shows author + summary; click opens that commit's diff
+- [!] After committing, the gutter clears for the now-committed lines — FOUND+FIXED: marker persisted because commit/amend moves HEAD without an fs-changed event, so the gutter never recomputed. Now commit/amend dispatch HEAD_MOVED and main.js repaints every open editor's gutter. Pending live re-verify after reload.
+- [~] A file opened from outside the repo → gutter no-ops — N/A: file nav is locked to project root and there's no open-external path, so this state isn't reachable in normal use
 
 ## Phase 2 — Polish
 - [ ] Indent guides render (toggle `editorIndentGuides`)
@@ -46,8 +46,8 @@ your `PATH`: `typescript-language-server` (JS/TS), `rust-analyzer` (Rust),
 - [ ] (Paths with spaces) LSP + reveal still work for a project under a path containing a space
 
 ## Phase 0 / older debt
-- [ ] `editorFontSize`: change it in Settings → already-open editors resize live
-- [ ] **Issue #3**: split the workspace (Cmd+\), click back and forth between the two terminal groups → the just-left terminal does **not** blank out (WebGL context-loss fix). Close issue #3 if good.
+- [x] `editorFontSize`: change it in Settings → already-open editors resize live
+- [x] **Issue #3**: split the workspace (Cmd+\), click back and forth between the two terminal groups → the just-left terminal does **not** blank out (WebGL context-loss fix). Close issue #3 if good.
 
 ## Merge tab (touched by the font/indent live-apply work)
 - [ ] Open a 3-pane merge tab on a conflict → all three panes render; font size and indent-guide settings apply

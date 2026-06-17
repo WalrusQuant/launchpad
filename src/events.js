@@ -14,3 +14,7 @@ export const FS_CHANGED = "fs-changed";
 // here too keeps the policy uniform.
 export const PATH_RENAMED = "launchpad:path-renamed";
 export const PANEL_TRANSITION_DONE = "panel-transition-done";
+// HEAD moved (commit / amend) without the working file changing on disk — open
+// editors must recompute their change gutter (disk-vs-HEAD) since fs-changed
+// won't fire for a commit.
+export const HEAD_MOVED = "launchpad:head-moved";

@@ -1,6 +1,6 @@
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, rectangularSelection, crosshairCursor } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
-import { defaultKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirror/commands";
 import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, foldGutter, indentOnInput } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
@@ -182,6 +182,10 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
 
   const extensions = [
     ...(vimMode ? [vim()] : []),
+    // Undo/redo. defaultKeymap binds Cmd+Z/Cmd+Shift+Z to the undo/redo commands,
+    // but those are no-ops without the history() state field installed — so this
+    // must be present or the editor has no undo at all.
+    history(),
     lineNumbers(),
     // Change gutter sits just right of the line numbers (VS Code-style). Only
     // wired for real on-disk files in a repo; the host pushes classifications
@@ -209,7 +213,7 @@ export function createEditor(parentEl, content, fileName, { onChange, onCursorCh
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     ...(isLight ? [] : [oneDark]),
     launchpadTheme,
-    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, indentWithTab]),
+    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
     search(),
     ...getLang(fileName),
     ...(conflictMode

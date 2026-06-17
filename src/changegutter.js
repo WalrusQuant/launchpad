@@ -1,4 +1,4 @@
-import { gutter, GutterMarker, keymap, EditorView } from "@codemirror/view";
+import { gutter, GutterMarker, EditorView } from "@codemirror/view";
 import { StateField, StateEffect, RangeSetBuilder, RangeSet } from "@codemirror/state";
 
 // Change gutter: paints a per-line bar showing how each line differs from HEAD
@@ -167,10 +167,26 @@ export const goToNextChange = (view) => jumpToChange(view, 1);
 /** Move the cursor to the previous changed line (wraps at start). */
 export const goToPrevChange = (view) => jumpToChange(view, -1);
 
-const changeNavKeymap = keymap.of([
-  { key: "Alt-j", run: goToNextChange },
-  { key: "Alt-k", run: goToPrevChange },
-]);
+// Hunk navigation: Alt+J (next) / Alt+K (prev). We can't use a normal
+// `keymap.of([{ key: "Alt-j" }])` here — on macOS CodeMirror deliberately
+// refuses to recover the base letter from an Alt+letter event (Option is the
+// compose key, so Option+J arrives as "∆"), so the binding would never fire and
+// the glyph would get typed instead. Matching on the *physical* key (`event.code`,
+// with a `keyCode` fallback for older webviews) sidesteps the compose layer and
+// is keyboard-layout-independent. We always preventDefault on a bare Alt+J/K so
+// the ∆/˚ glyph never leaks into the buffer even when there's no hunk to jump to.
+const changeNavHandler = EditorView.domEventHandlers({
+  keydown(event, view) {
+    if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+    const isJ = event.code === "KeyJ" || event.keyCode === 74;
+    const isK = event.code === "KeyK" || event.keyCode === 75;
+    if (!isJ && !isK) return false;
+    event.preventDefault();
+    if (isJ) goToNextChange(view);
+    else goToPrevChange(view);
+    return true;
+  },
+});
 
 /**
  * Editor extension that renders the change gutter and wires hunk navigation
@@ -185,9 +201,14 @@ export function changeGutter({ onMarkerClick } = {}) {
   const view = gutter({
     class: "cm-change-gutter",
     markers: (v) => v.state.field(changeField),
+    // Open on `click`, not `mousedown`: the host's popover defers its
+    // dismiss-on-document-click by one tick to skip the opening interaction,
+    // which only works when that interaction is itself a click. Opening on
+    // mousedown left the completing click of the same press to dismiss the menu
+    // instantly (it only stayed up while the button was held).
     domEventHandlers: onMarkerClick
       ? {
-          mousedown(v, line, event) {
+          click(v, line, event) {
             const lineNo = v.state.doc.lineAt(line.from).number;
             if (!lineHasChange(v.state, lineNo)) return false;
             onMarkerClick(v, lineNo, event);
@@ -196,7 +217,7 @@ export function changeGutter({ onMarkerClick } = {}) {
         }
       : undefined,
   });
-  return [changeField, view, changeNavKeymap];
+  return [changeField, view, changeNavHandler];
 }
 
 /** Push a fresh { added, modified, deleted } classification into the view. */

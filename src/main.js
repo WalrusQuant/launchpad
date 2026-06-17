@@ -22,7 +22,7 @@ import { matches as keyMatches } from "./keymap.js";
 import { createSettingsPanel } from "./settingspanel.js";
 import { addProject, touchProject, setActiveProject, getActiveProject, focusProjectWindow, registerProjectWindow, unregisterProjectWindow, unregisterCurrentWindow } from "./projects.js";
 import { showPicker, hidePicker } from "./projectpicker.js";
-import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE } from "./events.js";
+import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE, HEAD_MOVED } from "./events.js";
 import { lspExtensionForFile, shutdownAllLsp, lspDocumentSymbols } from "./lspclient.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -2613,6 +2613,15 @@ window.addEventListener(PATH_RENAMED, (e) => {
     }
   }
   if (anyUpdated) renderTabBar();
+});
+
+// A commit / amend moves HEAD without touching the working file, so fs-changed
+// won't fire — repaint every open editor's change gutter (disk-vs-HEAD) so the
+// now-committed lines stop showing as changes.
+window.addEventListener(HEAD_MOVED, () => {
+  for (const [, tab] of tabs) {
+    if (tab.type === "editor") refreshEditorGutter(tab);
+  }
 });
 
 // Resize observer
