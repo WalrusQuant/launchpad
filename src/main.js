@@ -4,8 +4,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
 import { createEditor, getLangName } from "./editor.js";
-import { updateChangeGutter } from "./changegutter.js";
-import { deriveLineChanges } from "./changegutter.js";
+import { updateChangeGutter, deriveLineChanges } from "./changegutter.js";
 import { collectSymbols } from "./symbols.js";
 import { undoDepth, redoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
@@ -1797,6 +1796,7 @@ export async function createMergeTab({ filePath }) {
     wordWrap: editorSettings.editorWordWrap,
     fontSize: editorSettings.editorFontSize,
     theme: getResolvedTheme(),
+    visualExtras: { indentGuides: editorSettings.editorIndentGuides },
   };
 
   // Side panes: read-only, no vim (vim's command mode would intercept
@@ -2068,7 +2068,7 @@ async function saveEditorTab(uiId) {
     // Gate is `parseConflictBlocks` returning [] — not a substring scan —
     // so source files containing literal "<<<<<<< HEAD" (e.g. test fixtures)
     // never wrongly trigger a stage.
-    if (tab.conflictMode && parseConflictBlocks(rawContent).length === 0) {
+    if (tab.conflictMode && parseConflictBlocks(savedContent).length === 0) {
       const project = getActiveProject();
       if (project) {
         try {
@@ -2157,7 +2157,11 @@ function applySettingLive(key, value) {
   if (key === "editorIndentGuides") {
     const flags = { indentGuides: value };
     for (const tab of tabs.values()) {
-      if (tab.type === "editor" && tab.editorHandle) tab.editorHandle.setVisualExtras(flags);
+      if (tab.type === "editor" && tab.editorHandle) {
+        tab.editorHandle.setVisualExtras(flags);
+      } else if (tab.type === "merge" && tab.editorHandles) {
+        for (const h of tab.editorHandles) h.setVisualExtras(flags);
+      }
     }
   }
 

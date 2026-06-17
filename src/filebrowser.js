@@ -1593,15 +1593,21 @@ export async function revealPath(absPath) {
   }
   await refreshFileBrowser();
 
-  const row = document.querySelector(`.file-entry[data-path="${CSS.escape(absPath)}"]`);
-  if (!row) return;
-  setSingleSelection(absPath);
+  // Find the row by exact dataset match while toggling selection — avoids a
+  // querySelector with the path interpolated into an attribute selector (which
+  // needs delicate escaping for paths with spaces/quotes). dataset.path holds
+  // the raw path, so a direct === comparison is exact.
+  let matchRow = null;
   document.querySelectorAll(".file-entry").forEach((r) => {
     const on = r.dataset.path === absPath;
     r.classList.toggle("selected", on);
     r.setAttribute("aria-selected", on ? "true" : "false");
+    if (on) matchRow = r;
   });
-  row.scrollIntoView({ block: "center" });
+  if (matchRow) {
+    setSingleSelection(absPath);
+    matchRow.scrollIntoView({ block: "center" });
+  }
 }
 
 export function openFileByPath(fullPath) {
