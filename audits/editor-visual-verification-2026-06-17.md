@@ -32,11 +32,11 @@ your `PATH`: `typescript-language-server` (JS/TS), `rust-analyzer` (Rust),
 - [x] Click a marker → popover with **Revert hunk** / **Stage file** (fixed: popover opened on mousedown but dismissed on the completing click; now opens on click and stays)
   - [x] Revert hunk restores HEAD content correctly for a **modification**
   - [x] Revert hunk correct for a **pure-deletion** hunk (lines come back in the right place)
-  - [!] Revert hunk correct for an **end-of-file** hunk — FOUND+FIXED: "Couldn't revert — the diff is stale". Root cause: libgit2's synthetic "\ No newline at end of file" EOFNL line ('=','>','<') was bucketed as context and inflated the hunk's reconstructed text, so revert bailed. Now skipped in collect_structured_diff/_files_diff (git.rs). Pending live re-verify after Rust rebuild.
+  - [x] Revert hunk correct for an **end-of-file** hunk — FOUND+FIXED+VERIFIED. Root cause: libgit2's synthetic "\ No newline at end of file" EOFNL line ('=','>','<') was bucketed as context and inflated the hunk's reconstructed text, so revert bailed. Now skipped in collect_structured_diff/_files_diff (git.rs). Confirmed working live.
   - [x] Revert is disabled/gated when the tab has unsaved edits
   - [x] Stage file works and the git panel refreshes
 - [x] Blame toggle (status bar) → left margin shows short OID + age; hover shows author + summary; click opens that commit's diff
-- [!] After committing, the gutter clears for the now-committed lines — FOUND+FIXED: marker persisted because commit/amend moves HEAD without an fs-changed event, so the gutter never recomputed. Now commit/amend dispatch HEAD_MOVED and main.js repaints every open editor's gutter. Pending live re-verify after reload.
+- [x] After committing, the gutter clears for the now-committed lines — FOUND+FIXED+VERIFIED: marker persisted because commit/amend moves HEAD without an fs-changed event, so the gutter never recomputed. Now commit/amend dispatch HEAD_MOVED and main.js repaints every open editor's gutter. Confirmed working live.
 - [~] A file opened from outside the repo → gutter no-ops — N/A: file nav is locked to project root and there's no open-external path, so this state isn't reachable in normal use
 
 ## Phase 2 — Polish
