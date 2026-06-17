@@ -1025,6 +1025,18 @@ fn test_delete_path_refuses_when_root_is_none() {
 }
 
 #[test]
+fn test_delete_path_refuses_root_itself() {
+    // target == root canonicalizes equal, and starts_with is true for equal
+    // paths — so the guard must reject the root explicitly or it would
+    // remove_dir_all the whole project.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+    let result = tauri::async_runtime::block_on(delete_path(root.clone(), Some(root.clone())));
+    assert!(result.is_err(), "expected refusal, got: {:?}", result);
+    assert!(dir.path().exists(), "guard must not delete the project root");
+}
+
+#[test]
 fn test_delete_path_refuses_symlink_escaping_root() {
     use std::os::unix::fs::symlink;
     // The symlink itself lives inside the project, but its target is

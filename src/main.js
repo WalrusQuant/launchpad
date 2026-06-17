@@ -238,17 +238,17 @@ function loadWebgl(pane) {
     const addon = new WebglAddon();
     addon.onContextLoss(() => {
       addon.dispose();
-      pane.webglAddon = null;
       // Re-create on the next frame so the GL stack has settled after the loss.
+      // Guard on our own `disposed` flag, not term.element: xterm's element
+      // getter survives term.dispose(), so a context-loss whose rAF fires after
+      // destroyPane would otherwise call loadAddon on a dead terminal and leak
+      // a GL context.
       requestAnimationFrame(() => {
-        // Guard against a pane disposed between loss and this callback.
-        if (pane.term.element) loadWebgl(pane);
+        if (!pane.disposed) loadWebgl(pane);
       });
     });
     pane.term.loadAddon(addon);
-    pane.webglAddon = addon;
   } catch (e) {
-    pane.webglAddon = null;
     console.warn("WebGL renderer not available, using default");
   }
 }
@@ -283,7 +283,7 @@ async function createPane(parentEl, cwd) {
     ptyId: null,
     term,
     fitAddon,
-    webglAddon: null,
+    disposed: false,
     el,
     // Flow control — backpressure replaces gate/buffer/settle resize coordination
     unackedChars: 0,
@@ -337,6 +337,9 @@ async function createPane(parentEl, cwd) {
 }
 
 function destroyPane(pane) {
+  // Mark disposed BEFORE term.dispose() so a WebGL context-loss rAF queued by
+  // this pane's renderer can't re-create an addon on the dead terminal.
+  pane.disposed = true;
   pane.term.dispose();
   pane.el.remove();
   if (pane.ptyId !== null) {
@@ -2193,26 +2196,16 @@ const resizeObserver = new ResizeObserver((entries) => {
     w: Math.round(entry?.contentRect?.width ?? 0),
     h: Math.round(entry?.contentRect?.height ?? 0),
   });
-  const tab = tabs.get(activeTabUiId);
-  if (tab?.type === "terminal") fitAllPanes(tab);
-  // When workspace is split, the right group's terminal needs refitting too
-  // — ResizeObserver only watches the left container, so without this the
-  // right group's xterm grid stays CSS-stretched after window resizes.
-  if (isSplit && rightActiveTabUiId !== -1) {
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
-  }
+  // Fit both groups' active terminals — the ResizeObserver only watches the
+  // left container, so without the right-group refit its xterm grid stays
+  // CSS-stretched after window resizes.
+  refitGroupTerminals();
 });
 resizeObserver.observe(terminalContainer);
 
 // Refit terminal after git panel close transition (ResizeObserver is blocked during transition)
 window.addEventListener(PANEL_TRANSITION_DONE, () => {
-  const tab = tabs.get(activeTabUiId);
-  if (tab?.type === "terminal") fitAllPanes(tab);
-  if (isSplit && rightActiveTabUiId !== -1) {
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
-  }
+  refitGroupTerminals();
 });
 
 // Sidebar resize
@@ -2254,10 +2247,7 @@ function setSidebarCollapsed(collapsed, { persist = true } = {}) {
   if (persist) saveSetting("sidebarCollapsed", collapsed);
   // Reflow terminals after width change settles
   requestAnimationFrame(() => {
-    const tab = tabs.get(activeTabUiId);
-    if (tab?.type === "terminal") fitAllPanes(tab);
-    const rightTab = tabs.get(rightActiveTabUiId);
-    if (rightTab?.type === "terminal") fitAllPanes(rightTab);
+    refitGroupTerminals();
   });
 }
 
@@ -2707,17 +2697,20 @@ function setFocusedGroup(group) {
   // which resizes BOTH groups' panes. Nothing else re-fits on a focus switch,
   // so a group could be left with a stale xterm grid (contributing cause of
   // issue #3). Re-fit each group's active terminal after the class flip.
-  refitGroupTerminals();
+  refitGroupTerminals({ immediate: true });
 }
 
 // Re-fit the active terminal tab in each group. Cheap no-op for non-terminal
 // active tabs. Used after focus switches and other layout-affecting changes
-// that the ResizeObserver on the shared outer container doesn't catch.
-function refitGroupTerminals() {
+// (window/sidebar resize, panel transition) that the ResizeObserver on the
+// shared outer container doesn't catch for the right group. `immediate`
+// matches the caller's needs: focus switches fit synchronously; rapid resize
+// events use the debounced default to avoid thrashing.
+function refitGroupTerminals({ immediate = false } = {}) {
   for (const id of [activeTabUiId, isSplit ? rightActiveTabUiId : -1]) {
     if (id === -1) continue;
     const tab = tabs.get(id);
-    if (tab && tab.type === "terminal") fitAllPanes(tab, { immediate: true });
+    if (tab && tab.type === "terminal") fitAllPanes(tab, { immediate });
   }
 }
 

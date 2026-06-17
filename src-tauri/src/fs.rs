@@ -389,6 +389,12 @@ pub(crate) async fn delete_path(path: String, project_root: Option<String>) -> R
         let root = project_root.ok_or("Refusing to delete: no project root supplied")?;
         let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
         let root_canon = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+        // Must be STRICTLY inside the root. starts_with is true for an equal
+        // path, so without this check a caller could delete the project root
+        // itself (remove_dir_all over the whole tree).
+        if target == root_canon {
+            return Err("Refusing to delete the project root itself".into());
+        }
         if !target.starts_with(&root_canon) {
             return Err("Refusing to delete path outside project root".into());
         }
