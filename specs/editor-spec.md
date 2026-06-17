@@ -252,23 +252,28 @@ the same `editor.js` surface area we'll lean on for A and B.
 We work the tracks **one at a time**, but pull the standalone fontSize bug
 forward since it's tiny and currently misleading.
 
-### Phase 0 — Bug fix (do first, ~½ day)
-- Track C #1: make `editorFontSize` actually drive the editor (live, via
-  `setFontSize` Compartment). Closes a real "setting does nothing" bug.
+### Phase 0 — Bug fix ✅ DONE
+- ✅ Track C #1: `editorFontSize` now drives the editor live via a
+  `setFontSize` Compartment. Closed the "setting does nothing" bug.
 
-### Phase 1 — Track A: Git-Aware Editor
-1. Line-change derivation (frontend, from existing hunk data) + Vitest.
-2. Change gutter extension wired into `createEditor`, recompute on
-   open/save/`fs-changed`.
-3. Hunk navigation keybindings.
-4. Inline hunk actions (revert, then stage).
-5. Blame command (`git_blame_file`) + opt-in blame gutter.
+### Phase 1 — Track A: Git-Aware Editor ✅ DONE
+1. ✅ Line-change derivation (`deriveLineChanges`, frontend) + Vitest.
+2. ✅ Change gutter wired into `createEditor`, backed by `get_file_diff_vs_head`;
+   recomputes on open/save/external-reload/tab-focus.
+3. ✅ Hunk navigation (`Alt+J` / `Alt+K`).
+4. ✅ Inline hunk actions: Revert hunk (buffer edit, dirty-gated) + Stage file.
+5. ✅ Blame command (`git_blame_file`) + opt-in blame gutter.
 
-### Phase 2 — Track C: Polish Bundle (the rest)
-6. Symbol outline (Cmd+Shift+O), syntax-tree-backed.
-7. Format-on-save (opt-in per language).
-8. Indentation guides, bracket-pair colors, sticky scroll, active-file sync —
-   each behind a setting.
+### Phase 2 — Track C: Polish Bundle ✅ DONE (with two deferrals)
+6. ✅ Symbol outline (Cmd+Shift+O), syntax-tree-backed (`symbols.js`).
+7. ✅ Format-on-save (opt-in; `format_file` Rust command).
+8. ✅ Indentation guides (packaged) + ✅ active-file sync (`revealPath`), each
+   behind a setting.
+   - **Deferred: bracket-pair colorization and sticky scroll.** No maintained
+     CodeMirror 6 package exists for either, so both would need hand-rolled
+     implementations. They are purely cosmetic and can't be verified headless,
+     so they're parked until someone can iterate on them live (or a package
+     appears). Tracked here rather than dropped.
 
 ### Phase 3 — Track B: Language Intelligence (LSP)
 9. Rust LSP host (`lsp.rs`): spawn + JSON-RPC framing for one server
