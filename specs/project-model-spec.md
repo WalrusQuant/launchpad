@@ -169,29 +169,25 @@ The main question: does each window get its own set of PTYs in the shared AppSta
 
 ## Agent Strategy
 
-Launchpad ships its own built-in coding agent AND supports external CLI agents side by side.
+Launchpad is a **home for external CLI coding agents** — it does not ship its own. The AI lives in the terminal via whatever agent you run; Launchpad's job is to make that workflow excellent, not to be the agent.
 
-### Built-in Agent (see `specs/agent-spec.md`)
-- Native Rust agent module in the Tauri backend — agentic loop, tool use, streaming
-- Agent tab type alongside terminal/editor/settings
-- Deep integration: file browser updates, git panel sync, editor tab opens
-- Provider-agnostic: Anthropic + OpenAI
-- **Project-scoped**: agent's working directory = project root, file writes blocked outside boundary
+> **Decision (2026-06):** an earlier plan to build a native in-app agent was dropped. A built-in agent would blur the product's one clear idea ("where you run CLI agents") and commit the project to indefinitely competing with the very agents it hosts. The design work is archived in `specs/agent-spec.md` and may move to a separate standalone agent repo (`launchpad-agent`). See that spec's header for the full rationale.
 
 ### External CLI Agents
-Users can still run whatever CLI agent they want in terminal tabs:
+Run whatever CLI agent you want in terminal tabs:
 
 - **Claude Code** — Anthropic models
 - **Aider** — supports dozens of models via litellm, including custom endpoints
 - **OpenCode** — open source, multiple providers
 - **goose** — Block's open source agent
 
-The project model makes both built-in and CLI agents better:
-- Agent always starts in the right directory (project root)
+The project model makes CLI agents better:
+- The agent always starts in the right directory (project root)
 - Split workspace lets you watch an agent in one group and work in another
 - Multiple windows = multiple agents on different projects, each properly scoped
+- The file browser is agent-safe — browsing never sends a stray `cd` to a running agent
 
-### What Launchpad adds on top (later)
+### What Launchpad adds on top (the on-thesis roadmap)
 - Tab auto-labeling when a CLI agent is detected
 - Status indicator showing if a tab has an active agent process
 
@@ -199,7 +195,7 @@ The project model makes both built-in and CLI agents better:
 
 ## What's Out of Scope
 
-- ~~Native AI agent panel~~ — **Updated**: built-in agent now planned (see `specs/agent-spec.md`). Complements CLI agents, doesn't replace them.
+- **Native in-app AI agent** — out of scope. Launchpad hosts CLI agents; it isn't one. The archived design is in `specs/agent-spec.md` and may move to a standalone `launchpad-agent` repo.
 - Multi-project in one window — too complex, not worth it.
 - Agent orchestration / coordination — that's the agent's job, not the workspace's.
 - Per-project settings — later, not now.
