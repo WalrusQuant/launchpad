@@ -13,13 +13,20 @@ use crate::*;
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use tauri::{AppHandle, Emitter, State};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+// Monotonic id stamped on each spawned server so the reader thread can tell
+// whether the map entry under its key is still *its* instance (vs a successor
+// spawned after it died) before removing it.
+static LSP_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 // A running language server. stdout was moved into the reader thread; we keep
-// the child handle (to kill on stop) and stdin (to write requests).
+// the child handle (to kill/reap on stop) and stdin (to write requests).
 pub(crate) struct LspInstance {
     pub(crate) child: Child,
     pub(crate) stdin: ChildStdin,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -90,6 +97,7 @@ pub(crate) async fn lsp_start(
 ) -> Result<String, String> {
     let server_id = format!("{language}:{project_path}");
 
+    // Fast path: already running.
     {
         let servers = state.lsp_servers.lock_safe();
         if servers.contains_key(&server_id) {
@@ -100,6 +108,9 @@ pub(crate) async fn lsp_start(
     let (cmd, args) = server_command(&language)
         .ok_or_else(|| format!("No language server configured for {language}"))?;
 
+    // Spawn outside the lock (spawn does I/O). A concurrent lsp_start for the
+    // same key may also reach here; the re-check under the lock below resolves
+    // the race by killing whichever child loses.
     let mut child = Command::new(cmd)
         .args(args)
         .current_dir(&project_path)
@@ -117,9 +128,25 @@ pub(crate) async fn lsp_start(
 
     let stdin = child.stdin.take().ok_or("Failed to capture server stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to capture server stdout")?;
+    let generation = LSP_GENERATION.fetch_add(1, Ordering::Relaxed);
 
-    // Reader thread: forward each framed message as an event; exit (and notify)
-    // when the server closes its stdout or emits a malformed frame.
+    // Insert under the lock, re-checking for a concurrent winner. Insert BEFORE
+    // spawning the reader thread so the entry is guaranteed present when the
+    // reader later tries to remove it on exit.
+    {
+        let mut servers = state.lsp_servers.lock_safe();
+        if servers.contains_key(&server_id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(server_id);
+        }
+        servers.insert(server_id.clone(), LspInstance { child, stdin, generation });
+    }
+
+    // Reader thread: forward each framed message as an event; on EOF/error the
+    // server has exited — drop our entry (only if it's still ours, i.e. the
+    // generation matches, so we don't evict a successor spawned after a crash),
+    // reap the child, then notify the frontend.
     let app_handle = app.clone();
     let sid = server_id.clone();
     std::thread::spawn(move || {
@@ -135,13 +162,21 @@ pub(crate) async fn lsp_start(
                 Ok(None) | Err(_) => break,
             }
         }
+        let removed = {
+            let st = app_handle.state::<AppState>();
+            let mut servers = st.lsp_servers.lock_safe();
+            if servers.get(&sid).map(|i| i.generation) == Some(generation) {
+                servers.remove(&sid)
+            } else {
+                None
+            }
+        };
+        if let Some(mut inst) = removed {
+            let _ = inst.child.wait();
+        }
         let _ = app_handle.emit(events::LSP_EXIT, sid.clone());
     });
 
-    state
-        .lsp_servers
-        .lock_safe()
-        .insert(server_id.clone(), LspInstance { child, stdin });
     Ok(server_id)
 }
 
@@ -169,6 +204,7 @@ pub(crate) async fn lsp_send(
 pub(crate) async fn lsp_stop(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
     if let Some(mut inst) = state.lsp_servers.lock_safe().remove(&server_id) {
         let _ = inst.child.kill();
+        let _ = inst.child.wait(); // reap so we don't leave a zombie
     }
     Ok(())
 }

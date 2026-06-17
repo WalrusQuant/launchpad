@@ -34,35 +34,52 @@ export function lspLanguageForFile(fileName) {
   return LANG_BY_EXT[ext] || null;
 }
 
+// Build a proper file URI: percent-encode each path segment so paths with
+// spaces or other special characters produce a valid URI the server accepts
+// (an unencoded space breaks didOpen and every request keyed on the URI).
+function fileUri(path) {
+  return "file://" + path.split("/").map(encodeURIComponent).join("/");
+}
+
 // One client per "{language}:{projectPath}", reused across files. A cached
 // `null` means "we tried and there's no server" — don't hammer lsp_start on
-// every file open.
+// every file open. A non-null entry is { client, serverId, handlers, unlisten }.
 const clients = new Map();
 
-function tauriTransport(serverId) {
-  const handlers = new Set();
-  // Long-lived: the listener lives as long as the client (app session).
-  listen("lsp-message", (e) => {
-    if (e.payload && e.payload.serverId === serverId) {
-      for (const h of handlers) h(e.payload.message);
+// Drop a client: unregister its transport listener, disconnect, and forget it
+// so the next open re-spawns. Leaves a cached `null` (binary-missing) in place.
+function evictClient(key) {
+  const entry = clients.get(key);
+  if (!entry) return;
+  clients.delete(key);
+  if (entry.unlisten) entry.unlisten();
+  try {
+    entry.client.disconnect();
+  } catch (_) {
+    /* already gone */
+  }
+}
+
+// One global listener: when the host reports a server exited (crash or stop),
+// evict the matching client so a later open re-spawns instead of reusing a
+// dead connection.
+let exitListenerReady = false;
+function ensureExitListener() {
+  if (exitListenerReady) return;
+  exitListenerReady = true;
+  listen("lsp-exit", (e) => {
+    const serverId = e.payload;
+    for (const [key, entry] of clients) {
+      if (entry && entry.serverId === serverId) {
+        evictClient(key);
+        break;
+      }
     }
   });
-  return {
-    send(message) {
-      invoke("lsp_send", { serverId, message }).catch((err) =>
-        console.warn("[lsp] send failed:", err)
-      );
-    },
-    subscribe(handler) {
-      handlers.add(handler);
-    },
-    unsubscribe(handler) {
-      handlers.delete(handler);
-    },
-  };
 }
 
 async function getClient(language, projectPath) {
+  ensureExitListener();
   const key = `${language}:${projectPath}`;
   if (clients.has(key)) return clients.get(key);
 
@@ -77,9 +94,31 @@ async function getClient(language, projectPath) {
     return null;
   }
 
+  const handlers = new Set();
+  const transport = {
+    send(message) {
+      invoke("lsp_send", { serverId, message }).catch((err) =>
+        console.warn("[lsp] send failed:", err)
+      );
+    },
+    subscribe(handler) {
+      handlers.add(handler);
+    },
+    unsubscribe(handler) {
+      handlers.delete(handler);
+    },
+  };
+  // Await the subscription so the unlisten handle is captured before we hand the
+  // entry out (so evict/shutdown can always clean it up).
+  const unlisten = await listen("lsp-message", (e) => {
+    if (e.payload && e.payload.serverId === serverId) {
+      for (const h of handlers) h(e.payload.message);
+    }
+  });
+
   const client = new LSPClient({ extensions: languageServerExtensions() });
-  client.connect(tauriTransport(serverId));
-  const entry = { client, serverId };
+  client.connect(transport);
+  const entry = { client, serverId, handlers, unlisten };
   clients.set(key, entry);
   return entry;
 }
@@ -94,8 +133,7 @@ export async function lspExtensionForFile(filePath, fileName, projectPath) {
   if (!language || !projectPath) return [];
   const entry = await getClient(language, projectPath);
   if (!entry) return [];
-  const uri = `file://${filePath}`;
-  return entry.client.plugin(uri, language);
+  return entry.client.plugin(fileUri(filePath), language);
 }
 
 // Request textDocument/documentSymbol for an open file. Returns the raw LSP
@@ -111,7 +149,7 @@ export async function lspDocumentSymbols(filePath, fileName, projectPath) {
     await entry.client.initializing;
     entry.client.sync(); // flush pending edits so positions are current
     const result = await entry.client.request("textDocument/documentSymbol", {
-      textDocument: { uri: `file://${filePath}` },
+      textDocument: { uri: fileUri(filePath) },
     });
     return result ?? null;
   } catch (err) {
@@ -125,8 +163,15 @@ export async function lspDocumentSymbols(filePath, fileName, projectPath) {
 // the Rust-side registry, which outlives the webview.
 export async function shutdownAllLsp() {
   const ids = [];
-  for (const entry of clients.values()) {
-    if (entry && entry.serverId) ids.push(entry.serverId);
+  for (const [, entry] of clients) {
+    if (!entry) continue;
+    if (entry.unlisten) entry.unlisten();
+    try {
+      entry.client.disconnect();
+    } catch (_) {
+      /* already gone */
+    }
+    ids.push(entry.serverId);
   }
   clients.clear();
   await Promise.all(ids.map((serverId) => invoke("lsp_stop", { serverId }).catch(() => {})));
