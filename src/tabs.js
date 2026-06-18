@@ -41,7 +41,9 @@ export function runTopEscape() {
 
 // Type-specific behavior injected once from main.js. Keys:
 //   fitTerminal(tab), activateEditor(tab), activateMerge(tab),
-//   destroyPane(pane), createTab(), renderTabBar()
+//   destroyPane(pane), createTab(),
+//   startTabRename(uiId, labelEl, index), startTabDrag(tabEl, uiId, group, e),
+//   splitWorkspace(), getIsSplit()
 let hooks = {};
 export function setTabHooks(h) { hooks = h; }
 
@@ -78,7 +80,7 @@ export function switchTab(uiId) {
     hooks.activateMerge(tab);
   }
 
-  hooks.renderTabBar();
+  renderTabBar();
 }
 
 // Themed in-app modal confirm. Defaults to a "Close" affirmative button to
@@ -145,7 +147,7 @@ export async function doCloseTab(uiId) {
   // Remove tab from state and UI FIRST — before any cleanup that could fail
   tab.containerEl.style.display = "none";
   tabs.delete(uiId);
-  hooks.renderTabBar();
+  renderTabBar();
 
   // Now clean up resources
   try {
@@ -172,4 +174,96 @@ export async function doCloseTab(uiId) {
     const remaining = [...tabs.keys()];
     switchTab(remaining[remaining.length - 1]);
   }
+}
+
+// Render the LEFT-group tab bar. Type-specific interactions (rename, drag,
+// new-tab, split toggle) are delegated to injected hooks so this stays in the
+// feature-free spine; the right-group bar is rendered separately in main.js.
+export function renderTabBar() {
+  const tabBar = document.getElementById("tab-bar");
+  tabBar.innerHTML = "";
+
+  let termIndex = 1;
+  for (const [uiId, tab] of tabs) {
+    if (tab._rightGroup) continue; // skip tabs in the right split group
+    const isActive = uiId === activeTabUiId;
+    const tabEl = document.createElement("div");
+    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
+    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
+    if (staleClass) tabEl.title = "File no longer exists on disk";
+    tabEl.dataset.tabId = uiId;
+    tabEl.setAttribute("role", "tab");
+    tabEl.setAttribute("aria-selected", isActive ? "true" : "false");
+
+    // Icon
+    const icon = document.createElement("span");
+    icon.className = "tab-icon";
+    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : "◆";
+    tabEl.appendChild(icon);
+
+    const label = document.createElement("span");
+    label.className = "tab-label";
+
+    if (tab.type === "terminal") {
+      label.textContent = tab.name || `Terminal ${termIndex}`;
+      label.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        hooks.startTabRename(uiId, label, termIndex);
+      });
+      termIndex++;
+    } else if (tab.type === "settings") {
+      label.textContent = "Settings";
+    } else if (tab.type === "diff") {
+      label.textContent = tab.fileName;
+      label.title = `${tab.fromRef} → ${tab.toRef}`;
+    } else if (tab.type === "rebase") {
+      label.textContent = tab.fileName;
+      label.title = `Interactive rebase onto ${tab.baseOid.slice(0, 7)}`;
+    } else if (tab.type === "merge") {
+      label.textContent = tab.fileName;
+      label.title = `3-way merge: ${tab.filePath}`;
+    } else {
+      label.textContent = tab.fileName;
+    }
+    tabEl.appendChild(label);
+
+    // Modified dot or close button
+    if ((tab.type === "editor" || tab.type === "merge") && tab.modified) {
+      const dot = document.createElement("span");
+      dot.className = "tab-modified-dot";
+      dot.title = "Unsaved changes";
+      tabEl.appendChild(dot);
+    }
+
+    const closeBtn = document.createElement("span");
+    closeBtn.className = "tab-close";
+    closeBtn.textContent = "×";
+    closeBtn.addEventListener("mousedown", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      closeTab(uiId);
+    });
+    tabEl.appendChild(closeBtn);
+
+    tabEl.addEventListener("click", () => switchTab(uiId));
+    tabEl.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".tab-close")) return; // don't start drag from close button
+      hooks.startTabDrag(tabEl, uiId, "left", e);
+    });
+    tabBar.appendChild(tabEl);
+  }
+
+  const newTabBtn = document.createElement("div");
+  newTabBtn.className = "tab tab-new";
+  newTabBtn.textContent = "+";
+  newTabBtn.title = "New terminal (⌘T)";
+  newTabBtn.addEventListener("click", () => hooks.createTab());
+  tabBar.appendChild(newTabBtn);
+
+  const splitBtn = document.createElement("div");
+  splitBtn.className = "tab tab-new";
+  splitBtn.textContent = hooks.getIsSplit() ? "⊞" : "⊟";
+  splitBtn.title = hooks.getIsSplit() ? "Unsplit (⌘\\)" : "Split view (⌘\\)";
+  splitBtn.addEventListener("click", () => hooks.splitWorkspace());
+  tabBar.appendChild(splitBtn);
 }

@@ -28,6 +28,7 @@ import {
   tabs, activeTabUiId, setActiveTabId, nextTabId,
   pushEscape, popEscape, runTopEscape, setTabHooks,
   getActivePtyId, uiIdForTab, switchTab, closeTab, doCloseTab, showConfirmDialog,
+  renderTabBar,
 } from "./tabs.js";
 import {
   debugCaptureActive, hexOf, dbg, startDebugCapture, stopDebugCapture, markDebug,
@@ -1975,95 +1976,6 @@ function refreshTerminalsForTheme() {
   }
 }
 
-function renderTabBar() {
-  const tabBar = document.getElementById("tab-bar");
-  tabBar.innerHTML = "";
-
-  let termIndex = 1;
-  for (const [uiId, tab] of tabs) {
-    if (tab._rightGroup) continue; // skip tabs in the right split group
-    const isActive = uiId === activeTabUiId;
-    const tabEl = document.createElement("div");
-    const staleClass = tab.type === "editor" && tab.stale ? " tab-stale" : "";
-    tabEl.className = `tab ${isActive ? "tab-active" : ""}${staleClass}`;
-    if (staleClass) tabEl.title = "File no longer exists on disk";
-    tabEl.dataset.tabId = uiId;
-    tabEl.setAttribute("role", "tab");
-    tabEl.setAttribute("aria-selected", isActive ? "true" : "false");
-
-    // Icon
-    const icon = document.createElement("span");
-    icon.className = "tab-icon";
-    icon.textContent = tab.type === "terminal" ? ">_" : tab.type === "settings" ? "⚙" : tab.type === "diff" ? "↔" : tab.type === "rebase" ? "⤴" : tab.type === "merge" ? "⫝" : "◆";
-    tabEl.appendChild(icon);
-
-    const label = document.createElement("span");
-    label.className = "tab-label";
-
-    if (tab.type === "terminal") {
-      label.textContent = tab.name || `Terminal ${termIndex}`;
-      label.addEventListener("dblclick", (e) => {
-        e.stopPropagation();
-        startTabRename(uiId, label, termIndex);
-      });
-      termIndex++;
-    } else if (tab.type === "settings") {
-      label.textContent = "Settings";
-    } else if (tab.type === "diff") {
-      label.textContent = tab.fileName;
-      label.title = `${tab.fromRef} → ${tab.toRef}`;
-    } else if (tab.type === "rebase") {
-      label.textContent = tab.fileName;
-      label.title = `Interactive rebase onto ${tab.baseOid.slice(0, 7)}`;
-    } else if (tab.type === "merge") {
-      label.textContent = tab.fileName;
-      label.title = `3-way merge: ${tab.filePath}`;
-    } else {
-      label.textContent = tab.fileName;
-    }
-    tabEl.appendChild(label);
-
-    // Modified dot or close button
-    if ((tab.type === "editor" || tab.type === "merge") && tab.modified) {
-      const dot = document.createElement("span");
-      dot.className = "tab-modified-dot";
-      dot.title = "Unsaved changes";
-      tabEl.appendChild(dot);
-    }
-
-    const closeBtn = document.createElement("span");
-    closeBtn.className = "tab-close";
-    closeBtn.textContent = "×";
-    closeBtn.addEventListener("mousedown", (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      closeTab(uiId);
-    });
-    tabEl.appendChild(closeBtn);
-
-    tabEl.addEventListener("click", () => switchTab(uiId));
-    tabEl.addEventListener("mousedown", (e) => {
-      if (e.target.closest(".tab-close")) return; // don't start drag from close button
-      startTabDrag(tabEl, uiId, "left", e);
-    });
-    tabBar.appendChild(tabEl);
-  }
-
-  const newTabBtn = document.createElement("div");
-  newTabBtn.className = "tab tab-new";
-  newTabBtn.textContent = "+";
-  newTabBtn.title = "New terminal (⌘T)";
-  newTabBtn.addEventListener("click", () => createTab());
-  tabBar.appendChild(newTabBtn);
-
-  const splitBtn = document.createElement("div");
-  splitBtn.className = "tab tab-new";
-  splitBtn.textContent = isSplit ? "⊞" : "⊟";
-  splitBtn.title = isSplit ? "Unsplit (⌘\\)" : "Split view (⌘\\)";
-  splitBtn.addEventListener("click", () => splitWorkspace());
-  tabBar.appendChild(splitBtn);
-}
-
 function startTabRename(uiId, labelEl, index) {
   const tab = tabs.get(uiId);
   const input = document.createElement("input");
@@ -3432,7 +3344,10 @@ setTabHooks({
   },
   destroyPane,
   createTab,
-  renderTabBar,
+  startTabRename,
+  startTabDrag,
+  splitWorkspace,
+  getIsSplit: () => isSplit,
 });
 
 boot();
