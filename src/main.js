@@ -24,6 +24,11 @@ import { addProject, touchProject, setActiveProject, getActiveProject, focusProj
 import { showPicker, hidePicker } from "./projectpicker.js";
 import { PTY_OUTPUT, PTY_EXIT, FS_CHANGED, PATH_RENAMED, PANEL_TRANSITION_DONE, HEAD_MOVED } from "./events.js";
 import { lspExtensionForFile, shutdownAllLsp, lspDocumentSymbols } from "./lspclient.js";
+import {
+  tabs, activeTabUiId, setActiveTabId, nextTabId,
+  pushEscape, popEscape, runTopEscape, setTabHooks,
+  getActivePtyId, uiIdForTab, switchTab, closeTab, doCloseTab, showConfirmDialog,
+} from "./tabs.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -54,14 +59,13 @@ export function showToast(message, type = "error") {
   }, 4000);
 }
 
-// Tab management
+// Tab management — the registry + spine (tabs Map, activeTabUiId, switch/close,
+// escape stack, confirm dialog) live in tabs.js; main.js wires the
+// type-specific behavior via setTabHooks (see boot).
 // Terminal tab: { type: "terminal", panes: [pane, pane?], containerEl, name, activePane: 0|1 }
 // Editor tab:   { type: "editor", containerEl, filePath, fileName, inode, editorView, originalContent, modified, stale }
 // Each pane: { ptyId, term, fitAddon, el }
-const tabs = new Map(); // uiTabId → tab object
 const paneMap = new Map(); // ptyId → pane object (for routing PTY output)
-let activeTabUiId = -1;
-let nextUiTabId = 0;
 let isCreatingTab = false;
 let panelTransitioning = false;
 // fitAllPanes uses a trailing-edge debounce stored on tab.fitDebounceTimer.
@@ -71,15 +75,6 @@ const FIT_DEBOUNCE_MS = 60; // Coalesces ResizeObserver firehose during drags
 // PTY output rate in sync with xterm.js rendering speed.
 const FLOW_HIGH_WATER = 100_000; // chars — pause PTY when exceeded
 const FLOW_LOW_WATER = 25_000;   // chars — resume PTY when drained below
-
-// Escape handler stack — topmost handler fires first, prevents conflicts
-// between Quick Open, file search, diff preview, and dialogs.
-const escapeStack = [];
-export function pushEscape(handler) { escapeStack.push(handler); }
-export function popEscape(handler) {
-  const i = escapeStack.lastIndexOf(handler);
-  if (i !== -1) escapeStack.splice(i, 1);
-}
 
 /** Wait for the browser to complete layout reflow (double-rAF). */
 function waitForLayout() {
@@ -355,7 +350,7 @@ async function createTab() {
   if (isCreatingTab) return;
   isCreatingTab = true;
   try {
-    const uiId = nextUiTabId++;
+    const uiId = nextTabId();
 
     const containerEl = document.createElement("div");
     containerEl.className = "terminal-instance";
@@ -499,140 +494,6 @@ function fitAllPanes(tab, { immediate = false } = {}) {
   }, FIT_DEBOUNCE_MS);
 }
 
-function getActivePtyId() {
-  const tab = tabs.get(activeTabUiId);
-  if (!tab || tab.type !== "terminal") return null;
-  return tab.panes[tab.activePane]?.ptyId ?? tab.panes[0]?.ptyId ?? null;
-}
-
-function switchTab(uiId) {
-  if (activeTabUiId === uiId && tabs.has(uiId)) return;
-
-  // Hide current tab
-  if (tabs.has(activeTabUiId)) {
-    tabs.get(activeTabUiId).containerEl.style.display = "none";
-  }
-
-  const tab = tabs.get(uiId);
-  if (!tab) return;
-  tab.containerEl.style.display = "flex";
-  activeTabUiId = uiId;
-
-  if (tab.type === "terminal") {
-    fitAllPanes(tab, { immediate: true });
-    requestAnimationFrame(() => {
-      const activePane = tab.panes[tab.activePane] || tab.panes[0];
-      if (activePane) activePane.term.focus();
-    });
-  } else if (tab.type === "editor") {
-    setTimeout(() => tab.editorView.focus(), 10);
-    // HEAD may have moved while away (staged/committed in the git panel) —
-    // recompute the change gutter on focus.
-    refreshEditorGutter(tab);
-    // Optionally sync the file tree to the now-active file.
-    if (getSettings().editorFollowActiveFile && tab.filePath) {
-      revealPath(tab.filePath);
-    }
-  } else if (tab.type === "merge") {
-    setTimeout(() => tab.mergedView.focus(), 10);
-  }
-
-  renderTabBar();
-}
-
-// Themed in-app modal confirm. Defaults to a "Close" affirmative button to
-// preserve historical callers (close-with-unsaved-changes). Pass `opts` to
-// customize the affirmative label and tone:
-//   { confirmLabel: "Delete", tone: "danger" }
-// `tone: "danger"` colors the affirmative button red so a destructive
-// action visibly differs from a benign one.
-export function showConfirmDialog(message, onConfirm, opts = {}) {
-  const confirmLabel = opts.confirmLabel || "Close";
-  const cancelLabel = opts.cancelLabel || "Cancel";
-  const toneClass = opts.tone === "danger" ? " confirm-danger" : "";
-
-  document.querySelector(".confirm-overlay")?.remove();
-  const overlay = document.createElement("div");
-  overlay.className = "confirm-overlay";
-  overlay.innerHTML = `
-    <div class="confirm-dialog">
-      <div class="confirm-message"></div>
-      <div class="confirm-actions">
-        <button class="confirm-btn confirm-cancel"></button>
-        <button class="confirm-btn confirm-ok${toneClass}"></button>
-      </div>
-    </div>`;
-  // textContent assignments avoid HTML injection from caller-supplied
-  // strings (filenames containing "<" etc.).
-  overlay.querySelector(".confirm-message").textContent = message;
-  overlay.querySelector(".confirm-cancel").textContent = cancelLabel;
-  overlay.querySelector(".confirm-ok").textContent = confirmLabel;
-  document.body.appendChild(overlay);
-
-  const dismiss = () => { overlay.remove(); popEscape(dismiss); };
-  overlay.querySelector(".confirm-cancel").addEventListener("click", dismiss);
-  overlay.querySelector(".confirm-ok").addEventListener("click", () => { dismiss(); onConfirm(); });
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
-  pushEscape(dismiss);
-}
-
-async function closeTab(uiId) {
-  const tab = tabs.get(uiId);
-  if (!tab) return;
-
-  if ((tab.type === "editor" || tab.type === "merge") && tab.modified) {
-    showConfirmDialog(
-      `\u201C${tab.fileName}\u201D has unsaved changes. Close anyway?`,
-      () => doCloseTab(uiId)
-    );
-    return;
-  }
-  if (tab.type === "terminal" && tab.panes.some(p => p.ptyId !== null)) {
-    showConfirmDialog(
-      "Terminal has a running process. Close anyway?",
-      () => doCloseTab(uiId)
-    );
-    return;
-  }
-  await doCloseTab(uiId);
-}
-
-async function doCloseTab(uiId) {
-  const tab = tabs.get(uiId);
-  if (!tab) return;
-
-  // Remove tab from state and UI FIRST — before any cleanup that could fail
-  tab.containerEl.style.display = "none";
-  tabs.delete(uiId);
-  renderTabBar();
-
-  // Now clean up resources
-  try {
-    if (tab.type === "editor") tab.editorView.destroy();
-    else if (tab.type === "terminal") tab.panes.forEach(destroyPane);
-    else if (tab.type === "merge") {
-      // Detach the scroll listener BEFORE view.destroy() — CodeMirror
-      // doesn't track external listeners, and the closure captures the
-      // tab + all three views, so leaving it attached pins the views
-      // alive past the tab's lifetime.
-      if (tab.onMergedScroll && tab.mergedView) {
-        try { tab.mergedView.scrollDOM.removeEventListener("scroll", tab.onMergedScroll); } catch (_) {}
-      }
-      tab.oursView?.destroy();
-      tab.theirsView?.destroy();
-      tab.mergedView?.destroy();
-    }
-  } catch (_) {}
-  try { tab.containerEl.remove(); } catch (_) {}
-
-  if (tabs.size === 0) {
-    await createTab();
-  } else if (activeTabUiId === uiId) {
-    const remaining = [...tabs.keys()];
-    switchTab(remaining[remaining.length - 1]);
-  }
-}
-
 // Build (or rebuild) a breadcrumb element's contents for a file path. Used
 // both when creating an editor tab and when updating after an external
 // rename.
@@ -728,11 +589,6 @@ function revertHunkInBuffer(view, hunk) {
   if (to > doc.length) return false; // stale diff — bail rather than corrupt
   view.dispatch({ changes: { from, to, insert: oldText } });
   return true;
-}
-
-function uiIdForTab(tab) {
-  for (const [uiId, t] of tabs) if (t === tab) return uiId;
-  return null;
 }
 
 // Popover shown when a change-gutter marker is clicked: revert the hunk in the
@@ -1019,7 +875,7 @@ async function createEditorTab(filePath, options = {}) {
     inode = await invoke("get_file_inode", { path: filePath });
   } catch (_) {}
 
-  const uiId = nextUiTabId++;
+  const uiId = nextTabId();
 
   const containerEl = document.createElement("div");
   containerEl.className = "editor-instance";
@@ -1242,7 +1098,7 @@ export async function createDiffTab({ fromRef, toRef }) {
     return null;
   }
 
-  const uiId = nextUiTabId++;
+  const uiId = nextTabId();
 
   const containerEl = document.createElement("div");
   containerEl.className = "diff-instance diff-tab";
@@ -1420,7 +1276,7 @@ export async function createRebaseTab({ baseOid, count = 30 }) {
   }));
   const originalTodo = todo.map((e) => ({ ...e }));
 
-  const uiId = nextUiTabId++;
+  const uiId = nextTabId();
 
   const containerEl = document.createElement("div");
   containerEl.className = "rebase-instance rebase-tab";
@@ -1795,7 +1651,7 @@ export async function createMergeTab({ filePath }) {
   }
 
   const fileName = filePath.split("/").pop();
-  const uiId = nextUiTabId++;
+  const uiId = nextTabId();
 
   const containerEl = document.createElement("div");
   containerEl.className = "merge-instance merge-tab";
@@ -2152,7 +2008,7 @@ function openSettingsTab() {
     }
   }
 
-  const uiId = nextUiTabId++;
+  const uiId = nextTabId();
   const containerEl = document.createElement("div");
   containerEl.className = "settings-instance";
   document.getElementById("terminal-instances").appendChild(containerEl);
@@ -2886,9 +2742,8 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === "Escape") {
-    if (escapeStack.length > 0) {
+    if (runTopEscape()) {
       e.preventDefault();
-      escapeStack[escapeStack.length - 1]();
       return;
     }
     closeFilePreview();
@@ -3318,7 +3173,7 @@ async function createTabInRight() {
   if (!isSplit || !rightInstancesEl || isCreatingTab) return;
   isCreatingTab = true;
   try {
-    const uiId = nextUiTabId++;
+    const uiId = nextTabId();
     const containerEl = document.createElement("div");
     containerEl.className = "terminal-instance";
     rightInstancesEl.appendChild(containerEl);
@@ -3356,7 +3211,7 @@ async function moveTabToRight(uiId) {
       // Last tab leaving the left group: mint a fresh terminal so the group
       // doesn't end up with activeTabUiId === -1 and a dead `+` button.
       tab.containerEl.style.display = "none";
-      activeTabUiId = -1;
+      setActiveTabId(-1);
       await createTab();
     }
   } else {
@@ -3414,7 +3269,7 @@ function moveTabToLeft(uiId) {
   // Reparent to left
   document.getElementById("terminal-instances").appendChild(tab.containerEl);
   tab.containerEl.style.display = "flex";
-  activeTabUiId = uiId;
+  setActiveTabId(uiId);
 
   renderTabBar();
   renderRightTabBar();
@@ -3667,5 +3522,34 @@ async function enterWorkspace(project, settings) {
 export function setPanelTransitioning(value) {
   panelTransitioning = value;
 }
+
+// Inject the tab-type-specific behavior into the registry/spine in tabs.js.
+// Keeps tabs.js free of feature imports (no cycle); these closures own the
+// terminal/editor/merge specifics that switchTab and doCloseTab delegate to.
+setTabHooks({
+  fitTerminal(tab) {
+    fitAllPanes(tab, { immediate: true });
+    requestAnimationFrame(() => {
+      const activePane = tab.panes[tab.activePane] || tab.panes[0];
+      if (activePane) activePane.term.focus();
+    });
+  },
+  activateEditor(tab) {
+    setTimeout(() => tab.editorView.focus(), 10);
+    // HEAD may have moved while away (staged/committed in the git panel) —
+    // recompute the change gutter on focus.
+    refreshEditorGutter(tab);
+    // Optionally sync the file tree to the now-active file.
+    if (getSettings().editorFollowActiveFile && tab.filePath) {
+      revealPath(tab.filePath);
+    }
+  },
+  activateMerge(tab) {
+    setTimeout(() => tab.mergedView.focus(), 10);
+  },
+  destroyPane,
+  createTab,
+  renderTabBar,
+});
 
 boot();
