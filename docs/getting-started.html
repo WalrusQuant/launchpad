@@ -66,9 +66,12 @@ cp -R src-tauri/target/release/bundle/macos/Launchpad.app /Applications/</code><
           depending on your machine. Incremental builds are under 10 seconds.
         </p>
         <div class="callout">
-          <strong>Note:</strong> the app isn't code-signed or notarized. macOS
-          Gatekeeper will complain on first launch — right-click the app and
-          choose <em>Open</em>, or <code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code>.
+          <strong>Note:</strong> an app you build yourself from source isn't
+          code-signed, so macOS Gatekeeper will complain on first launch —
+          right-click the app and choose <em>Open</em>, or
+          <code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code>.
+          (The official <code>.dmg</code> from Releases is signed and notarized, so
+          it launches with no warning.)
         </div>
 
         <h2 id="dev">Dev build</h2>
@@ -121,7 +124,7 @@ npm run dev</code></pre>
         <h2 id="troubleshooting">Troubleshooting</h2>
 
         <h3>"Launchpad can't be opened because Apple cannot check it for malicious software"</h3>
-        <p>The app isn't code-signed. Either right-click &rarr; Open, or clear the quarantine attribute:</p>
+        <p>This only happens with an app you built from source (the official <code>.dmg</code> from Releases is signed and notarized). Either right-click &rarr; Open, or clear the quarantine attribute:</p>
 <pre><code>xattr -dr com.apple.quarantine /Applications/Launchpad.app</code></pre>
 
         <h3>Terminal shows no output / is blank</h3>
