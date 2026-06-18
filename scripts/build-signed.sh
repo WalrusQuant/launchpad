@@ -58,15 +58,23 @@ npx tauri build
 APP="$REPO_ROOT/src-tauri/target/release/bundle/macos/Launchpad.app"
 DMG="$(ls -t "$REPO_ROOT"/src-tauri/target/release/bundle/dmg/Launchpad_*_aarch64.dmg 2>/dev/null | head -1)"
 
+# Tauri notarizes + staples the .app but NOT the .dmg. Notarize + staple the
+# disk image too so the downloaded .dmg passes Gatekeeper on its own. The dmg
+# is already signed by the tauri build above; we only submit + staple here.
+echo
+echo "▸ Notarizing the .dmg (Tauri only does the .app)…"
+xcrun notarytool submit "$DMG" \
+  --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+  --wait
+xcrun stapler staple "$DMG"
+
 echo
 echo "▸ Verifying signature + notarization…"
 codesign --verify --deep --strict --verbose=2 "$APP"
-# Gatekeeper assessment for a Developer-ID-signed app.
-spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" || \
-  spctl --assess --type install --verbose=2 "$DMG"
-# Notarization ticket must be stapled for offline Gatekeeper checks.
 xcrun stapler validate "$APP"
+# .dmg is assessed with --type install (it's a disk image, not an app to open).
 xcrun stapler validate "$DMG"
+spctl --assess --type install --verbose=2 "$DMG"
 
 echo
 echo "✓ Signed + notarized build ready:"
