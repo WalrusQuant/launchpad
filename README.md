@@ -29,7 +29,7 @@ I told Claude I wanted to build a desktop app. It suggested Tauri + Rust + vanil
 Grab the latest `.dmg` from [Releases](https://github.com/WalrusQuant/launchpad/releases/latest). Apple Silicon only for now.
 
 1. Open the DMG, drag `Launchpad.app` to `/Applications`
-2. First launch: right-click the app → **Open** (the app isn't code-signed, so macOS will warn). Or run `xattr -dr com.apple.quarantine /Applications/Launchpad.app`.
+2. Double-click to launch. The app is code-signed and notarized by Apple, so no Gatekeeper warning or `xattr` workaround is needed.
 
 ### From source
 ```bash
