@@ -32,6 +32,8 @@ import {
 import {
   debugCaptureActive, hexOf, dbg, startDebugCapture, stopDebugCapture, markDebug,
 } from "./debugcapture.js";
+import { showToast } from "./toast.js";
+import { escapeText, escapeAttr } from "./domutil.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -40,27 +42,6 @@ const { listen } = window.__TAURI__.event;
 // boot from get_home_dir (see boot()), not hardcoded — supports corporate
 // macOS setups with email-style usernames, Docker mounts, and Linux.
 let homeDir = "";
-
-// Floating toast for app-level errors (file-open failures, rename/delete
-// errors, etc.) that aren't bound to a specific panel. Lazy-creates the
-// container on first use; auto-dismisses after 4s. type is "error" | "info".
-export function showToast(message, type = "error") {
-  let container = document.getElementById("app-toast-container");
-  if (!container) {
-    container = document.createElement("div");
-    container.id = "app-toast-container";
-    container.className = "app-toast-container";
-    document.body.appendChild(container);
-  }
-  const el = document.createElement("div");
-  el.className = `app-toast app-toast-${type}`;
-  el.textContent = message;
-  container.appendChild(el);
-  setTimeout(() => {
-    el.classList.add("app-toast-leaving");
-    setTimeout(() => el.remove(), 200);
-  }, 4000);
-}
 
 // Tab management — the registry + spine (tabs Map, activeTabUiId, switch/close,
 // escape stack, confirm dialog) live in tabs.js; main.js wires the
@@ -1122,17 +1103,6 @@ function renderDiffTab(tab, uiId) {
     .map(({ anchorId, file }) => buildFileDiffSection(file, anchorId))
     .join("");
   content.innerHTML = sectionsHtml;
-}
-
-function escapeText(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeAttr(s) {
-  return escapeText(s).replace(/"/g, "&quot;");
 }
 
 // ─── Interactive rebase tab (PR5) ──────────────────────────────────────────
