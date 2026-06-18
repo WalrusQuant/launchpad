@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-import { pushEscape, popEscape, showConfirmDialog } from "./main.js";
+import { pushEscape, popEscape, showConfirmDialog } from "./tabs.js";
 import { PATH_RENAMED } from "./events.js";
 import { applyGitColors } from "./git.js";
 

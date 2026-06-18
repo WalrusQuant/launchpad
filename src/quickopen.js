@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-import { pushEscape, popEscape } from "./main.js";
+import { pushEscape, popEscape } from "./tabs.js";
 
 let visible = false;
 let currentRoot = "";
