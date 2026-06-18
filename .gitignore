@@ -9,6 +9,13 @@ tasks/
 .env
 .env.*
 
+# macOS code-signing secrets — never commit
+src-tauri/.env.signing
+*.p8
+*.p12
+*.cer
+*.certSigningRequest
+
 # Claude Code local state (settings, scheduled task locks, etc.)
 .claude/
 

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# Build a signed + notarized macOS release of Launchpad.
+#
+# Prereqs (one-time — see docs/macos-signing.md):
+#   1. A "Developer ID Application" cert installed in your login Keychain.
+#   2. An App Store Connect API key (.p8) + its Key ID and Issuer ID.
+#   3. A gitignored secrets file at src-tauri/.env.signing (copy the template
+#      from docs/macos-signing.md and fill in your values).
+#
+# Tauri auto-signs (hardened runtime), notarizes, and staples the .app/.dmg
+# when these env vars are present at build time. This script loads them, builds,
+# and then verifies the result.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$REPO_ROOT/src-tauri/.env.signing"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "✗ Missing $ENV_FILE — see docs/macos-signing.md for the template." >&2
+  exit 1
+fi
+
+# Load secrets (exported for the tauri build subprocess).
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+# Validate required vars.
+missing=()
+for v in APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH; do
+  [[ -n "${!v:-}" ]] || missing+=("$v")
+done
+if (( ${#missing[@]} )); then
+  echo "✗ Missing required vars in $ENV_FILE: ${missing[*]}" >&2
+  exit 1
+fi
+if [[ ! -f "$APPLE_API_KEY_PATH" ]]; then
+  echo "✗ APPLE_API_KEY_PATH does not point to a file: $APPLE_API_KEY_PATH" >&2
+  exit 1
+fi
+
+# Confirm the signing identity is actually in the Keychain.
+if ! security find-identity -v -p codesigning | grep -qF "$APPLE_SIGNING_IDENTITY"; then
+  echo "✗ Signing identity not found in Keychain: $APPLE_SIGNING_IDENTITY" >&2
+  echo "  Run: security find-identity -v -p codesigning" >&2
+  exit 1
+fi
+
+echo "▸ Signing identity: $APPLE_SIGNING_IDENTITY"
+echo "▸ Notarizing via App Store Connect API key: $APPLE_API_KEY"
+echo "▸ Building (this signs + notarizes + staples; can take several minutes)…"
+cd "$REPO_ROOT"
+npx tauri build
+
+# Locate the artifacts.
+APP="$REPO_ROOT/src-tauri/target/release/bundle/macos/Launchpad.app"
+DMG="$(ls -t "$REPO_ROOT"/src-tauri/target/release/bundle/dmg/Launchpad_*_aarch64.dmg 2>/dev/null | head -1)"
+
+echo
+echo "▸ Verifying signature + notarization…"
+codesign --verify --deep --strict --verbose=2 "$APP"
+# Gatekeeper assessment for a Developer-ID-signed app.
+spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" || \
+  spctl --assess --type install --verbose=2 "$DMG"
+# Notarization ticket must be stapled for offline Gatekeeper checks.
+xcrun stapler validate "$APP"
+xcrun stapler validate "$DMG"
+
+echo
+echo "✓ Signed + notarized build ready:"
+echo "  $DMG"
