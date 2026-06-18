@@ -39,7 +39,10 @@ src-tauri/              # Rust backend — lib.rs is a thin shell; commands live
   src/lib.rs            # AppState, event names, run()/invoke_handler, shared helpers (atomic_write)
   src/pty.rs            # PTY spawn / reader / backpressure
   src/fs.rs             # Filesystem ops, search, format_file
-  src/git.rs            # All git commands (libgit2 + system git)
+  src/git/              # All git commands (libgit2 + system git), split by concern:
+                        #   mod.rs (re-exports), common.rs (validators/helpers), status, branches,
+                        #   commits, diff, staging, stash, network (cancellable push/pull/fetch),
+                        #   conflicts, cherrypick, pending, rebase, blame
   src/lsp.rs            # Language-server process host + JSON-RPC framing
   src/{projects,project_env,windows,watcher,settings}.rs
   src/tests.rs          # Unit + #[ignore]d e2e tests (LSP probes against real servers)
