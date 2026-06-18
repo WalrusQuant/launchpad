@@ -18,7 +18,19 @@ Terminal-first desktop workspace built with Tauri v2 (Rust) + vanilla JS. No fra
 ## Project Structure
 ```
 src/                    # Frontend (JS/CSS/HTML)
-  main.js              # App entry, project-gated workspace init, unified tab management (terminal + editor + settings), split workspace, split panes, drag-to-move tabs, keyboard shortcuts, context menus
+  main.js              # App shell only: boot/enterWorkspace, settings tab, keyboard-shortcut dispatch, sidebar, fs-changed/rename/HEAD-moved listeners, context menus, setTabHooks wiring
+  tabs.js               # Tab spine (DI core): tabs Map, activeTabUiId (live binding), nextTabId, switchTab/closeTab/doCloseTab, renderTabBar, escape stack, showConfirmDialog. Feature behavior injected via setTabHooks — depends on NO feature module (no cycles)
+  terminal.js           # PTY/pane/tab core (createPane, createTab, splitPane, fitAllPanes, themes, flow control) + paneMap + PTY_OUTPUT/PTY_EXIT listeners. isCreatingTab + setCreatingTab. setCloseRightTabHook avoids importing workspace.js
+  workspace.js          # Split workspace + right-group + tab-drag (splitWorkspace, right-group tab fns, moveTab*, startTabDrag, reorder). Imports terminal.js one-way; exports getIsSplit + live-binding state for the shell
+  editortab.js          # Editor tab builder: createEditorTab, saveEditorTab, showHunkMenu (imports editorchrome + createMergeTab)
+  editorchrome.js       # Shared editor helpers (leaf): renderBreadcrumb, change-gutter glue, blame toggle, renderEditorStatus, gotoLine; owns homeDir via setHomeDir
+  mergetab.js           # 3-pane merge tab (createMergeTab, saveMergeTab) — independent leaf
+  difftab.js            # Compare/diff tab (createDiffTab + render)
+  rebasetab.js          # Interactive-rebase composer tab (createRebaseTab + drag/apply)
+  symbolpalette.js      # Cmd+Shift+O symbol picker UI (uses pure extractors in symbols.js)
+  debugcapture.js       # NDJSON debug capture (toolbar ⦿)
+  toast.js              # showToast (app-level toasts)
+  domutil.js            # escapeText / escapeAttr
   projects.js           # Active project state + thin wrappers around project Tauri commands
   projectpicker.js      # Project picker UI (welcome state / recent list) shown before any workspace exists
   filebrowser.js        # File tree rooted at project.path, context menu, drag & drop, git status colors, CRUD operations
@@ -276,14 +288,19 @@ rather than DOM-wiring code.
 3. Call from JS with `await invoke("command_name", { args })`
 
 ## Adding a New Frontend Feature
-- Terminal features → `main.js`
-- Split workspace logic → `main.js` (search for `rightGroup` or `splitWorkspace`)
+- Tab lifecycle / registry / tab bar → `tabs.js` (spine). Type-specific behavior is injected via `setTabHooks` in `main.js`.
+- Terminal / PTY / panes → `terminal.js`
+- Split workspace / right group / tab drag → `workspace.js`
+- A new tab *type* → its own `*tab.js` module (see `difftab.js` / `rebasetab.js` / `mergetab.js` / `editortab.js`); import the registry from `tabs.js`, never from `main.js` (avoids cycles)
+- Editor tab → `editortab.js`; shared editor chrome (gutter/blame/status/breadcrumb) → `editorchrome.js`; CodeMirror factory → `editor.js`
 - File browser features → `filebrowser.js`
 - Git features → `gitpanel.js`
-- Editor features → `editor.js`
 - Settings → `settingspanel.js` (UI) + `settings.js` (storage)
 - Project picker / project data → `projectpicker.js` (UI) + `projects.js` (state)
+- App-level wiring (boot, keyboard dispatch, global listeners) → `main.js`
 - Styles → `styles.css` (organized by section with comment headers)
+
+**No import cycles**: feature modules import the tab spine from `tabs.js` and shared helpers from `toast.js`/`domutil.js`; they must never import `main.js`. `main.js` imports feature modules and wires type-specific behavior through `setTabHooks` (and `setCloseRightTabHook` / `setHomeDir`). Only `gitpanel.js` imports `main.js` (`setPanelTransitioning`).
 
 **Project-scoped features rule**: when wiring a new feature that cares about "the current directory", use `getActiveProject().path` (or a closure over it) — **not** `getCurrentPath()` from the file browser. `getCurrentPath()` tracks sub-folder navigation; only the file browser itself should read it.
 
