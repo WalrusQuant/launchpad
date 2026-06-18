@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "launchpad"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "git2",
  "notify-debouncer-mini",
