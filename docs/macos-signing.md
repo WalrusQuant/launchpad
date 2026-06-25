@@ -68,10 +68,41 @@ that to the GitHub release.
 - **`The binary is not signed with a valid Developer ID certificate`** → confirm
   `APPLE_SIGNING_IDENTITY` matches `security find-identity` exactly.
 
-## Later: CI
+## Automated releases (CI)
 
-A `.github/workflows/release.yml` can build/sign/notarize on `v*` tag push using
-`tauri-apps/tauri-action`, with repo secrets: `APPLE_CERTIFICATE` (base64 of an
-exported `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_ISSUER`,
-`APPLE_API_KEY` (Key ID), `APPLE_API_KEY` contents, and `KEYCHAIN_PASSWORD`.
-Not set up yet — see the "Local + CI" path when ready.
+`.github/workflows/release.yml` builds, signs, notarizes, and publishes a
+release whenever a **version tag** is pushed. It reuses `scripts/build-signed.sh`
+(which now accepts the signing vars from the environment when `.env.signing` is
+absent), so local and CI builds run the exact same signing + notarization path.
+
+### Cutting a release
+
+```sh
+./scripts/bump-version.sh 0.3.2      # bumps the 3 version files, commits, tags v0.3.2
+git push origin main --follow-tags   # pushing the tag triggers the release build
+```
+
+Normal pushes to `main` do **not** release — only tags matching `v*` do.
+
+### Required repo secrets
+
+Set these once (`gh secret set <NAME>`), pulling values from your local
+`src-tauri/.env.signing` and Keychain:
+
+| Secret | Value |
+|--------|-------|
+| `APPLE_CERTIFICATE` | base64 of your exported *Developer ID Application* `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | the password you set when exporting that `.p12` |
+| `KEYCHAIN_PASSWORD` | any throwaway string (unlocks the temp CI keychain) |
+| `APPLE_SIGNING_IDENTITY` | exact string from `security find-identity -v -p codesigning` |
+| `APPLE_API_ISSUER` | App Store Connect **Issuer ID** |
+| `APPLE_API_KEY` | App Store Connect **Key ID** |
+| `APPLE_API_KEY_P8` | base64 of the `.p8` key file contents |
+
+Export the cert from Keychain Access (right-click the *Developer ID
+Application* identity → **Export** → `.p12`), then:
+
+```sh
+base64 -i Certificates.p12 | gh secret set APPLE_CERTIFICATE
+base64 -i ~/.appstoreconnect/private_keys/AuthKey_XXXXXXXXXX.p8 | gh secret set APPLE_API_KEY_P8
+```

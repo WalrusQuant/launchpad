@@ -16,16 +16,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/src-tauri/.env.signing"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "✗ Missing $ENV_FILE — see docs/macos-signing.md for the template." >&2
-  exit 1
+# Local runs load secrets from the gitignored env file. In CI the same vars are
+# injected from repo secrets (see .github/workflows/release.yml), so a missing
+# file is fine as long as the required vars are already exported.
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+else
+  echo "▸ No $ENV_FILE — expecting signing vars from the environment (CI)."
 fi
-
-# Load secrets (exported for the tauri build subprocess).
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
 
 # Validate required vars.
 missing=()
