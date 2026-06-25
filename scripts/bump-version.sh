@@ -36,23 +36,24 @@ fi
 CUR="$(grep -m1 '"version"' package.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')"
 echo "▸ $CUR → $NEW"
 
-# package.json — first top-level "version" key.
-sed -i '' -E "0,/\"version\": *\"[^\"]+\"/s//\"version\": \"$NEW\"/" package.json
-# tauri.conf.json — its top-level "version" key.
-sed -i '' -E "0,/\"version\": *\"[^\"]+\"/s//\"version\": \"$NEW\"/" src-tauri/tauri.conf.json
-# Cargo.toml — the [package] version line.
-sed -i '' -E "0,/^version = \"[^\"]+\"/s//version = \"$NEW\"/" src-tauri/Cargo.toml
+# package.json + package-lock.json — npm owns both and is macOS/Linux portable.
+npm version "$NEW" --no-git-tag-version --allow-same-version >/dev/null
 
-# Keep Cargo.lock's launchpad entry in sync (no network).
-( cd src-tauri && cargo update --offline -p launchpad --precise "$NEW" >/dev/null 2>&1 || cargo update -p launchpad >/dev/null )
+# tauri.conf.json — replace the FIRST "version": "..." only (perl, not GNU-only
+# sed `0,/re/`, so this works with macOS BSD sed too).
+perl -pi -e "if (!\$done && s/(\"version\"\\s*:\\s*)\"[^\"]+\"/\${1}\"$NEW\"/) { \$done = 1 }" src-tauri/tauri.conf.json
+# Cargo.toml — the [package] version line (anchored at column 0).
+perl -pi -e "if (!\$done && s/^version = \"[^\"]+\"/version = \"$NEW\"/) { \$done = 1 }" src-tauri/Cargo.toml
+
+# Keep Cargo.lock's launchpad entry in sync.
+( cd src-tauri && cargo update -p launchpad >/dev/null 2>&1 || true )
 
 # Sanity: every file now reads the new version.
-for f in 'package.json' 'src-tauri/tauri.conf.json'; do
-  grep -q "\"version\": \"$NEW\"" "$f" || { echo "✗ $f did not update" >&2; exit 1; }
-done
+grep -q "\"version\": \"$NEW\"" package.json || { echo "✗ package.json did not update" >&2; exit 1; }
+grep -q "\"version\": \"$NEW\"" src-tauri/tauri.conf.json || { echo "✗ tauri.conf.json did not update" >&2; exit 1; }
 grep -q "^version = \"$NEW\"" src-tauri/Cargo.toml || { echo "✗ Cargo.toml did not update" >&2; exit 1; }
 
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "release: $TAG"
 git tag -a "$TAG" -m "$TAG"
 
