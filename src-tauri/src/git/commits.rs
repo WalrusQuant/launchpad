@@ -10,6 +10,67 @@ pub(crate) struct CommitInfo {
     pub(crate) parent_count: usize,
 }
 
+// One-shot summary for the project picker card: does the folder still exist on
+// disk, is it a git repo, what branch is checked out, and what was the last
+// commit. Folded into a single command so the picker makes ONE round-trip per
+// project instead of three (exists + status + log).
+#[derive(Clone, Serialize)]
+pub(crate) struct ProjectCardInfo {
+    pub(crate) exists: bool,
+    pub(crate) is_repo: bool,
+    pub(crate) branch: Option<String>,
+    pub(crate) last_commit: Option<CommitInfo>,
+}
+
+#[tauri::command]
+pub(crate) async fn get_project_card(path: String) -> Result<ProjectCardInfo, String> {
+    blocking(move || {
+        if !std::path::Path::new(&path).exists() {
+            return Ok(ProjectCardInfo {
+                exists: false,
+                is_repo: false,
+                branch: None,
+                last_commit: None,
+            });
+        }
+
+        let repo = match Repository::discover(&path) {
+            Ok(r) => r,
+            Err(_) => {
+                return Ok(ProjectCardInfo {
+                    exists: true,
+                    is_repo: false,
+                    branch: None,
+                    last_commit: None,
+                });
+            }
+        };
+
+        let branch = repo.head().ok().and_then(|h| h.shorthand().map(String::from));
+
+        let last_commit = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .map(|commit| CommitInfo {
+                oid: commit.id().to_string()[..7].to_string(),
+                message: commit.summary().unwrap_or("(no message)").to_string(),
+                author: commit.author().name().unwrap_or("Unknown").to_string(),
+                timestamp: commit.time().seconds(),
+                parent_count: commit.parent_count(),
+            });
+
+        Ok(ProjectCardInfo {
+            exists: true,
+            is_repo: true,
+            branch,
+            last_commit,
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 pub(crate) async fn get_commits(path: String, count: Option<usize>) -> Result<Vec<CommitInfo>, String> {
     blocking(move || {

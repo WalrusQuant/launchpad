@@ -39,6 +39,31 @@ function formatRelativeTime(iso) {
   return `${Math.floor(mo / 12)}y ago`;
 }
 
+// Stable per-project identity color so you learn to recognise a project by
+// the colour of its tile, not by reading the name. Hash the path (stable even
+// if renamed) onto the app's accent palette.
+const TILE_ACCENTS = [
+  "--accent-blue",
+  "--accent-green",
+  "--accent-cyan",
+  "--accent-teal",
+  "--accent-magenta",
+  "--accent-warm",
+  "--accent-yellow",
+];
+function accentFor(key) {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  return TILE_ACCENTS[h % TILE_ACCENTS.length];
+}
+function initialsFor(name) {
+  const cleaned = (name || "").replace(/[^A-Za-z0-9]+/g, " ").trim();
+  if (!cleaned) return "?";
+  const parts = cleaned.split(/\s+/);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return cleaned.slice(0, 2).toUpperCase();
+}
+
 function escapeHtml(s) {
   const d = document.createElement("div");
   d.textContent = s;
@@ -85,6 +110,7 @@ function startInlineRename(row, project, onChange) {
   };
 
   input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
     if (e.key === "Enter") {
       e.preventDefault();
       commit();
@@ -143,29 +169,15 @@ function showRowContextMenu(x, y, project, row, onChange) {
   }, 0);
 }
 
-function annotateBranches(projects, list) {
-  // Fire concurrently but guard with list.isConnected so a rerender that
-  // detaches this list doesn't let late-arriving responses mutate stale DOM
-  // (or, worse, paint one render's git branch into another render's row).
-  if (!list.isConnected) return;
-  Promise.allSettled(
-    projects.map(async (p, i) => {
-      try {
-        const status = await invoke("get_git_status", { path: p.path });
-        if (!list.isConnected) return;
-        if (!status?.branch) return;
-        const row = list.children[i];
-        if (!row) return;
-        const meta = row.querySelector(".picker-row-meta");
-        if (meta) {
-          // textContent is safe regardless of what branch/path/time contain.
-          meta.textContent = `${prettyPath(p.path)} · ${status.branch} · ${formatRelativeTime(p.lastOpened)}`;
-        }
-      } catch {
-        // Not a git repo — leave row as-is.
-      }
-    })
-  );
+// Substring match on name + pretty path. Returns the surviving projects in
+// their original (recency) order.
+function filterProjects(projects, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return projects;
+  return projects.filter((p) => {
+    const hay = (p.name + " " + prettyPath(p.path)).toLowerCase();
+    return q.split(/\s+/).every((tok) => hay.includes(tok));
+  });
 }
 
 export async function showPicker(onOpen) {
@@ -193,37 +205,88 @@ export async function showPicker(onOpen) {
           </div>
         </div>
       `;
-    } else {
-      const header = document.createElement("div");
-      header.className = "picker-header";
-      header.textContent = "Projects";
-      shell.appendChild(header);
+      pickerRoot.appendChild(shell);
+      const openBtn = document.getElementById("picker-open-btn");
+      openBtn?.addEventListener("click", async () => {
+        const project = await pickAndAdd();
+        if (project) onOpen(project);
+      });
+      return;
+    }
 
-      const list = document.createElement("div");
-      list.className = "picker-list";
-      projects.forEach((p) => {
+    // --- Header: wordmark + live search + open button ---------------------
+    const head = document.createElement("div");
+    head.className = "picker-topbar";
+    head.innerHTML = `
+      <div class="picker-brand">Launchpad</div>
+      <div class="picker-search-wrap">
+        <span class="picker-search-icon">⌕</span>
+        <input class="picker-search" type="text" spellcheck="false"
+               placeholder="Search ${projects.length} project${projects.length === 1 ? "" : "s"}…" />
+      </div>
+      <button id="picker-open-btn" class="picker-open-btn picker-open-btn-secondary">+ Open</button>
+    `;
+    shell.appendChild(head);
+
+    const list = document.createElement("div");
+    list.className = "picker-list";
+    shell.appendChild(list);
+
+    pickerRoot.appendChild(shell);
+
+    const searchInput = head.querySelector(".picker-search");
+
+    // --- Filtered render + keyboard-navigable selection -------------------
+    let filtered = projects;
+    let selected = 0;
+    const cardCache = new Map(); // path -> get_project_card result
+
+    function setSelected(i) {
+      const rows = list.querySelectorAll(".picker-row");
+      if (!rows.length) return;
+      selected = Math.max(0, Math.min(i, rows.length - 1));
+      rows.forEach((r, idx) => r.classList.toggle("is-selected", idx === selected));
+      rows[selected].scrollIntoView({ block: "nearest" });
+    }
+
+    function renderList() {
+      filtered = filterProjects(projects, searchInput.value);
+      selected = 0;
+      list.replaceChildren();
+
+      if (filtered.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "picker-empty";
+        empty.textContent = "No projects match your search.";
+        list.appendChild(empty);
+        return;
+      }
+
+      filtered.forEach((p, i) => {
         const row = document.createElement("div");
-        row.className = "picker-row";
-        row.tabIndex = 0;
+        row.className = "picker-row" + (i === 0 ? " is-selected" : "");
+        row.tabIndex = -1;
+        row.style.setProperty("--tile-accent", `var(${accentFor(p.path)})`);
+        row.style.animationDelay = `${Math.min(i, 12) * 22}ms`;
+        row.dataset.path = p.path;
         row.innerHTML = `
+          <div class="picker-tile">${escapeHtml(initialsFor(p.name))}</div>
           <div class="picker-row-body">
-            <div class="picker-row-name">${escapeHtml(p.name)}</div>
-            <div class="picker-row-meta">${escapeHtml(prettyPath(p.path))} · ${escapeHtml(formatRelativeTime(p.lastOpened))}</div>
+            <div class="picker-row-head">
+              <span class="picker-row-name">${escapeHtml(p.name)}</span>
+              <span class="picker-row-branch" hidden></span>
+            </div>
+            <div class="picker-row-meta">${escapeHtml(prettyPath(p.path))}</div>
+            <div class="picker-row-commit picker-row-commit-loading">loading…</div>
           </div>
+          <div class="picker-row-time">${escapeHtml(formatRelativeTime(p.lastOpened))}</div>
           <button class="picker-row-menu-btn" title="Project options" aria-label="Project options">⋯</button>
         `;
         row.addEventListener("click", (e) => {
-          // Ignore clicks originating from the menu button or inline-rename input.
           if (e.target.closest(".picker-row-menu-btn") || e.target.matches(".picker-row-name-input")) return;
           onOpen(p);
         });
-        row.addEventListener("keydown", (e) => {
-          if (e.target.matches(".picker-row-name-input")) return;
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onOpen(p);
-          }
-        });
+        row.addEventListener("mousemove", () => setSelected(i));
         row.addEventListener("contextmenu", (e) => {
           e.preventDefault();
           showRowContextMenu(e.clientX, e.clientY, p, row, rerender);
@@ -235,27 +298,95 @@ export async function showPicker(onOpen) {
           showRowContextMenu(rect.right, rect.bottom + 4, p, row, rerender);
         });
         list.appendChild(row);
+
+        // Fill folder-exists + branch + last-commit. Cached so re-filtering
+        // (which rebuilds rows) doesn't re-hit the backend. The result is
+        // applied to whatever row currently represents this path — rows are
+        // transient across keystrokes, so we re-query by path, never trust the
+        // captured `row` after an await.
+        const cached = cardCache.get(p.path);
+        if (cached) {
+          applyCard(cached, row);
+        } else {
+          invoke("get_project_card", { path: p.path })
+            .then((info) => {
+              if (!info) return;
+              cardCache.set(p.path, info);
+              const live = list.querySelector(`.picker-row[data-path="${CSS.escape(p.path)}"]`);
+              if (live) applyCard(info, live);
+            })
+            .catch(() => {});
+        }
       });
-      shell.appendChild(list);
-
-      annotateBranches(projects, list);
-
-      const openBtn = document.createElement("button");
-      openBtn.id = "picker-open-btn";
-      openBtn.className = "picker-open-btn picker-open-btn-secondary";
-      openBtn.textContent = "+ Open Project";
-      shell.appendChild(openBtn);
     }
 
-    pickerRoot.appendChild(shell);
+    function applyCard(info, row) {
+      const commitEl = row.querySelector(".picker-row-commit");
+      const branchEl = row.querySelector(".picker-row-branch");
+      if (!commitEl) return;
+      commitEl.classList.remove("picker-row-commit-loading");
 
-    const openBtn = document.getElementById("picker-open-btn");
-    if (openBtn) {
-      openBtn.addEventListener("click", async () => {
-        const project = await pickAndAdd();
-        if (project) onOpen(project);
-      });
+      if (!info.exists) {
+        row.classList.add("is-missing");
+        commitEl.textContent = "⚠ folder no longer on disk";
+        commitEl.classList.add("is-warning");
+        return;
+      }
+      if (info.branch && branchEl) {
+        branchEl.textContent = info.branch;
+        branchEl.hidden = false;
+      }
+      if (info.last_commit) {
+        const lc = info.last_commit;
+        const when = formatRelativeTime(new Date(lc.timestamp * 1000).toISOString());
+        // Pin the author (never truncated) and let only the message ellipsize,
+        // so a long subject can't hide who made it. No relative time here — the
+        // commit date lives in the title; the row already shows a date.
+        const author = document.createElement("span");
+        author.className = "picker-commit-author";
+        author.textContent = lc.author;
+        const msg = document.createElement("span");
+        msg.className = "picker-commit-msg";
+        msg.textContent = lc.message;
+        commitEl.replaceChildren(author, msg);
+        commitEl.title = `${lc.oid} · ${lc.message} · ${when}`;
+      } else if (info.is_repo) {
+        commitEl.textContent = "no commits yet";
+        commitEl.classList.add("is-dim");
+      } else {
+        commitEl.textContent = "not a git repository";
+        commitEl.classList.add("is-dim");
+      }
     }
+
+    searchInput.addEventListener("input", renderList);
+    searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelected(selected + 1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelected(selected - 1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (filtered[selected]) onOpen(filtered[selected]);
+      } else if (e.key === "Escape") {
+        if (searchInput.value) {
+          e.preventDefault();
+          searchInput.value = "";
+          renderList();
+        }
+      }
+    });
+
+    head.querySelector("#picker-open-btn").addEventListener("click", async () => {
+      const project = await pickAndAdd();
+      if (project) onOpen(project);
+    });
+
+    renderList();
+    // Auto-focus so you can just start typing to find a project.
+    searchInput.focus();
   }
 
   await rerender();

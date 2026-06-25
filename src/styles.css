@@ -3276,10 +3276,10 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 
 .picker-shell {
   width: 100%;
-  max-width: 560px;
+  max-width: 720px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
   -webkit-app-region: no-drag;
 }
 
@@ -3347,42 +3347,129 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   font-family: "SF Mono", Menlo, monospace;
 }
 
-.picker-header {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+/* Topbar: wordmark · live search · open button */
+.picker-topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 2px;
+}
+
+.picker-brand {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-11);
+  flex-shrink: 0;
+}
+
+.picker-search-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.picker-search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 15px;
   color: var(--text-3);
-  padding: 0 4px 4px;
+  pointer-events: none;
+}
+
+.picker-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px 9px 34px;
+  background: var(--surface-6);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  color: var(--text-11);
+  font-size: 13px;
+  font-family: "SF Mono", Menlo, monospace;
+  outline: none;
+  transition: border-color 0.1s ease, background 0.1s ease;
+}
+
+.picker-search::placeholder {
+  color: var(--text-2);
+}
+
+.picker-search:focus {
+  border-color: var(--accent-blue);
+  background: var(--surface-4);
 }
 
 .picker-list {
   display: flex;
   flex-direction: column;
-  background: var(--surface-6);
-  border: 1px solid var(--border-1);
-  border-radius: 8px;
-  overflow: hidden;
+  gap: 6px;
+}
+
+.picker-empty {
+  padding: 28px 8px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13px;
+  font-family: "SF Mono", Menlo, monospace;
+}
+
+@keyframes picker-row-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .picker-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 8px 12px 16px;
+  gap: 13px;
+  padding: 11px 12px;
   cursor: pointer;
-  border-bottom: 1px solid var(--surface-9);
-  transition: background 0.08s ease;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--surface-6);
   outline: none;
+  position: relative;
+  transition: background 0.1s ease, border-color 0.1s ease, transform 0.1s ease;
+  animation: picker-row-in 0.26s ease both;
 }
 
-.picker-row:last-child {
-  border-bottom: none;
+/* Keyboard/hover selection: accent edge + lift */
+.picker-row.is-selected {
+  background: var(--surface-8);
+  border-color: color-mix(in srgb, var(--tile-accent, var(--accent-blue)) 45%, var(--border-2));
+  transform: translateX(2px);
 }
 
-.picker-row:hover,
-.picker-row:focus {
-  background: var(--surface-9);
+.picker-row.is-selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--tile-accent, var(--accent-blue));
+}
+
+/* Monospace identity tile — stable colour per project */
+.picker-tile {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--tile-accent, var(--accent-blue));
+  background: color-mix(in srgb, var(--tile-accent, var(--accent-blue)) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tile-accent, var(--accent-blue)) 30%, transparent);
 }
 
 .picker-row-body {
@@ -3393,18 +3480,21 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 .picker-row-name {
   font-size: 14px;
   color: var(--text-11);
-  font-weight: 500;
+  font-weight: 600;
   margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .picker-row-name-input {
   font-size: 14px;
   color: var(--text-11);
-  font-weight: 500;
+  font-weight: 600;
   background: var(--surface-2);
-  border: 1px solid #57c7ff;
+  border: 1px solid var(--accent-blue);
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: 1px 6px;
   margin-bottom: 2px;
   width: 100%;
   font-family: inherit;
@@ -3412,9 +3502,111 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
 }
 
 .picker-row-meta {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-3);
   font-family: "SF Mono", Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.picker-row-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-2);
+  font-family: "SF Mono", Menlo, monospace;
+  white-space: nowrap;
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+.picker-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.picker-row-branch {
+  flex-shrink: 0;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-4);
+  background: var(--surface-9);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.picker-row-branch::before {
+  content: "⎇ ";
+  opacity: 0.7;
+}
+
+/* Last-commit line — the "what happened here last" context */
+.picker-row-commit {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-4);
+  font-family: "SF Mono", Menlo, monospace;
+  margin-top: 3px;
+  overflow: hidden;
+}
+
+/* Author stays fully visible; only the message ellipsizes. */
+.picker-commit-author {
+  flex-shrink: 0;
+  color: var(--text-6);
+  font-weight: 600;
+}
+
+.picker-commit-author::after {
+  content: "·";
+  margin-left: 7px;
+  color: var(--text-2);
+  font-weight: 400;
+}
+
+.picker-commit-msg {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.picker-row-commit.is-dim {
+  color: var(--text-2);
+  font-style: italic;
+}
+
+.picker-row-commit.is-warning {
+  color: var(--accent-red);
+  font-weight: 600;
+}
+
+.picker-row-commit-loading {
+  color: var(--text-1);
+  opacity: 0.55;
+}
+
+/* Folder deleted on disk — visibly dead, ready to remove from the list */
+.picker-row.is-missing {
+  opacity: 0.6;
+}
+
+.picker-row.is-missing .picker-tile {
+  color: var(--accent-red);
+  background: color-mix(in srgb, var(--accent-red) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent-red) 30%, transparent);
+}
+
+.picker-row.is-missing .picker-row-name {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-1);
 }
 
 .picker-row-menu-btn {
@@ -3424,16 +3616,16 @@ body.workspace-split #group-right.group-focused .right-tab-bar {
   border: none;
   background: transparent;
   color: var(--text-3);
-  border-radius: 4px;
+  border-radius: 6px;
   font-size: 16px;
   line-height: 1;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.08s ease, background 0.08s ease;
+  transition: opacity 0.1s ease, background 0.1s ease;
 }
 
 .picker-row:hover .picker-row-menu-btn,
-.picker-row:focus-within .picker-row-menu-btn {
+.picker-row.is-selected .picker-row-menu-btn {
   opacity: 1;
 }
 

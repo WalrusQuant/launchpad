@@ -310,6 +310,7 @@ pub fn run() {
             get_git_status,
             list_branches,
             get_commits,
+            get_project_card,
             checkout_branch,
             create_branch,
             load_settings,
